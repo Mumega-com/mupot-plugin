@@ -1,0 +1,26 @@
+# Restricted Hermes-to-Mupot operator profile.
+# Replace every angle-bracket placeholder before use.
+# Store MUPOT_AGENT_TOKEN in the profile's protected .env file, never in this YAML.
+
+plugins:
+  enabled:
+    - mupot
+  entries:
+    mupot:
+      settings:
+        mode: operator
+        operator:
+          base_url: https://<YOUR_MUPOT_HOST>
+          expected_tenant: <TENANT_SLUG>
+          squad_id: <SQUAD_ID>
+          agent_id: <HERMES_AGENT_ID>
+          approval_owner: <HUMAN_APPROVAL_OWNER_ID>
+          pubsub_peer_agent_ids:
+            - <ALLOWED_PEER_AGENT_ID>
+          timeout: 20
+
+# The baseline operator surface cannot grant permissions, approve its own work,
+# publish externally, spend money, or use generic HTTP administration.
+# Optional squad lifecycle management requires both agent_manager_enabled: true
+# and a separately granted exact-squad `agents:manage` capability in Mupot.
+# Credential management is intentionally not enabled by this example.

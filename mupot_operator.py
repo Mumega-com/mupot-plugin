@@ -270,9 +270,9 @@ class MupotOperatorClient:
         if action in MANAGER_CREDENTIAL_ACTIONS and not self.settings.agent_manager_credentials_enabled:
             return {"ok": False, "error": "action_not_allowed", "action": action}
         if action == "status":
-            return self._invoke("status", {})
+            return self.status()
 
-        identity = self._invoke("status", {})
+        identity = self._identity_snapshot()
         identity_error = self._validate_identity(identity)
         if identity_error is not None:
             return identity_error
@@ -305,9 +305,51 @@ class MupotOperatorClient:
         return self._invoke(action, dict(args))
 
     def status(self) -> JsonObject:
-        result = self._invoke("status", {})
+        result = self._identity_snapshot()
         identity_error = self._validate_identity(result)
         return identity_error or result
+
+    def _identity_snapshot(self) -> JsonObject:
+        """Build a fail-closed identity view for operator gates.
+
+        Prefer /actions/status when it already carries bound_agent_id + role.
+        Older pots omitted those fields on status self-echo (identity_mismatch);
+        fall back to /actions/boot_context which already returns bound_agent_id.
+        """
+        status = self._invoke("status", {})
+        status_result = status.get("result")
+        # Complete shape = fields present (even if null/wrong). Only fall back when
+        # older pots omit bound_agent_id/role entirely from status self-echo.
+        if (
+            status.get("ok") is True
+            and isinstance(status_result, dict)
+            and "bound_agent_id" in status_result
+            and "role" in status_result
+        ):
+            return status
+
+        boot = self._invoke("boot_context", {})
+        boot_result = boot.get("result")
+        if boot.get("ok") is not True or not isinstance(boot_result, dict):
+            return status if status.get("ok") is True else boot
+
+        merged: dict[str, Any] = {}
+        if isinstance(status_result, dict):
+            merged.update(status_result)
+        merged.update(
+            {
+                "tenant": boot_result.get("tenant", merged.get("tenant")),
+                "member_id": boot_result.get("member_id", merged.get("member_id")),
+                "channel": boot_result.get("channel", merged.get("channel")),
+                "capabilities": boot_result.get("capabilities", merged.get("capabilities")),
+                "bound_agent_id": boot_result.get("bound_agent_id"),
+                # Org-role layer for agent-bound tokens is always member; capability
+                # grants remain the real authorization surface.
+                "role": boot_result.get("role") or "member",
+                "identity_status": boot_result.get("identity_status"),
+            }
+        )
+        return {"ok": True, "tool": "status", "result": merged}
 
     def _invoke(self, action: str, args: JsonObject) -> JsonObject:
         base_url = self.settings.base_url.rstrip("/") + "/"

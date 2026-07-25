@@ -31,12 +31,14 @@ class RecordingTransport:
         bound_agent_id: str = "hermes-tenant-test",
         role: str | None = "member",
         surface_capabilities: tuple[str, ...] = (),
+        status_omits_identity: bool = False,
     ) -> None:
         self.calls: list[dict[str, Any]] = []
         self.capability = capability
         self.bound_agent_id = bound_agent_id
         self.role = role
         self.surface_capabilities = surface_capabilities
+        self.status_omits_identity = status_omits_identity
 
     def __call__(
         self,
@@ -50,13 +52,30 @@ class RecordingTransport:
         )
         action = url.rsplit("/", 1)[-1]
         if action == "status":
+            result: dict[str, Any] = {
+                "tenant": "tenant-test",
+                "capabilities": [
+                    {
+                        "scope_type": "squad",
+                        "scope_id": "squad-tenant-test",
+                        "capability": self.capability,
+                    }
+                ],
+                "surface_capabilities": list(self.surface_capabilities),
+            }
+            if not self.status_omits_identity:
+                result["role"] = self.role
+                result["bound_agent_id"] = self.bound_agent_id
+            return {"ok": True, "tool": "status", "result": result}
+        if action == "boot_context":
             return {
                 "ok": True,
-                "tool": "status",
+                "tool": "boot_context",
                 "result": {
                     "tenant": "tenant-test",
-                    "role": self.role,
+                    "role": self.role or "member",
                     "bound_agent_id": self.bound_agent_id,
+                    "identity_status": "minted",
                     "capabilities": [
                         {
                             "scope_type": "squad",
@@ -64,7 +83,6 @@ class RecordingTransport:
                             "capability": self.capability,
                         }
                     ],
-                    "surface_capabilities": list(self.surface_capabilities),
                 },
             }
         if action == "agent_manager_status":
@@ -162,6 +180,15 @@ class OperatorTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "identity_mismatch")
         self.assertEqual(len(transport.calls), 1)
+
+    def test_client_recovers_when_status_omits_identity_fields(self) -> None:
+        transport = RecordingTransport(status_omits_identity=True)
+        result = self.client(transport).status()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"]["bound_agent_id"], "hermes-tenant-test")
+        self.assertEqual(result["result"]["role"], "member")
+        actions = [call["url"].rsplit("/", 1)[-1] for call in transport.calls]
+        self.assertEqual(actions, ["status", "boot_context"])
 
     def test_client_fails_closed_for_owner_or_admin_capability(self) -> None:
         for capability in ("admin", "owner"):

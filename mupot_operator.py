@@ -353,7 +353,7 @@ class MupotOperatorClient:
 
     def _invoke(self, action: str, args: JsonObject) -> JsonObject:
         base_url = self.settings.base_url.rstrip("/") + "/"
-        url = urljoin(base_url, f"actions/{action}")
+        rest_url = urljoin(base_url, f"actions/{action}")
         headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {self._token}",
@@ -361,11 +361,91 @@ class MupotOperatorClient:
             "User-Agent": "hermes-mupot-operator/0.3",
         }
         try:
-            response = self._transport(url, headers, args, self.settings.timeout)
+            response = self._transport(rest_url, headers, dict(args), self.settings.timeout)
         except Exception as exc:  # tool boundary: never crash the Hermes session
             detail = _redact(str(exc), self._token)[:240]
             return {"ok": False, "error": "transport_error", "detail": detail}
-        return _sanitize_response(response, self._token)
+        if response.get("ok") is True:
+            return _sanitize_response(response, self._token)
+        # REST surface blocked (e.g. Cloudflare WAF on some pots) — retry over MCP.
+        if not self._is_waf_block(response):
+            return _sanitize_response(response, self._token)
+        mcp_url = urljoin(base_url, "mcp")
+        rid = 1
+        if action == "status":
+            payload = {
+                "jsonrpc": "2.0",
+                "id": rid,
+                "method": "tools/call",
+                "params": {"name": "status", "arguments": {}},
+            }
+        elif action == "check_in":
+            payload = {
+                "jsonrpc": "2.0",
+                "id": rid,
+                "method": "tools/call",
+                "params": {
+                    "name": "check_in",
+                    "arguments": {"source": "hermes", "label": "hadi-hermes"},
+                },
+            }
+        elif action == "inbox":
+            limit = int(args.get("limit") or 20)
+            peek = bool(args.get("peek", True))
+            payload = {
+                "jsonrpc": "2.0",
+                "id": rid,
+                "method": "tools/call",
+                "params": {"name": "inbox", "arguments": {"limit": limit, "peek": peek}},
+            }
+        elif action == "send":
+            send_args: JsonObject = {
+                "to": args.get("to"),
+                "body": args.get("body"),
+                "kind": args.get("kind") or "request",
+                "request_id": args.get("request_id"),
+            }
+            in_reply_to = args.get("in_reply_to")
+            if in_reply_to is not None:
+                send_args["in_reply_to"] = in_reply_to
+            payload = {
+                "jsonrpc": "2.0",
+                "id": rid,
+                "method": "tools/call",
+                "params": {"name": "send", "arguments": send_args},
+            }
+        else:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": rid,
+                "method": "tools/call",
+                "params": {"name": action, "arguments": dict(args)},
+            }
+        mcp_headers = {
+            "Accept": "application/json, text/event-stream",
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": "application/json",
+            "User-Agent": "hermes-mupot-operator/0.3",
+        }
+        try:
+            raw_response = self._transport(mcp_url, mcp_headers, payload, self.settings.timeout)
+        except Exception as exc:  # tool boundary: never crash the Hermes session
+            detail = _redact(str(exc), self._token)[:240]
+            return {"ok": False, "error": "transport_error", "detail": detail}
+        return _sanitize_mcp_response(raw_response, self._token)
+
+    @staticmethod
+    def _is_waf_block(response: JsonObject) -> bool:
+        """True when the REST call was refused by an edge WAF, not by Mupot."""
+        status = response.get("status")
+        if isinstance(status, int) and status in (401, 403):
+            detail = str(response.get("detail") or "")
+            if "1010" in detail or "browser_signature" in detail or "waf" in detail.lower():
+                return True
+        if response.get("error") == "http_error":
+            detail = str(response.get("detail") or "")
+            return "1010" in detail or "browser_signature" in detail
+        return False
 
     def _validate_identity(self, response: JsonObject) -> JsonObject | None:
         if response.get("ok") is not True:
@@ -398,6 +478,38 @@ def _sanitize_response(value: Any, token: str) -> JsonObject:
     except json.JSONDecodeError:
         return {"ok": False, "error": "invalid_response"}
     return decoded if isinstance(decoded, dict) else {"ok": False, "error": "invalid_response"}
+
+
+def _sanitize_mcp_response(value: Any, token: str) -> JsonObject:
+    if not isinstance(value, dict):
+        return {"ok": False, "error": "invalid_response"}
+    if "error" in value:
+        redacted = _redact(json.dumps(value, default=str), token)
+        try:
+            decoded = json.loads(redacted)
+        except json.JSONDecodeError:
+            return {"ok": False, "error": "invalid_response"}
+        return decoded if isinstance(decoded, dict) else {"ok": False, "error": "invalid_response"}
+    result = value.get("result")
+    if not isinstance(result, dict):
+        return {"ok": False, "error": "invalid_response"}
+    contents = result.get("content")
+    if isinstance(contents, list) and contents:
+        text = next((item.get("text", "") for item in contents if isinstance(item, dict) and item.get("type") == "text"), "")
+        text = text.strip()
+        if not text:
+            return {"ok": False, "error": "invalid_response"}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return {"ok": False, "error": "invalid_response", "detail": text[:240]}
+        if not isinstance(parsed, dict):
+            return {"ok": False, "error": "invalid_response"}
+        return parsed
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return {"ok": True, "result": structured}
+    return {"ok": False, "error": "invalid_response"}
 
 
 def _text(args: Mapping[str, Any], name: str, *, required: bool = True) -> str | None:

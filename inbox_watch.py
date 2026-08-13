@@ -271,23 +271,27 @@ class InboxWatcher:
             args["since"] = self._state.sos_cursor
         text = self._sos_call("inbox", args)
         items: list[WatchItem] = []
-        newest_cursor = self._state.sos_cursor
+        sids = [self._state.sos_cursor]
         for line in text.splitlines():
             match = _SOS_LINE.match(line.strip())
             if not match:
                 continue
-            sid = match.group("sid")
-            newest_cursor = sid  # stream ids sort lexically as <ms>-<n>
+            sids.append(match.group("sid"))
             items.append(
                 WatchItem(
                     source="sos",
-                    key=f"sos:{sid}",
+                    key=f"sos:{match.group('sid')}",
                     sender=match.group("from"),
                     body=match.group("body"),
                     ts=match.group("ts"),
                 )
             )
-        self._state.sos_cursor = newest_cursor
+        # The bus returns NEWEST-FIRST — the cursor must be the MAX stream id
+        # (numeric ms prefix), not the last line parsed, or every poll
+        # re-delivers the whole window.
+        self._state.sos_cursor = max(
+            sids, key=lambda s: int(s.split("-")[0]) if s and s.split("-")[0].isdigit() else 0
+        )
         return items
 
     # -- delivery ----------------------------------------------------------

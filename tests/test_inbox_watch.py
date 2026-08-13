@@ -175,6 +175,21 @@ class PollCycleTests(unittest.TestCase):
         watcher.poll_once()
         self.assertEqual(seen_args[-1].get("since"), "1786635047180-0")
 
+    def test_sos_newest_first_cursor_is_max_not_last(self):
+        # Regression: the bus returns NEWEST-FIRST. A last-line cursor picks the
+        # OLDEST id and every cycle re-delivers the whole window.
+        newest_first = (
+            "[2026-08-13T15:30:47Z] agent:kasra: newer [stream_id:1786635047180-0]\n"
+            "[2026-08-13T15:00:00Z] agent:river: older [stream_id:1786463250510-0]"
+        )
+        watcher = self._watcher(sos_text=newest_first, inbox_watch_sources=["sos"])
+        watcher.poll_once()  # baseline
+        self.assertEqual(watcher._state.sos_cursor, "1786635047180-0")
+        # Nothing new -> no delivery and cursor holds at the max.
+        watcher._sos_call = lambda tool, args: newest_first
+        self.assertEqual(watcher.poll_once(), 0)
+        self.assertEqual(watcher._state.sos_cursor, "1786635047180-0")
+
     def test_failed_source_does_not_kill_cycle(self):
         def broken():
             raise RuntimeError("pot unreachable")

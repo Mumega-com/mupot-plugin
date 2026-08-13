@@ -51,13 +51,16 @@ provides_tools:
 
 provides_hooks:
   - name: on_session_start
-    description: Provisioner-mode configuration reminder only.
+    description: Provisioner-mode configuration reminder; operator-mode inbox watcher session tracking.
 
 # No credential is globally required because operator and provisioner profiles use
 # different credentials. Each mode validates its own requirements at registration.
 optional_env:
   - name: MUPOT_AGENT_TOKEN
     description: Agent-bound Mupot bearer token required in operator mode.
+    secret: true
+  - name: CYRUS_SOS_TOKEN
+    description: SOS bus token used ONLY by the optional operator inbox watcher (inbox_watch_sources includes "sos"). Never required for the operator tools themselves.
     secret: true
   - name: MUPOT_CF_ACCOUNT_ID
     description: Cloudflare account ID used only in provisioner mode.

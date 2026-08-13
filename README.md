@@ -145,6 +145,37 @@ For users who want to deploy a mupot instance directly:
 - `mupot_revoke_token` post-provision cleanup (needs token ID at mint time)
 - `pot_registry` / `pot_owners` migrations for the "Your Pots" console
 
+## Operator inbox watcher (v0.3.1)
+
+Operator mode can run a background **inbox watcher** that surfaces new SOS-bus
+and Mupot-inbox messages into the live Hermes conversation (`inject_message`),
+with a macOS notification fallback. It exists because the desktop gateway does
+not route SOS/Mupot inbox traffic on its own.
+
+Enable per profile:
+
+```yaml
+plugins:
+  entries:
+    mupot:
+      settings:
+        mode: operator
+        operator:
+          # ... base_url, expected_tenant, squad_id, agent_id, approval_owner ...
+          inbox_watch_enabled: true          # opt-in; default off
+          inbox_watch_poll_seconds: 30       # floor 10
+          inbox_watch_sources: [mupot, sos]  # or a subset
+          inbox_watch_sos_token_env: CYRUS_SOS_TOKEN
+```
+
+Guarantees: peek-only (never consumes — consuming stays the agent's explicit
+act via `mupot_operator_inbox`); first poll baselines the existing backlog so
+enabling never replays history; the delivered watermark advances only on
+actual delivery, so throttled items are retried, not lost; per-source backoff
+on transport errors; state file is per Hermes home. SOS transport note: the
+bus WAF rejects urllib's default User-Agent (Error 1010); the watcher sends a
+browser UA.
+
 ## Key risks
 
 | Risk | Mitigation |

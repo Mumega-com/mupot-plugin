@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any, Mapping
 
 from .mupot_operator import MupotOperatorClient, OperatorSettings, register_operator_tools
@@ -23,10 +24,10 @@ from .schemas import (
 )
 from .tools import mupot_brain_enable, mupot_provision, mupot_status
 
-# Process-global registry of running inbox watchers keyed by
-# (state_file, agent_id). Prevents duplicate daemon threads when the plugin is
-# force-reloaded within one process; each Hermes home runs its own process.
-_ACTIVE_WATCHERS: dict[tuple[str, str], Any] = {}
+# Process-global registry of running inbox streamers keyed by state-file path.
+# Prevents duplicate daemon threads when the plugin is force-reloaded within
+# one process; each Hermes home runs its own process.
+_ACTIVE_WATCHERS: dict[str, Any] = {}
 
 
 def _load_plugin_settings() -> dict[str, Any]:
@@ -121,29 +122,33 @@ def _register_provisioner_reminder(ctx: Any) -> None:
         legacy_on("on_session_start", on_session_start)
 
 
-def _maybe_start_inbox_watcher(
-    ctx: Any, operator_value: Mapping[str, Any], client: "MupotOperatorClient"
+def _maybe_start_inbox_stream(
+    ctx: Any, operator_value: Mapping[str, Any]
 ) -> None:
-    """Start the background inbox watcher when operator settings enable it.
+    """Start the event-driven inbox stream when operator settings enable it.
 
-    Fail-closed on bad watcher configuration (it is an explicit opt-in), but a
-    runtime delivery limitation (no inject_message surface) degrades to macOS
+    Holds one persistent SSE connection per source (SOS bus ``/watch`` +
+    Mupot ``/api/inbox/stream``) and pushes NEW messages into the live
+    conversation as they arrive — no polling, no cron, no watcher.
+
+    Fail-closed on bad configuration (explicit opt-in), but a runtime
+    delivery limitation (no inject_message surface) degrades to macOS
     notifications rather than blocking registration.
     """
-    from .inbox_watch import InboxWatchSettings, InboxWatcher
+    from .inbox_stream import InboxStream, InboxStreamSettings
 
-    watch_settings = InboxWatchSettings.from_mapping(operator_value)
-    if not watch_settings.enabled:
+    stream_settings = InboxStreamSettings.from_mapping(operator_value)
+    if not stream_settings.enabled:
         return
 
     # Resolve the default state file against the ACTIVE Hermes home so two
     # homes (desktop vs CLI) keep separate cursors and never race on one file.
-    state_file = watch_settings.state_file
+    state_file = stream_settings.state_file
     if state_file == "~/.hermes/mupot-inbox-watch-state.json":
         home = os.environ.get("HERMES_HOME", "").strip() or "~/.hermes"
         state_file = os.path.join(home, "mupot-inbox-watch-state.json")
 
-    key = (os.path.expanduser(state_file), client.settings.agent_id)
+    key = os.path.expanduser(state_file)
     existing = _ACTIVE_WATCHERS.get(key)
     if existing is not None:
         return  # already running in this process (e.g. forced plugin reload)
@@ -157,13 +162,10 @@ def _maybe_start_inbox_watcher(
         except Exception:
             return False
 
-    def mupot_inbox() -> Mapping[str, Any]:
-        return client.call("inbox", {"limit": 100, "peek": True})
-
-    watcher = InboxWatcher(
-        watch_settings,
+    stream = InboxStream(
+        stream_settings,
         deliver=deliver,
-        mupot_inbox=mupot_inbox if "mupot" in watch_settings.sources else None,
+        state_path=Path(state_file),
     )
 
     def on_session_start(**kwargs: Any) -> None:
@@ -171,14 +173,14 @@ def _maybe_start_inbox_watcher(
         # ctx.inject_message (CLI/desktop loop reference), not the session key.
         session_id = kwargs.get("session_id")
         if session_id:
-            watcher.set_session_key(str(session_id))
+            stream.set_session_key(str(session_id))
 
     register_hook = getattr(ctx, "register_hook", None)
     if callable(register_hook):
         register_hook("on_session_start", on_session_start)
 
-    watcher.start()
-    _ACTIVE_WATCHERS[key] = watcher
+    stream.start()
+    _ACTIVE_WATCHERS[key] = stream
 
 
 def register(ctx: Any) -> None:
@@ -196,7 +198,7 @@ def register(ctx: Any) -> None:
         token = os.environ.get("MUPOT_AGENT_TOKEN", "")
         client = MupotOperatorClient(operator_settings, token=token)
         register_operator_tools(ctx, client)
-        _maybe_start_inbox_watcher(ctx, operator_value, client)
+        _maybe_start_inbox_stream(ctx, operator_value)
         return
 
     if mode == "provisioner":

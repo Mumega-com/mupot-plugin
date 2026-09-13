@@ -4,7 +4,9 @@ import asyncio
 import httpx
 import json
 import logging
+import math
 import os
+import time
 from collections import deque
 from dataclasses import replace
 from pathlib import Path
@@ -145,6 +147,61 @@ def validate_send_receipt(
     return result
 
 
+def _consumer_fence_proof(
+    value: Any,
+    expected_agent_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    agent_id = value.get("agent_id")
+    mode = value.get("mode")
+    generation = value.get("generation")
+    if (
+        not isinstance(agent_id, str)
+        or not agent_id.strip()
+        or agent_id != agent_id.strip()
+        or (expected_agent_id is not None and agent_id != expected_agent_id)
+        or mode not in {"bearer_only", "gateway"}
+        or type(generation) is not int
+        or generation < 0
+        or value.get("key_matches") is not True
+    ):
+        return None
+    return {"agent_id": agent_id, "mode": mode, "generation": generation}
+
+
+def _lease_reconciliation_proof(value: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "required",
+        "agent_id",
+        "mode",
+        "generation",
+        "reconcile_after",
+    }:
+        return None
+    deadline = value.get("reconcile_after")
+    fence = _consumer_fence_proof(
+        {
+            "agent_id": value.get("agent_id"),
+            "mode": value.get("mode"),
+            "generation": value.get("generation"),
+            "key_matches": True,
+        }
+    )
+    if (
+        value.get("version") != 1
+        or value.get("required") is not True
+        or fence is None
+        or not isinstance(deadline, (int, float))
+        or isinstance(deadline, bool)
+        or not math.isfinite(deadline)
+        or deadline < 0
+    ):
+        return None
+    return {**fence, "reconcile_after": float(deadline)}
+
+
 def _response_limit(tool: str) -> int:
     if tool in _SENSITIVE_MCP_TOOLS:
         return _SENSITIVE_MCP_RESPONSE_LIMIT
@@ -273,11 +330,17 @@ class StateStore:
         self.path = Path(path).expanduser()
 
     def load(self) -> dict[str, Any]:
+        value, _valid = self.load_checked()
+        return value
+
+    def load_checked(self) -> tuple[dict[str, Any], bool]:
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else {}
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return {}
+            return (value, True) if isinstance(value, dict) else ({}, False)
+        except FileNotFoundError:
+            return {}, True
+        except (json.JSONDecodeError, OSError):
+            return {}, False
 
     def save(self, value: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -435,7 +498,7 @@ class MupotAdapter(BasePlatformAdapter):
         self.lease_seconds = max(1, min(3600, int(requested_lease)))
         state_path = extra.get("state_path") or str(get_hermes_home() / "platforms" / "mupot" / "state.json")
         self.store = StateStore(Path(str(state_path)))
-        loaded = self.store.load()
+        loaded, state_valid = self.store.load_checked()
         self.notification_recipients = dict(extra.get("notification_recipients") or {})
         self.notification_activate = extra.get("notification_activate") is True
         self.message_injector = message_injector
@@ -447,6 +510,11 @@ class MupotAdapter(BasePlatformAdapter):
             "dlq": list(loaded.get("dlq") or [])[-100:],
             "terminal_receipts": list(loaded.get("terminal_receipts") or [])[-100:],
             "notification_outbox": dict(loaded.get("notification_outbox") or {}),
+            "lease_reconciliation": (
+                loaded.get("lease_reconciliation")
+                if state_valid
+                else {"state_invalid": True}
+            ),
         }
         # Keep durable inbox lease/ACK traffic isolated from outbound sends.
         # Cancelling a timed-out MCP send can close that SDK session; it must
@@ -457,7 +525,8 @@ class MupotAdapter(BasePlatformAdapter):
         self._completion_event = asyncio.Event()
         self._completion_outcome: Optional[ProcessingOutcome] = None
         self._current_message: Optional[dict[str, Any]] = None
-        self._lease_quarantined = False
+        self._consumer_fence: Optional[dict[str, Any]] = None
+        self._lease_quarantined = self._state["lease_reconciliation"] is not None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if self._lease_quarantined:
@@ -480,15 +549,10 @@ class MupotAdapter(BasePlatformAdapter):
                 self._client.call("inbox_consumer_status", {}),
                 timeout=self.rpc_timeout,
             )
-            generation = fence.get("generation") if isinstance(fence, dict) else None
-            if (
-                not isinstance(fence, dict)
-                or fence.get("key_matches") is not True
-                or fence.get("mode") not in {"bearer_only", "gateway"}
-                or type(generation) is not int
-                or generation < 0
-            ):
+            proof = _consumer_fence_proof(fence, self.expected_agent_id)
+            if proof is None:
                 raise _protocol_error()
+            self._consumer_fence = proof
             self._mark_connected()
             self._poll_task = asyncio.create_task(
                 self._poll_loop(), name="hermes-mupot-inbox-poller"
@@ -546,13 +610,81 @@ class MupotAdapter(BasePlatformAdapter):
         raise AssertionError("unreachable")
 
     def _quarantine_inbox_polling(self) -> None:
+        proof = self._consumer_fence
+        if proof is None:
+            self._lease_quarantined = True
+            self._set_fatal_error(
+                "mupot_inbox_reconciliation_state_missing",
+                "Mupot inbox reconciliation state is unavailable",
+                retryable=False,
+            )
+            logger.error("[mupot] inbox polling quarantined without fence state")
+            return
+        self._state["lease_reconciliation"] = {
+            "version": 1,
+            "required": True,
+            **proof,
+            "reconcile_after": time.time() + self.lease_seconds,
+        }
         self._lease_quarantined = True
+        try:
+            self.store.save(self._state)
+        except Exception:
+            self._set_fatal_error(
+                "mupot_inbox_reconciliation_persistence_failed",
+                "Mupot inbox reconciliation state could not be persisted",
+                retryable=False,
+            )
+            logger.error("[mupot] inbox polling quarantine persistence failed")
+            return
         self._set_fatal_error(
             "mupot_inbox_reconciliation_required",
             "Mupot inbox polling requires reconciliation",
             retryable=False,
         )
         logger.error("[mupot] inbox polling quarantined; reconciliation required")
+
+    async def reconcile_inbox_polling(self) -> bool:
+        """Explicitly clear a durable quarantine after expiry and exact readback."""
+        marker = _lease_reconciliation_proof(
+            self._state.get("lease_reconciliation")
+        )
+        if not self._lease_quarantined or marker is None:
+            return False
+        if time.time() < marker["reconcile_after"]:
+            return False
+        try:
+            require_supported_profile_runtime({})
+            await self._client.connect()
+            value = await asyncio.wait_for(
+                self._client.call("inbox_consumer_status", {}),
+                timeout=self.rpc_timeout,
+            )
+        except Exception:
+            logger.error("[mupot] inbox reconciliation readback failed")
+            return False
+        proof = _consumer_fence_proof(value, marker["agent_id"])
+        if proof is None or any(
+            proof[field] != marker[field]
+            for field in ("agent_id", "mode", "generation")
+        ):
+            logger.error("[mupot] inbox reconciliation readback mismatch")
+            return False
+
+        cleared = dict(self._state)
+        cleared.pop("lease_reconciliation", None)
+        try:
+            self.store.save(cleared)
+        except Exception:
+            logger.error("[mupot] inbox reconciliation clear persistence failed")
+            return False
+        self._state = cleared
+        self._consumer_fence = proof
+        self._lease_quarantined = False
+        self._fatal_error_code = self._fatal_error_message = None
+        self._fatal_error_retryable = True
+        self._mark_disconnected()
+        return True
 
     async def _poll_loop(self) -> None:
         while self._running:

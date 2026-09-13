@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ class FakeMupotClient:
     def __init__(self) -> None:
         self.sent: list[dict] = []
         self.acked = False
+        self.connect_calls = 0
         self.lease_calls = 0
         self.message = {
             "id": "m-1",
@@ -36,6 +38,7 @@ class FakeMupotClient:
         }
 
     async def connect(self) -> None:
+        self.connect_calls += 1
         return None
 
     async def close(self) -> None:
@@ -66,7 +69,12 @@ class FakeMupotClient:
                 "target_seat": None,
             }
         if tool == "inbox_consumer_status":
-            return {"mode": "bearer_only", "generation": 0, "key_matches": True}
+            return {
+                "agent_id": "agent-consumer",
+                "mode": "bearer_only",
+                "generation": 0,
+                "key_matches": True,
+            }
         raise AssertionError(f"unexpected tool: {tool} {arguments}")
 
 
@@ -134,6 +142,50 @@ class LeasePayloadClient(FakeMupotClient):
             self.first_lease.set()
             return self.payload  # type: ignore[return-value]
         return await super().call(tool, arguments)
+
+
+class ReconciliationClient(FakeMupotClient):
+    def __init__(self, status: object) -> None:
+        super().__init__()
+        self.status = status
+        self.tools: list[str] = []
+
+    async def call(self, tool: str, arguments: dict) -> dict:
+        self.tools.append(tool)
+        if tool == "inbox_consumer_status":
+            return self.status  # type: ignore[return-value]
+        raise AssertionError(f"unexpected reconciliation tool: {tool} {arguments}")
+
+
+async def persist_ambiguous_lease_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    monkeypatch.setattr(time, "time", lambda: 100.0)
+    state_path = tmp_path / "state.json"
+    client = LeaseFailureClient(MupotTransportError("Mupot request failed"))
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "lease_seconds": 1,
+                "poll_interval": 0.01,
+                "state_path": str(state_path),
+            },
+        ),
+        client_factory=lambda *_: client,
+    )
+    assert await adapter.connect()
+    try:
+        await asyncio.wait_for(client.first_lease.wait(), 1)
+        for _ in range(100):
+            if not adapter._running:
+                break
+            await asyncio.sleep(0.01)
+        assert adapter._running is False
+    finally:
+        await adapter.disconnect()
+    return state_path
 
 
 def test_build_mupot_event_preserves_project_and_correlation() -> None:
@@ -419,6 +471,144 @@ async def test_poll_loop_retries_only_classified_safe_before_send_failure(
 
 
 @pytest.mark.asyncio
+async def test_reconstructed_adapter_stays_fenced_without_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = await persist_ambiguous_lease_quarantine(tmp_path, monkeypatch)
+    marker = StateStore(state_path).load().get("lease_reconciliation")
+    assert isinstance(marker, dict)
+    assert marker["required"] is True
+    monkeypatch.setattr(time, "time", lambda: 200.0)
+
+    client = ReconciliationClient(
+        {
+            "agent_id": "agent-consumer",
+            "mode": "bearer_only",
+            "generation": 0,
+            "key_matches": True,
+        }
+    )
+    reconstructed = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
+        client_factory=lambda *_: client,
+    )
+
+    assert await reconstructed.connect() is False
+    assert client.connect_calls == 0
+    assert client.tools == []
+    assert client.lease_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_corrupt_existing_state_fails_closed_without_network(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{not-valid-json", encoding="utf-8")
+    client = ReconciliationClient(
+        {
+            "agent_id": "agent-consumer",
+            "mode": "bearer_only",
+            "generation": 0,
+            "key_matches": True,
+        }
+    )
+    adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
+        client_factory=lambda *_: client,
+    )
+
+    assert await adapter.connect() is False
+    assert client.connect_calls == 0
+    assert client.tools == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_reconciliation_before_lease_deadline_does_no_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = await persist_ambiguous_lease_quarantine(tmp_path, monkeypatch)
+    monkeypatch.setattr(time, "time", lambda: 100.5)
+    client = ReconciliationClient({})
+    reconstructed = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
+        client_factory=lambda *_: client,
+    )
+
+    reconcile = getattr(reconstructed, "reconcile_inbox_polling", None)
+    assert callable(reconcile)
+    assert await reconcile() is False
+    assert client.connect_calls == 0
+    assert client.tools == []
+    assert isinstance(StateStore(state_path).load().get("lease_reconciliation"), dict)
+
+
+@pytest.mark.asyncio
+async def test_explicit_reconciliation_clears_only_after_exact_readback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = await persist_ambiguous_lease_quarantine(tmp_path, monkeypatch)
+    monkeypatch.setattr(time, "time", lambda: 101.0)
+    client = ReconciliationClient(
+        {
+            "agent_id": "agent-consumer",
+            "mode": "bearer_only",
+            "generation": 0,
+            "key_matches": True,
+        }
+    )
+    reconstructed = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
+        client_factory=lambda *_: client,
+    )
+
+    reconcile = getattr(reconstructed, "reconcile_inbox_polling", None)
+    assert callable(reconcile)
+    assert await reconcile() is True
+    assert client.connect_calls == 1
+    assert client.tools == ["inbox_consumer_status"]
+    assert StateStore(state_path).load().get("lease_reconciliation") is None
+    assert reconstructed._running is False
+    assert reconstructed.has_fatal_error is False
+
+    fresh = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
+        client_factory=lambda *_: ReconciliationClient({}),
+    )
+    assert getattr(fresh, "_lease_quarantined", True) is False
+
+
+@pytest.mark.asyncio
+async def test_failed_reconciliation_readback_remains_durably_fenced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = await persist_ambiguous_lease_quarantine(tmp_path, monkeypatch)
+    monkeypatch.setattr(time, "time", lambda: 101.0)
+    client = ReconciliationClient(
+        {
+            "agent_id": "agent-consumer",
+            "mode": "bearer_only",
+            "generation": 1,
+            "key_matches": True,
+        }
+    )
+    reconstructed = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
+        client_factory=lambda *_: client,
+    )
+
+    reconcile = getattr(reconstructed, "reconcile_inbox_polling", None)
+    assert callable(reconcile)
+    assert await reconcile() is False
+    assert isinstance(StateStore(state_path).load().get("lease_reconciliation"), dict)
+    assert getattr(reconstructed, "_lease_quarantined", False) is True
+    assert await reconstructed.connect() is False
+    assert client.tools == ["inbox_consumer_status"]
+
+
+@pytest.mark.asyncio
 async def test_terminal_ack_receipt_persistence_failure_prevents_ack(tmp_path: Path) -> None:
     client = AckMupotClient()
     config = PlatformConfig(
@@ -449,6 +639,9 @@ async def test_gateway_verifies_operator_identity_before_reading_mail(tmp_path, 
             if tool == "boot_context":
                 return {"tenant": tenant, "bound_agent_id": agent, "channel": "workspace",
                         "role": "member", "capabilities": []}
+            if tool == "inbox_consumer_status":
+                return {"agent_id": agent, "mode": "bearer_only", "generation": 0,
+                        "key_matches": True}
             return await super().call(tool, arguments)
     client = BoundClient()
     adapter = MupotAdapter(PlatformConfig(enabled=True, extra={

@@ -36,6 +36,12 @@ from ..profile_scope import (
     read_profile_secret,
     require_supported_profile_runtime,
 )
+from .lease_ownership import (
+    AckOwnershipError,
+    attempt_ack_ownership,
+    legacy_ack_ownership,
+    validate_ack_ownership,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +54,8 @@ _GENERIC_MCP_TRANSPORT_ERROR = "Mupot request failed"
 _GENERIC_DELIVERY_CONTEXT_ERROR = "Mupot delivery context unavailable"
 _DELIVERY_CONTEXT_METADATA_KEY = "_mupot_delivery_context"
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
-_REPLY_OUTBOX_VERSION = 1
+_REPLY_OUTBOX_VERSION = 2
+_LEGACY_REPLY_OUTBOX_VERSION = 1
 _LEASE_ATTEMPT_MARKER_VERSION = 3
 _LEASE_ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _PROFILE_OWNER_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -928,6 +935,10 @@ class MupotAdapter(BasePlatformAdapter):
         self._reply_reconciliation_required = any(
             not isinstance(record, dict)
             or record.get("status") == "reconciliation_required"
+            or (
+                record.get("version") == _LEGACY_REPLY_OUTBOX_VERSION
+                and record.get("status") != "complete"
+            )
             for record in self._state["reply_outbox"].values()
         )
         for source_id, record in self._state["reply_outbox"].items():
@@ -1083,6 +1094,98 @@ class MupotAdapter(BasePlatformAdapter):
                 runtime.context.session_key,
             )
 
+    def _delivery_ack_ownership(
+        self,
+        attempt_id: Optional[str],
+    ) -> dict[str, Any]:
+        if attempt_id is None:
+            return legacy_ack_ownership()
+        marker = _lease_reconciliation_proof(
+            self._state.get("lease_reconciliation")
+        )
+        current_owner = _profile_owner_fingerprint(
+            self._secret_owner,
+            validate=True,
+        )
+        if (
+            marker is None
+            or marker.get("version") != _LEASE_ATTEMPT_MARKER_VERSION
+            or marker.get("attempt_id") != attempt_id
+            or current_owner != self._profile_owner_fingerprint
+            or marker.get("profile_owner_fingerprint") != current_owner
+        ):
+            raise _protocol_error()
+        try:
+            return attempt_ack_ownership(marker)
+        except AckOwnershipError:
+            raise _protocol_error() from None
+
+    async def _ack_persisted_ownership(
+        self,
+        expected_id: str,
+        ownership_value: Any,
+    ) -> None:
+        try:
+            ownership = validate_ack_ownership(ownership_value)
+        except AckOwnershipError:
+            self._lease_quarantined = True
+            raise _protocol_error() from None
+        if ownership["kind"] == "legacy_non_attempt":
+            await self._ack_expected(expected_id)
+            return
+        try:
+            current_owner = _profile_owner_fingerprint(
+                self._secret_owner,
+                validate=True,
+            )
+            if (
+                current_owner != self._profile_owner_fingerprint
+                or ownership["profile_owner_fingerprint"] != current_owner
+            ):
+                raise _protocol_error()
+            status = await self._call_consumer(
+                "inbox_consumer_status",
+                {"strict_scope": True},
+            )
+            proof = _consumer_fence_proof(
+                status,
+                ownership["agent_id"],
+                ownership["tenant"],
+                strict_scope=True,
+            )
+            if proof is None or any(
+                proof[field] != ownership[field]
+                for field in (
+                    "tenant",
+                    "agent_id",
+                    "effective_inbox_seat",
+                    "mode",
+                    "generation",
+                )
+            ):
+                raise _protocol_error()
+            payload = await self._call_consumer(
+                "inbox_lease_ack",
+                {"attempt_id": ownership["attempt_id"]},
+            )
+            receipt = validate_lease_attempt_ack(
+                payload,
+                ownership["attempt_id"],
+                ownership,
+            )
+            if receipt["state"] != "acked" or receipt["consumed"] is not True:
+                raise _protocol_error()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._lease_quarantined = True
+            self._set_fatal_error(
+                "mupot_inbox_attempt_ack_reconciliation_required",
+                "Mupot inbox attempt acknowledgement requires reconciliation",
+                retryable=False,
+            )
+            raise
+
     def _persist_reply_record(
         self,
         source_id: str,
@@ -1118,8 +1221,9 @@ class MupotAdapter(BasePlatformAdapter):
             raise _protocol_error()
         arguments = record.get("arguments")
         receipt = record.get("receipt")
+        version = record.get("version")
         if (
-            record.get("version") != _REPLY_OUTBOX_VERSION
+            version not in {_LEGACY_REPLY_OUTBOX_VERSION, _REPLY_OUTBOX_VERSION}
             or record.get("source_id") != source_id
             or not isinstance(record.get("source"), dict)
             or not isinstance(record.get("source_fingerprint"), str)
@@ -1164,6 +1268,13 @@ class MupotAdapter(BasePlatformAdapter):
             }
             or (receipt is not None and not isinstance(receipt, dict))
         ):
+            raise _protocol_error()
+        if version == _REPLY_OUTBOX_VERSION:
+            try:
+                validate_ack_ownership(record.get("ack_ownership"))
+            except AckOwnershipError:
+                raise _protocol_error() from None
+        elif "ack_ownership" in record:
             raise _protocol_error()
         persisted_source = record["source"]
         if record["source_fingerprint"] != _reply_source_fingerprint(persisted_source):
@@ -1211,11 +1322,13 @@ class MupotAdapter(BasePlatformAdapter):
         if runtime.context.project:
             arguments["project_id"] = runtime.context.project
         source = copy.deepcopy(dict(runtime.source))
+        ack_ownership = self._delivery_ack_ownership(runtime.context.attempt_id)
         record = {
             "version": _REPLY_OUTBOX_VERSION,
             "source_id": source_id,
             "source": source,
             "source_fingerprint": _reply_source_fingerprint(source),
+            "ack_ownership": ack_ownership,
             "arguments": arguments,
             "status": "prepared",
             "receipt": None,
@@ -1323,6 +1436,9 @@ class MupotAdapter(BasePlatformAdapter):
             record = self._validated_reply_record(source_id, outbox[source_id])
             if record["status"] == "complete":
                 continue
+            if record["version"] == _LEGACY_REPLY_OUTBOX_VERSION:
+                self._reply_reconciliation_required = True
+                raise _protocol_error()
             if record["status"] == "reconciliation_required":
                 self._reply_reconciliation_required = True
                 raise _protocol_error()
@@ -1346,7 +1462,10 @@ class MupotAdapter(BasePlatformAdapter):
             await self._transmit_final_reply(record)
             if not self._reply_has_human_custody(source_id):
                 raise _protocol_error()
-            await self._ack_expected(source_id)
+            await self._ack_persisted_ownership(
+                source_id,
+                record["ack_ownership"],
+            )
             self._commit(source_id)
             self._mark_reply_complete(source_id)
 
@@ -1799,7 +1918,14 @@ class MupotAdapter(BasePlatformAdapter):
             self._commit(message_id)
             return
 
-        persist_routine_receipt(self._state, self.store, message, event)
+        ack_ownership = self._delivery_ack_ownership(attempt_id)
+        persist_routine_receipt(
+            self._state,
+            self.store,
+            message,
+            event,
+            ack_ownership,
+        )
         enqueue(
             self._state,
             self.store,
@@ -1808,7 +1934,7 @@ class MupotAdapter(BasePlatformAdapter):
             activation_required=True,
             activation_after_processed=True,
         )
-        await self._ack_expected(event.source_id, attempt_id=attempt_id)
+        await self._ack_persisted_ownership(event.source_id, ack_ownership)
         mark_routine_processed(self._state, self.store, event.source_id)
 
     async def _replay_routine_events(self) -> None:
@@ -1833,7 +1959,10 @@ class MupotAdapter(BasePlatformAdapter):
                 activation_required=True,
                 activation_after_processed=True,
             )
-            await self._ack_expected(event.source_id)
+            await self._ack_persisted_ownership(
+                event.source_id,
+                record["ack_ownership"],
+            )
             mark_routine_processed(self._state, self.store, event.source_id)
 
     async def _handle_ack_envelope(
@@ -1911,9 +2040,14 @@ class MupotAdapter(BasePlatformAdapter):
                 # concrete Mupot receipt and its human notice has custody.
                 self.store.save(self._state)
                 return
-            await self._ack_expected(
+            durable_record = self._validated_reply_record(
                 message_id,
-                attempt_id=runtime.context.attempt_id,
+                self._state.get("reply_outbox", {}).get(message_id),
+                runtime.source,
+            )
+            await self._ack_persisted_ownership(
+                message_id,
+                durable_record["ack_ownership"],
             )
             self._commit(message_id)
             self._mark_reply_complete(message_id)

@@ -4,6 +4,7 @@ import asyncio
 import copy
 import hashlib
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,33 @@ from plugin.mupot_gateway.routine_events import (
     is_routine_event_candidate,
     validate_routine_event,
 )
+
+
+ATTEMPT_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+ATTEMPT_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+STRICT_SCOPE = {
+    "tenant": "tenant-a",
+    "agent_id": "agent-consumer",
+    "effective_inbox_seat": None,
+    "mode": "bearer_only",
+    "generation": 0,
+}
+
+
+class SimulatedRoutineCrash(BaseException):
+    """Stop after durable custody without turning the event into a test error path."""
+
+
+class ScopeOwner:
+    def __init__(self, fingerprint: str) -> None:
+        self.fingerprint = fingerprint
+
+    def validated_fingerprint(self) -> str:
+        return self.fingerprint
+
+    @contextmanager
+    def activate(self):
+        yield
 
 
 def _utf16_length(value: str) -> int:
@@ -90,6 +118,45 @@ class RoutineClient:
         return {"acked": [message_id], "already_read": [], "refused": []}
 
 
+class AttemptRoutineClient(RoutineClient):
+    def __init__(
+        self,
+        *,
+        attempt_state: str = "acked",
+        consumed: bool = True,
+        crash_on_attempt_ack: bool = False,
+        status_scope: dict | None = None,
+    ) -> None:
+        super().__init__()
+        self.attempt_state = attempt_state
+        self.consumed = consumed
+        self.crash_on_attempt_ack = crash_on_attempt_ack
+        self.status_scope = status_scope or STRICT_SCOPE
+        self.attempts = {ATTEMPT_A: attempt_state, ATTEMPT_B: "leased"}
+        self.message_read = {ATTEMPT_B: False}
+
+    async def call(self, tool: str, arguments: dict) -> dict:
+        if tool == "inbox_consumer_status":
+            self.calls.append((tool, copy.deepcopy(arguments)))
+            return {"strict_scope": True, **self.status_scope, "key_matches": True}
+        if tool == "inbox_lease_ack":
+            self.calls.append((tool, copy.deepcopy(arguments)))
+            if self.crash_on_attempt_ack:
+                raise SimulatedRoutineCrash("crash after Routine custody")
+            return {
+                "tenant": "tenant-a",
+                "agent_id": "agent-consumer",
+                "effective_inbox_seat": None,
+                "attempt_id": arguments["attempt_id"],
+                "state": self.attempt_state,
+                "consumed": self.consumed,
+            }
+        if tool == "inbox_ack":
+            self.attempts[ATTEMPT_B] = "acked"
+            self.message_read[ATTEMPT_B] = True
+        return await super().call(tool, arguments)
+
+
 class PollRoutineClient(RoutineClient):
     def __init__(self, message: dict[str, object]) -> None:
         super().__init__()
@@ -153,6 +220,7 @@ def adapter_at(
     *,
     enabled: bool = True,
     injector=None,
+    owner: ScopeOwner | None = None,
 ) -> MupotAdapter:
     return MupotAdapter(
         PlatformConfig(
@@ -166,7 +234,27 @@ def adapter_at(
         ),
         client_factory=lambda *_: client,
         message_injector=injector,
+        secret_owner=owner,  # type: ignore[arg-type]
     )
+
+
+def install_attempt_a(adapter: MupotAdapter) -> None:
+    adapter._consumer_fence = copy.deepcopy(STRICT_SCOPE)
+    adapter._state["lease_reconciliation"] = {
+        "version": 3,
+        "required": True,
+        **STRICT_SCOPE,
+        "profile_owner_fingerprint": adapter._profile_owner_fingerprint,
+        "attempt_id": ATTEMPT_A,
+    }
+    adapter.store.save(adapter._state)
+
+
+def clear_lease_marker_for_replay(path: Path) -> None:
+    state_path = path / "state.json"
+    state = StateStore(state_path).load()
+    state.pop("lease_reconciliation", None)
+    StateStore(state_path).save(state)
 
 
 def test_validates_exact_server_human_wait_contract_and_stable_hashed_key() -> None:
@@ -334,6 +422,10 @@ async def test_valid_event_custody_then_exact_ack_then_processed_then_one_activa
     assert model_turns == []
     assert "mupot-routines" not in adapter.allowed_agents
     assert state["routine_event_receipts"]["routine-message-1"]["status"] == "processed"
+    assert state["routine_event_receipts"]["routine-message-1"]["ack_ownership"] == {
+        "version": 1,
+        "kind": "legacy_non_attempt",
+    }
     assert state["processed"] == ["routine-message-1"]
     assert (
         state["notification_outbox"]["routine-message-1"]["activation_status"]
@@ -656,6 +748,164 @@ async def test_crash_after_ack_before_processed_replays_exact_ack_and_then_activ
     await restarted._flush_notifications()
     await restarted._flush_notifications()
     assert len(activations) == 1
+
+
+@pytest.mark.asyncio
+async def test_routine_restart_expired_attempt_a_never_generic_acks_live_attempt_b(
+    tmp_path: Path,
+) -> None:
+    first_client = AttemptRoutineClient(crash_on_attempt_ack=True)
+    first = adapter_at(tmp_path, first_client)
+    install_attempt_a(first)
+    with pytest.raises(SimulatedRoutineCrash, match="crash after Routine custody"):
+        await first._handle_routine_event(routine_message(), attempt_id=ATTEMPT_A)
+    ownership = StateStore(tmp_path / "state.json").load()[
+        "routine_event_receipts"
+    ]["routine-message-1"]["ack_ownership"]
+    assert ownership == {
+        "version": 1,
+        "kind": "attempt",
+        "attempt_id": ATTEMPT_A,
+        **STRICT_SCOPE,
+        "profile_owner_fingerprint": first._profile_owner_fingerprint,
+    }
+    clear_lease_marker_for_replay(tmp_path)
+
+    client = AttemptRoutineClient(attempt_state="expired", consumed=False)
+    restarted = adapter_at(tmp_path, client)
+    with pytest.raises(RuntimeError, match="Mupot MCP request failed"):
+        await restarted._replay_routine_events()
+
+    assert ("inbox_lease_ack", {"attempt_id": ATTEMPT_A}) in client.calls
+    assert not any(tool == "inbox_ack" for tool, _arguments in client.calls)
+    assert client.attempts[ATTEMPT_B] == "leased"
+    assert client.message_read[ATTEMPT_B] is False
+    state = StateStore(tmp_path / "state.json").load()
+    assert "routine-message-1" not in state.get("processed", [])
+    assert state["routine_event_receipts"]["routine-message-1"]["status"] == "custody"
+
+
+@pytest.mark.asyncio
+async def test_preownership_routine_custody_stays_fenced_without_network(
+    tmp_path: Path,
+) -> None:
+    def crash_before_ack() -> None:
+        raise OSError("crash before legacy ACK")
+
+    first = adapter_at(tmp_path, RoutineClient(before_ack=crash_before_ack))
+    with pytest.raises(OSError, match="crash before legacy ACK"):
+        await first._handle_routine_event(routine_message())
+    state = StateStore(tmp_path / "state.json").load()
+    record = state["routine_event_receipts"]["routine-message-1"]
+    record["version"] = 1
+    record.pop("ack_ownership")
+    StateStore(tmp_path / "state.json").save(state)
+
+    client = RoutineClient()
+    restarted = adapter_at(tmp_path, client)
+    assert await restarted.connect() is False
+    with pytest.raises(RuntimeError):
+        await restarted._replay_routine_events()
+
+    assert client.connect_calls == 0
+    assert client.calls == []
+    durable = StateStore(tmp_path / "state.json").load()
+    assert durable["routine_event_receipts"]["routine-message-1"] == record
+    assert "routine-message-1" not in durable.get("processed", [])
+
+
+@pytest.mark.asyncio
+async def test_preownership_processed_routine_receipt_remains_terminal(
+    tmp_path: Path,
+) -> None:
+    from plugin.mupot_gateway.routine_events import pending_routine_receipts
+
+    adapter = adapter_at(tmp_path, RoutineClient())
+    await adapter._handle_routine_event(routine_message())
+    state = StateStore(tmp_path / "state.json").load()
+    record = state["routine_event_receipts"]["routine-message-1"]
+    record["version"] = 1
+    record.pop("ack_ownership")
+    StateStore(tmp_path / "state.json").save(state)
+
+    assert pending_routine_receipts(state) == []
+
+
+@pytest.mark.asyncio
+async def test_routine_restart_acked_attempt_replay_processes_once_without_generic_ack(
+    tmp_path: Path,
+) -> None:
+    first_client = AttemptRoutineClient(crash_on_attempt_ack=True)
+    first = adapter_at(tmp_path, first_client)
+    install_attempt_a(first)
+    with pytest.raises(SimulatedRoutineCrash):
+        await first._handle_routine_event(routine_message(), attempt_id=ATTEMPT_A)
+    clear_lease_marker_for_replay(tmp_path)
+
+    client = AttemptRoutineClient(attempt_state="acked", consumed=True)
+    restarted = adapter_at(tmp_path, client)
+    await restarted._replay_routine_events()
+    await restarted._replay_routine_events()
+
+    assert [tool for tool, _arguments in client.calls].count("inbox_lease_ack") == 1
+    assert not any(tool == "inbox_ack" for tool, _arguments in client.calls)
+    state = StateStore(tmp_path / "state.json").load()
+    assert state["processed"] == ["routine-message-1"]
+    assert state["routine_event_receipts"]["routine-message-1"]["status"] == "processed"
+
+
+@pytest.mark.asyncio
+async def test_routine_restart_scope_swap_stops_before_attempt_or_generic_ack(
+    tmp_path: Path,
+) -> None:
+    first_client = AttemptRoutineClient(crash_on_attempt_ack=True)
+    first = adapter_at(tmp_path, first_client)
+    install_attempt_a(first)
+    with pytest.raises(SimulatedRoutineCrash):
+        await first._handle_routine_event(routine_message(), attempt_id=ATTEMPT_A)
+    clear_lease_marker_for_replay(tmp_path)
+
+    client = AttemptRoutineClient(
+        status_scope={**STRICT_SCOPE, "agent_id": "other-agent"}
+    )
+    restarted = adapter_at(tmp_path, client)
+    with pytest.raises(RuntimeError, match="Mupot MCP request failed"):
+        await restarted._replay_routine_events()
+
+    assert client.calls == [("inbox_consumer_status", {"strict_scope": True})]
+    state = StateStore(tmp_path / "state.json").load()
+    assert "routine-message-1" not in state.get("processed", [])
+    assert state["routine_event_receipts"]["routine-message-1"]["status"] == "custody"
+
+
+@pytest.mark.asyncio
+async def test_routine_restart_profile_owner_swap_stops_before_status_or_ack(
+    tmp_path: Path,
+) -> None:
+    first_client = AttemptRoutineClient(crash_on_attempt_ack=True)
+    first = adapter_at(
+        tmp_path,
+        first_client,
+        owner=ScopeOwner("a" * 64),
+    )
+    install_attempt_a(first)
+    with pytest.raises(SimulatedRoutineCrash):
+        await first._handle_routine_event(routine_message(), attempt_id=ATTEMPT_A)
+    clear_lease_marker_for_replay(tmp_path)
+
+    client = AttemptRoutineClient()
+    restarted = adapter_at(
+        tmp_path,
+        client,
+        owner=ScopeOwner("b" * 64),
+    )
+    with pytest.raises(RuntimeError, match="Mupot MCP request failed"):
+        await restarted._replay_routine_events()
+
+    assert client.calls == []
+    state = StateStore(tmp_path / "state.json").load()
+    assert "routine-message-1" not in state.get("processed", [])
+    assert state["routine_event_receipts"]["routine-message-1"]["status"] == "custody"
 
 
 @pytest.mark.asyncio

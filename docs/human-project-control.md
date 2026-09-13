@@ -64,7 +64,11 @@ not. Only the exact scoped leased tuple is
 processed. Attempt-originated work uses `inbox_lease_ack`, never the generic ACK path, and
 local commit requires an exact `acked` receipt with `consumed: true`. Scope changes,
 non-consumed ACKs, malformed responses, and older markers remain fenced for explicit
-operator reconciliation.
+operator reconciliation. Peer reply and Routine custody records persist the originating
+attempt, strict scope, and profile owner before ACK. Their restart replay revalidates that
+ownership and never substitutes generic `inbox_ack`; only explicitly identified legacy
+non-attempt records may use the generic path. Older pending records without ownership proof
+remain uncertain and fenced.
 
 Use exactly one native Mupot receiver and one Telegram bot per Hermes profile. The same
 profile owns deterministic commands and return delivery; a second receiver or bot creates

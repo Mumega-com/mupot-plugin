@@ -234,6 +234,17 @@ test('migration-backed Routine human wait crosses the plugin with scope-bound at
     })
     expect(consumed.status, consumed.stderr).toBe(0)
     const pluginReceipt = JSON.parse(consumed.stdout) as {
+      ack_ownership: {
+        version: number
+        kind: string
+        attempt_id: string
+        tenant: string
+        agent_id: string
+        effective_inbox_seat: string | null
+        mode: string
+        generation: number
+        profile_owner_fingerprint: string
+      }
       activation_count: number
       activation_status: string
       delivery_status: string
@@ -242,7 +253,7 @@ test('migration-backed Routine human wait crosses the plugin with scope-bound at
       profile_agent_id: string
       source_id: string
     }
-    expect(pluginReceipt).toEqual({
+    expect(pluginReceipt).toMatchObject({
       activation_count: 1,
       activation_status: 'queued',
       delivery_status: 'pending',
@@ -259,6 +270,17 @@ test('migration-backed Routine human wait crosses the plugin with scope-bound at
     expect(lease?.arguments).toMatchObject({ limit: 1 })
     expect(typeof lease?.arguments.attempt_id).toBe('string')
     expect(ack?.arguments).toEqual({ attempt_id: lease?.arguments.attempt_id })
+    expect(pluginReceipt.ack_ownership).toEqual({
+      version: 1,
+      kind: 'attempt',
+      attempt_id: lease?.arguments.attempt_id,
+      tenant: 'tenant-a',
+      agent_id: 'agent-1',
+      effective_inbox_seat: null,
+      mode: 'bearer_only',
+      generation: 0,
+      profile_owner_fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+    })
     expect(bridge.calls.some(call => call.name === 'inbox_ack')).toBe(false)
     expect(bridge.calls.some(call => call.name === 'send')).toBe(false)
     expect(bridge.calls.map(call => call.name)).toContain('boot_context')

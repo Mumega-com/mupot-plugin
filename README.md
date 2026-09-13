@@ -33,8 +33,12 @@ remains valid; a different profile presenting the same server scope stays fenced
 exact scope-matching
 `leased` tuple is processed, and only an exact `acked`/`consumed:true` attempt receipt permits
 local commit and marker clearing. Terminal non-consumed or mismatched receipts remain fenced.
-Legacy non-attempt paths alone use `inbox_ack`; older reconciliation markers stay fenced for
-manual recovery. The receiver also verifies the operator's expected agent/tenant, preserves
+Before any source ACK, peer reply and Routine custody records also persist the originating
+attempt, strict scope, and profile owner. Restart replay revalidates those facts and remains
+on `inbox_lease_ack`; an expired attempt can never fall through and consume a newer lease.
+Only records durably identified as non-attempt work use `inbox_ack`; ambiguous older outbox
+records and older reconciliation markers stay fenced for manual recovery. The receiver also
+verifies the operator's expected agent/tenant, preserves
 message correlation, and consumes a source only after successful handling. Terminal ACKs
 are preserved without generating another peer reply. It does not start an SOS connection.
 

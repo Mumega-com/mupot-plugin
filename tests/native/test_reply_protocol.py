@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,29 @@ from plugin.mupot_gateway.adapter import (
 
 class SimulatedCrash(BaseException):
     """Stop execution at a crash boundary that ordinary recovery must not swallow."""
+
+
+class ScopeOwner:
+    def __init__(self, fingerprint: str) -> None:
+        self.fingerprint = fingerprint
+
+    def validated_fingerprint(self) -> str:
+        return self.fingerprint
+
+    @contextmanager
+    def activate(self):
+        yield
+
+
+ATTEMPT_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+ATTEMPT_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+STRICT_SCOPE = {
+    "tenant": "tenant-test",
+    "agent_id": "receiver",
+    "effective_inbox_seat": "native",
+    "mode": "bearer_only",
+    "generation": 0,
+}
 
 
 class ProtocolClient:
@@ -96,6 +120,42 @@ class ProtocolClient:
         }
 
 
+class AttemptReplayClient(ProtocolClient):
+    def __init__(
+        self,
+        *,
+        attempt_state: str,
+        consumed: bool,
+        status_scope: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self.attempt_state = attempt_state
+        self.consumed = consumed
+        self.status_scope = status_scope or STRICT_SCOPE
+        self.attempts = {ATTEMPT_A: attempt_state, ATTEMPT_B: "leased"}
+        self.message_read = {ATTEMPT_B: False}
+
+    async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool == "inbox_consumer_status":
+            self.calls.append((tool, copy.deepcopy(arguments)))
+            return {"strict_scope": True, **self.status_scope, "key_matches": True}
+        if tool == "inbox_lease_ack":
+            self.calls.append((tool, copy.deepcopy(arguments)))
+            assert arguments == {"attempt_id": ATTEMPT_A}
+            return {
+                "tenant": "tenant-test",
+                "agent_id": "receiver",
+                "effective_inbox_seat": "native",
+                "attempt_id": ATTEMPT_A,
+                "state": self.attempt_state,
+                "consumed": self.consumed,
+            }
+        if tool == "inbox_ack":
+            self.attempts[ATTEMPT_B] = "acked"
+            self.message_read[ATTEMPT_B] = True
+        return await super().call(tool, arguments)
+
+
 def source_message(source_id: str = "source-1") -> dict[str, Any]:
     return {
         "id": source_id,
@@ -122,7 +182,11 @@ def source_message(source_id: str = "source-1") -> dict[str, Any]:
     }
 
 
-def adapter_at(tmp_path: Path, client: ProtocolClient) -> MupotAdapter:
+def adapter_at(
+    tmp_path: Path,
+    client: ProtocolClient,
+    owner: ScopeOwner | None = None,
+) -> MupotAdapter:
     return MupotAdapter(
         PlatformConfig(
             enabled=True,
@@ -134,6 +198,7 @@ def adapter_at(tmp_path: Path, client: ProtocolClient) -> MupotAdapter:
             },
         ),
         client_factory=lambda _server: client,
+        secret_owner=owner,  # type: ignore[arg-type]
     )
 
 
@@ -143,6 +208,32 @@ async def bind_delivery(
 ) -> None:
     event, _runtime = adapter._begin_delivery(message or source_message())
     await adapter.on_processing_start(event)
+
+
+async def bind_attempt_delivery(
+    adapter: MupotAdapter,
+    message: dict[str, Any] | None = None,
+) -> None:
+    source = message or source_message()
+    adapter._consumer_fence = copy.deepcopy(STRICT_SCOPE)
+    adapter._state["lease_reconciliation"] = {
+        "version": 3,
+        "required": True,
+        **STRICT_SCOPE,
+        "profile_owner_fingerprint": adapter._profile_owner_fingerprint,
+        "attempt_id": ATTEMPT_A,
+    }
+    adapter._state["pending"] = {"message": copy.deepcopy(source)}
+    adapter.store.save(adapter._state)
+    event, _runtime = adapter._begin_delivery(source, attempt_id=ATTEMPT_A)
+    await adapter.on_processing_start(event)
+
+
+def clear_lease_marker_for_replay(path: Path) -> None:
+    state_path = path / "state.json"
+    state = StateStore(state_path).load()
+    state.pop("lease_reconciliation", None)
+    StateStore(state_path).save(state)
 
 
 @pytest.mark.asyncio
@@ -222,6 +313,10 @@ async def test_restart_replays_prepared_final_without_another_model_turn(
     with pytest.raises(SimulatedCrash):
         await first.send("sender", "Exact prepared final.")
     prepared = copy.deepcopy(StateStore(tmp_path / "state.json").load())
+    assert prepared["reply_outbox"]["source-1"]["ack_ownership"] == {
+        "version": 1,
+        "kind": "legacy_non_attempt",
+    }
 
     replay_client = ProtocolClient()
     restarted = adapter_at(tmp_path, replay_client)
@@ -246,6 +341,134 @@ async def test_restart_replays_prepared_final_without_another_model_turn(
     sent = [args for tool, args in replay_client.calls if tool == "send"]
     assert sent == [prepared["reply_outbox"]["source-1"]["arguments"]]
     assert sent[0]["body"] == "Exact prepared final."
+
+
+@pytest.mark.asyncio
+async def test_preownership_pending_reply_outbox_stays_fenced_without_network(
+    tmp_path: Path,
+) -> None:
+    client = ProtocolClient()
+    adapter = adapter_at(tmp_path, client)
+    message = source_message()
+    adapter._state["pending"] = {"message": copy.deepcopy(message)}
+    adapter.store.save(adapter._state)
+    await bind_delivery(adapter, message)
+    assert (await adapter.send("sender", "Legacy ambiguous final.")).success is True
+    state = StateStore(tmp_path / "state.json").load()
+    record = state["reply_outbox"]["source-1"]
+    record["version"] = 1
+    record.pop("ack_ownership")
+    StateStore(tmp_path / "state.json").save(state)
+
+    restarted_client = ProtocolClient()
+    restarted = adapter_at(tmp_path, restarted_client)
+    assert await restarted.connect() is False
+    with pytest.raises(RuntimeError, match="Mupot MCP request failed"):
+        await restarted._replay_reply_outbox()
+
+    assert restarted_client.calls == []
+    durable = StateStore(tmp_path / "state.json").load()
+    assert durable["reply_outbox"]["source-1"] == record
+    assert "source-1" not in durable.get("processed", [])
+
+
+@pytest.mark.asyncio
+async def test_peer_restart_expired_attempt_a_never_generic_acks_live_attempt_b(
+    tmp_path: Path,
+) -> None:
+    first = adapter_at(tmp_path, ProtocolClient())
+    await bind_attempt_delivery(first)
+    result = await first.send("sender", "Durable exact final.")
+    assert result.success is True
+    ownership = StateStore(tmp_path / "state.json").load()["reply_outbox"][
+        "source-1"
+    ]["ack_ownership"]
+    assert ownership == {
+        "version": 1,
+        "kind": "attempt",
+        "attempt_id": ATTEMPT_A,
+        **STRICT_SCOPE,
+        "profile_owner_fingerprint": first._profile_owner_fingerprint,
+    }
+    clear_lease_marker_for_replay(tmp_path)
+
+    client = AttemptReplayClient(attempt_state="expired", consumed=False)
+    restarted = adapter_at(tmp_path, client)
+    with pytest.raises(RuntimeError, match="Mupot MCP request failed"):
+        await restarted._replay_reply_outbox()
+
+    assert ("inbox_lease_ack", {"attempt_id": ATTEMPT_A}) in client.calls
+    assert not any(tool == "inbox_ack" for tool, _arguments in client.calls)
+    assert client.attempts[ATTEMPT_B] == "leased"
+    assert client.message_read[ATTEMPT_B] is False
+    state = StateStore(tmp_path / "state.json").load()
+    assert "source-1" not in state.get("processed", [])
+    assert state["reply_outbox"]["source-1"]["status"] == "custodied"
+
+
+@pytest.mark.asyncio
+async def test_peer_restart_acked_attempt_replay_commits_once_without_generic_ack(
+    tmp_path: Path,
+) -> None:
+    first = adapter_at(tmp_path, ProtocolClient())
+    await bind_attempt_delivery(first)
+    assert (await first.send("sender", "Durable exact final.")).success is True
+    clear_lease_marker_for_replay(tmp_path)
+
+    client = AttemptReplayClient(attempt_state="acked", consumed=True)
+    restarted = adapter_at(tmp_path, client)
+    await restarted._replay_reply_outbox()
+    await restarted._replay_reply_outbox()
+
+    assert [tool for tool, _arguments in client.calls].count("inbox_lease_ack") == 1
+    assert not any(tool == "inbox_ack" for tool, _arguments in client.calls)
+    state = StateStore(tmp_path / "state.json").load()
+    assert state["processed"] == ["source-1"]
+    assert state["reply_outbox"]["source-1"]["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_peer_restart_scope_swap_stops_before_attempt_or_generic_ack(
+    tmp_path: Path,
+) -> None:
+    first = adapter_at(tmp_path, ProtocolClient())
+    await bind_attempt_delivery(first)
+    assert (await first.send("sender", "Durable exact final.")).success is True
+    clear_lease_marker_for_replay(tmp_path)
+
+    client = AttemptReplayClient(
+        attempt_state="acked",
+        consumed=True,
+        status_scope={**STRICT_SCOPE, "effective_inbox_seat": "other-seat"},
+    )
+    restarted = adapter_at(tmp_path, client)
+    with pytest.raises(RuntimeError, match="Mupot MCP request failed"):
+        await restarted._replay_reply_outbox()
+
+    assert client.calls == [("inbox_consumer_status", {"strict_scope": True})]
+    state = StateStore(tmp_path / "state.json").load()
+    assert "source-1" not in state.get("processed", [])
+    assert state["reply_outbox"]["source-1"]["status"] == "custodied"
+
+
+@pytest.mark.asyncio
+async def test_peer_restart_profile_owner_swap_stops_before_status_or_ack(
+    tmp_path: Path,
+) -> None:
+    first = adapter_at(tmp_path, ProtocolClient(), ScopeOwner("a" * 64))
+    await bind_attempt_delivery(first)
+    assert (await first.send("sender", "Durable exact final.")).success is True
+    clear_lease_marker_for_replay(tmp_path)
+
+    client = AttemptReplayClient(attempt_state="acked", consumed=True)
+    restarted = adapter_at(tmp_path, client, ScopeOwner("b" * 64))
+    with pytest.raises(RuntimeError, match="Mupot MCP request failed"):
+        await restarted._replay_reply_outbox()
+
+    assert client.calls == []
+    state = StateStore(tmp_path / "state.json").load()
+    assert "source-1" not in state.get("processed", [])
+    assert state["reply_outbox"]["source-1"]["status"] == "custodied"
 
 
 @pytest.mark.asyncio

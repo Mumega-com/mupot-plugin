@@ -120,8 +120,10 @@ async def _main() -> None:
 
     state = adapter.store.load()
     notice = state["notification_outbox"][source_id]
+    routine_receipt = state["routine_event_receipts"][source_id]
     manager.unload("mupot")
     print(json.dumps({
+        "ack_ownership": routine_receipt["ack_ownership"],
         "activation_count": len(activations),
         "activation_status": notice["activation_status"],
         "delivery_status": notice["delivery_status"],

@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
+from .lease_ownership import AckOwnershipError, validate_ack_ownership
+
 
 _SOURCE_AGENT = "mupot-routines"
 _SOURCE_MEMBER = "system:routines"
@@ -25,7 +27,8 @@ _REF_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
 _SOURCE_ID_RE = re.compile(r"^[^\s]{1,128}$")
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _CHECKSUM_RE = re.compile(r"^[a-f0-9]{64}$")
-_RECEIPT_VERSION = 1
+_RECEIPT_VERSION = 2
+_QUARANTINE_VERSION = 1
 _IMMUTABLE_SOURCE_FIELDS = (
     "seq",
     "id",
@@ -334,7 +337,19 @@ def _persist_exact(
     state.update(durable)
 
 
-def persist_routine_receipt(state, store, source, event: RoutineHumanWaitEvent) -> None:
+def persist_routine_receipt(
+    state,
+    store,
+    source,
+    event: RoutineHumanWaitEvent,
+    ack_ownership: Mapping[str, Any],
+) -> None:
+    try:
+        ownership = validate_ack_ownership(ack_ownership)
+    except AckOwnershipError:
+        raise RoutineEventCustodyError(
+            "Routine event acknowledgement ownership is invalid"
+        ) from None
     fingerprint = _source_fingerprint(source)
     durable, valid = store.load_checked()
     if not valid:
@@ -352,6 +367,7 @@ def persist_routine_receipt(state, store, source, event: RoutineHumanWaitEvent) 
             or existing.get("version") != _RECEIPT_VERSION
             or existing.get("source_fingerprint") != fingerprint
             or existing.get("notice") != event.notice
+            or existing.get("ack_ownership") != ownership
         ):
             raise RoutineEventConflict("Routine event source conflict")
         candidate = copy.deepcopy(durable)
@@ -368,6 +384,7 @@ def persist_routine_receipt(state, store, source, event: RoutineHumanWaitEvent) 
         "source_fingerprint": fingerprint,
         "source": copy.deepcopy(dict(source)),
         "notice": event.notice,
+        "ack_ownership": ownership,
         "status": "custody",
     }
     candidate["routine_event_receipts"][event.source_id] = expected
@@ -403,7 +420,7 @@ def quarantine_routine_event(state, store, source, reason: str) -> None:
         candidate = copy.deepcopy(durable if store.path.exists() else state)
         candidate.setdefault("routine_event_quarantine", {})
         expected = {
-            "version": _RECEIPT_VERSION,
+            "version": _QUARANTINE_VERSION,
             "source_id": source_id,
             "source_fingerprint": fingerprint,
             "reason": reason,
@@ -445,14 +462,26 @@ def pending_routine_receipts(state) -> list[dict[str, Any]]:
     for source_id, record in records.items():
         if not isinstance(record, dict):
             raise RoutineEventCustodyError("Routine event custody record is invalid")
+        legacy_processed = (
+            record.get("version") == 1
+            and record.get("status") == "processed"
+            and "ack_ownership" not in record
+        )
         if (
-            record.get("version") != _RECEIPT_VERSION
+            not (record.get("version") == _RECEIPT_VERSION or legacy_processed)
             or record.get("source_id") != source_id
             or not isinstance(record.get("source"), dict)
             or record.get("status") not in {"custody", "processed"}
         ):
             raise RoutineEventCustodyError("Routine event custody record is invalid")
         event = validate_routine_event(record["source"])
+        if not legacy_processed:
+            try:
+                validate_ack_ownership(record.get("ack_ownership"))
+            except AckOwnershipError:
+                raise RoutineEventCustodyError(
+                    "Routine event acknowledgement ownership is invalid"
+                ) from None
         if (
             event.source_id != source_id
             or record.get("source_fingerprint") != _source_fingerprint(record["source"])

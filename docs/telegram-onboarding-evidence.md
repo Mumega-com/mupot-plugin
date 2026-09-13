@@ -8,8 +8,9 @@ or pilot completion.
 
 ## Exact local contracts
 
-- Final verified plugin head: `457ac9816ec1b2532eb959b05a664cbccde2532c`.
-- Mupot server checkout: `80001a11c29d93a5dd83f09f87eeaff92514f851`,
+- Plugin head before this repair slice: `0c68246c5764303c1382d05f9caa2a2e58f13116`.
+- Mupot server checkout: `22c778d88d7378a1c4df164552bd541a1be1f812`
+  (attempt contract introduced at `80001a11c29d93a5dd83f09f87eeaff92514f851`),
   clean tracked tree.
 - Hermes native contract: `233757037df1f03f9fe1cfddc097acd5ad7f7510`.
 
@@ -28,7 +29,9 @@ The plugin consumer proves durable Routine custody and notice custody, one scope
 attempt ACK, one private-session activation acceptance, no peer model turn, and no outbound
 send to the synthetic Routine source. The harness observes the real server attempt tombstone
 at `state=acked`, matches the random attempt ID emitted on the HTTP wire, and reads back
-`agent_messages.read_at` from the same database.
+`agent_messages.read_at` from the same database. It also reads the plugin's durable Routine
+custody record and requires its attempt, strict scope, and profile-owner fingerprint to
+match that wire attempt before accepting the result.
 It separately proves the participant's squad capability reaches the intended project, the
 Routine's responsible squad matches that edge, and the materialized run's
 `assigned_agent_id` equals the `agent_id` obtained by discovering the plugin through a real
@@ -38,8 +41,8 @@ or activation and leaves the server message unread. The matched path also proves
 exposes the pending question and one exact `/answer` records the human decision.
 
 Fresh verification passed the two cross-repository tests 2/2, standalone pytest 220 plus 12
-subtests, standalone unittest 27/27, local native 243/243, and clean-detached pinned-Hermes
-native 243/243. Ruff, mypy, Python compilation, shell parsing, four-file YAML parsing,
+subtests, standalone unittest 27/27, local native 254/254, and clean-detached pinned-Hermes
+native 254/254. Ruff, mypy, Python compilation, shell parsing, four-file YAML parsing,
 relative-link checks, working and full-base whitespace checks, and credential-shape checks
 also passed. The current lease-attempt commands are retained in the ignored hostile Task 2
 report; the earlier integration mutation results remain in the Task 8 report.
@@ -69,8 +72,9 @@ invitation, and pilot execution remain separately controlled and unproven.
 ## Final attempt-v3 and notification-fence verification
 
 The final cross-repository run used the real plugin HTTP client against the registered Mupot
-MCP application at server head `80001a11c29d93a5dd83f09f87eeaff92514f851` and migration
-order `0152_telegram_project_onboarding.sql` then
+MCP application at server head `22c778d88d7378a1c4df164552bd541a1be1f812`
+(attempt code `80001a11c29d93a5dd83f09f87eeaff92514f851`) and migration order
+`0152_telegram_project_onboarding.sql` then
 `0153_inbox_lease_attempt_reconciliation.sql`. It passed 2/2 cases and observed strict scope,
 random attempt lease, exact attempt ACK, the `acked` server tombstone, consumed message
 readback, matched assigned/profile agent identity, and one activation acceptance. The

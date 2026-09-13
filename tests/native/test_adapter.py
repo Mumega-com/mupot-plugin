@@ -15,6 +15,7 @@ from gateway.platforms.base import ProcessingOutcome
 
 from plugin.mupot_gateway.adapter import (  # noqa: E402
     MupotProtocolError,
+    MupotSafeRetryError,
     MupotTransportError,
     MupotAdapter,
     StateStore,
@@ -148,6 +149,27 @@ class LeasePayloadClient(FakeMupotClient):
         return await super().call(tool, arguments)
 
 
+class TimedLeaseFailureClient(FakeMupotClient):
+    def __init__(
+        self,
+        clock: list[float],
+        outcomes: list[tuple[float, Exception]],
+    ) -> None:
+        super().__init__()
+        self.clock = clock
+        self.outcomes = outcomes
+        self.first_lease = asyncio.Event()
+
+    async def call(self, tool: str, arguments: dict) -> dict:
+        if tool == "inbox_lease":
+            self.lease_calls += 1
+            self.first_lease.set()
+            issued_at, failure = self.outcomes.pop(0)
+            self.clock[0] = issued_at
+            raise failure
+        return await super().call(tool, arguments)
+
+
 class ReconciliationClient(FakeMupotClient):
     def __init__(self, status: object) -> None:
         super().__init__()
@@ -209,6 +231,7 @@ async def persist_ambiguous_lease_quarantine(
             enabled=True,
             extra={
                 "lease_seconds": 1,
+                "rpc_timeout": 5,
                 "poll_interval": 0.01,
                 "state_path": str(state_path),
             },
@@ -869,6 +892,7 @@ async def test_reconstructed_adapter_stays_fenced_without_network(
     marker = StateStore(state_path).load().get("lease_reconciliation")
     assert isinstance(marker, dict)
     assert marker["required"] is True
+    assert marker["reconcile_after"] == 106.0
     monkeypatch.setattr(time, "time", lambda: 200.0)
 
     client = ReconciliationClient(
@@ -986,8 +1010,15 @@ async def test_explicit_reconciliation_before_lease_deadline_does_no_network(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state_path = await persist_ambiguous_lease_quarantine(tmp_path, monkeypatch)
-    monkeypatch.setattr(time, "time", lambda: 100.5)
-    client = ReconciliationClient({})
+    monkeypatch.setattr(time, "time", lambda: 105.999)
+    client = ReconciliationClient(
+        {
+            "agent_id": "agent-consumer",
+            "mode": "bearer_only",
+            "generation": 0,
+            "key_matches": True,
+        }
+    )
     reconstructed = MupotAdapter(
         PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
         client_factory=lambda *_: client,
@@ -1007,7 +1038,7 @@ async def test_explicit_reconciliation_clears_only_after_exact_readback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state_path = await persist_ambiguous_lease_quarantine(tmp_path, monkeypatch)
-    monkeypatch.setattr(time, "time", lambda: 101.0)
+    monkeypatch.setattr(time, "time", lambda: 106.0)
     client = ReconciliationClient(
         {
             "agent_id": "agent-consumer",
@@ -1043,7 +1074,7 @@ async def test_failed_reconciliation_readback_remains_durably_fenced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state_path = await persist_ambiguous_lease_quarantine(tmp_path, monkeypatch)
-    monkeypatch.setattr(time, "time", lambda: 101.0)
+    monkeypatch.setattr(time, "time", lambda: 106.0)
     client = ReconciliationClient(
         {
             "agent_id": "agent-consumer",
@@ -1064,6 +1095,104 @@ async def test_failed_reconciliation_readback_remains_durably_fenced(
     assert getattr(reconstructed, "_lease_quarantined", False) is True
     assert await reconstructed.connect() is False
     assert client.tools == ["inbox_consumer_status"]
+
+
+@pytest.mark.asyncio
+async def test_delayed_ambiguous_lease_reserves_full_rpc_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    state_path = tmp_path / "state.json"
+    client = TimedLeaseFailureClient(
+        clock,
+        [(104.999, MupotTransportError("Mupot request failed"))],
+    )
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "lease_seconds": 1,
+                "rpc_timeout": 5,
+                "poll_interval": 0.01,
+                "state_path": str(state_path),
+            },
+        ),
+        client_factory=lambda *_: client,
+    )
+
+    assert await adapter.connect()
+    try:
+        await asyncio.wait_for(client.first_lease.wait(), 1)
+        for _ in range(100):
+            if not adapter._running:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await adapter.disconnect()
+
+    marker = StateStore(state_path).load()["lease_reconciliation"]
+    assert marker["reconcile_after"] == 106.0
+
+
+@pytest.mark.asyncio
+async def test_safe_retry_rewrites_full_window_and_clears_at_exact_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    state_path = tmp_path / "state.json"
+    client = TimedLeaseFailureClient(
+        clock,
+        [
+            (104.0, MupotSafeRetryError("Mupot request failed")),
+            (109.999, MupotTransportError("Mupot request failed")),
+        ],
+    )
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "lease_seconds": 1,
+                "rpc_timeout": 5,
+                "poll_interval": 0.01,
+                "state_path": str(state_path),
+            },
+        ),
+        client_factory=lambda *_: client,
+    )
+
+    assert await adapter.connect()
+    try:
+        await asyncio.wait_for(client.first_lease.wait(), 1)
+        for _ in range(100):
+            if not adapter._running:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await adapter.disconnect()
+    marker = StateStore(state_path).load()["lease_reconciliation"]
+    assert marker["reconcile_after"] == 110.0
+
+    readback = ReconciliationClient(
+        {
+            "agent_id": "agent-consumer",
+            "mode": "bearer_only",
+            "generation": 0,
+            "key_matches": True,
+        }
+    )
+    reconstructed = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
+        client_factory=lambda *_: readback,
+    )
+    assert await reconstructed.reconcile_inbox_polling() is False
+    assert readback.tools == []
+    clock[0] = 110.0
+    assert await reconstructed.reconcile_inbox_polling() is True
+    assert readback.tools == ["inbox_consumer_status"]
 
 
 @pytest.mark.asyncio

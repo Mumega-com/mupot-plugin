@@ -509,7 +509,7 @@ class HermesMCPClient:
             self._headers = {
                 name: value
                 for name, value in self._headers.items()
-                if name.lower() != "authorization"
+                if name.lower() not in {"authorization", "accept-encoding"}
             }
             timeout_sec = float(cfg.get("timeout") or 30.0)
             self._client = httpx.AsyncClient(
@@ -537,7 +537,11 @@ class HermesMCPClient:
                     },
                 }
                 token = read_profile_secret("MUPOT_AGENT_TOKEN")
-                headers = {**self._headers, "Authorization": f"Bearer {token}"}
+                headers = {
+                    **self._headers,
+                    "Authorization": f"Bearer {token}",
+                    "Accept-Encoding": "identity",
+                }
                 client = self._client
                 url = self._url
                 if client is None or url is None:
@@ -1248,7 +1252,9 @@ class MupotAdapter(BasePlatformAdapter):
             "version": 1,
             "required": True,
             **proof,
-            "reconcile_after": time.time() + self.lease_seconds,
+            "reconcile_after": (
+                time.time() + self.rpc_timeout + self.lease_seconds
+            ),
         }
         self.store.save(fenced)
         self._state = fenced

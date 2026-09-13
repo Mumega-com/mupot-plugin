@@ -402,6 +402,57 @@ async def test_connect_failure_is_the_only_explicit_safe_before_send_retry(
     assert len(calls) == 1
 
 
+@pytest.mark.asyncio
+async def test_real_httpx_wire_forces_identity_over_configured_compression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import config as config_module
+    from hermes_cli import mcp_config
+    from plugin.mupot_gateway import adapter as adapter_module
+
+    real_async_client = httpx.AsyncClient
+    seen_headers: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_headers.append(request.headers.get_list("accept-encoding"))
+        return httpx.Response(
+            200,
+            stream=httpx.ByteStream(
+                json.dumps(tool_result({"ok": True})).encode("utf-8")
+            ),
+            headers={"content-type": "application/json"},
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(transport=transport, **kwargs)
+
+    raw_config = {
+        "mcp_servers": {
+            "mupot": {
+                "url": "https://pot.example.invalid/mcp",
+                "headers": {
+                    "Accept-Encoding": "gzip",
+                    "accept-encoding": "br",
+                },
+                "timeout": 5,
+            }
+        }
+    }
+    monkeypatch.setattr(config_module, "load_config", lambda: raw_config)
+    monkeypatch.setattr(mcp_config, "_resolve_mcp_server_config", lambda value: value)
+    monkeypatch.setattr(adapter_module.httpx, "AsyncClient", client_factory)
+    scope = set_secret_scope({"MUPOT_AGENT_TOKEN": "native-test-token"})
+    try:
+        result = await HermesMCPClient("mupot").call("status", {})
+    finally:
+        reset_secret_scope(scope)
+
+    assert result == {"ok": True}
+    assert seen_headers == [["identity"]]
+
+
 class ReceiptClient:
     def __init__(self, receipt: Any) -> None:
         self.receipt = receipt

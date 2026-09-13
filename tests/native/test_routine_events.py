@@ -110,17 +110,22 @@ class PollRoutineClient(RoutineClient):
             }
         if tool == "inbox_lease":
             self.calls.append((tool, copy.deepcopy(arguments)))
+            attempt_id = arguments["attempt_id"]
             if self.leased:
                 messages = []
+                state = "empty"
+                lease_expires_at = None
             else:
                 self.leased = True
                 messages = [copy.deepcopy(self.message)]
+                state = "leased"
+                lease_expires_at = self.message["lease_expires_at"]
             return {
+                "attempt_id": attempt_id,
+                "state": state,
+                "lease_expires_at": lease_expires_at,
                 "messages": messages,
-                "remaining": 0,
-                "complete": True,
-                "dead_lettered": 0,
-                "lease_seconds": arguments["lease_seconds"],
+                "consumed": False,
             }
         return await super().call(tool, arguments)
 

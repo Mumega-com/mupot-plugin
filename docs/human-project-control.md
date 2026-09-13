@@ -53,6 +53,14 @@ the server migration ledger, exact profile/webhook configuration, project/routin
 and a live non-admin pilot. Enabling handlers or notifications alone does not prove that
 loop. Ordinary project members receive no agent token or administrator access.
 
+Native inbox recovery is server-authoritative. Before each one-message lease, the plugin
+fsyncs a bounded random attempt ID together with the authenticated consumer fence. A safe
+pre-send retry reuses that ID. After restart or an ambiguous response, the plugin verifies
+the same consumer fence and asks Mupot for the durable attempt receipt; local wall-clock
+movement cannot authorize recovery. Only an exact live leased tuple is processed and ACKed.
+Empty or terminal tombstones clear without invoking the runtime, while malformed,
+mismatched, or legacy local-clock markers stay fenced for explicit operator reconciliation.
+
 Use exactly one native Mupot receiver and one Telegram bot per Hermes profile. The same
 profile owns deterministic commands and return delivery; a second receiver or bot creates
 ambiguous ownership and is unsupported. The hosted production origin is

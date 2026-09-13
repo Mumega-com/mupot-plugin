@@ -21,10 +21,15 @@ platform alongside the existing restricted operator tools. It is mutually exclus
 with `inbox_watch_enabled`; enabling both is rejected before registration. Existing
 CLI/SSE-stream configurations remain opt-in and unchanged when native mode is off.
 
-The native receiver uses Mupot's existing `inbox_lease`/`inbox_ack` interface, verifies
-the operator's expected agent/tenant before receiving, preserves message correlation,
-and consumes a source only after successful handling. Terminal ACKs are preserved
-without generating another peer reply. It does not start an SOS connection.
+The native receiver uses Mupot's server-authoritative `inbox_lease` attempt receipts and
+`inbox_ack` interface. It durably records one random attempt ID before leasing, reuses that
+ID for the single proven-safe transport retry, and resolves an ambiguous or restarted
+attempt through `inbox_lease_reconcile` before admitting new work. Only the exact `leased`
+tuple is processed and ACKed; terminal `empty`, `cancelled`, `expired`, and `acked` receipts
+clear without processing. Legacy local-clock reconciliation markers remain fenced for
+manual recovery. The receiver also verifies the operator's expected agent/tenant, preserves
+message correlation, and consumes a source only after successful handling. Terminal ACKs
+are preserved without generating another peer reply. It does not start an SOS connection.
 
 Enable `mupot.routine_events_enabled: true` for the dedicated authenticated
 `routine.human-wait/v1` receive path. This opt-in does not add `mupot-routines` to

@@ -170,12 +170,13 @@ async def call_native(
     response: StreamingResponse,
     *,
     tool: str = "status",
+    arguments: dict[str, Any] | None = None,
     error: Exception | None = None,
 ) -> tuple[Any, list[dict[str, Any]]]:
     calls = install_transport(monkeypatch, response, error=error)
     scope = set_secret_scope({"MUPOT_AGENT_TOKEN": "native-test-token"})
     try:
-        value = await HermesMCPClient("mupot").call(tool, {})
+        value = await HermesMCPClient("mupot").call(tool, arguments or {})
     finally:
         reset_secret_scope(scope)
     return value, calls
@@ -451,6 +452,53 @@ async def test_real_httpx_wire_forces_identity_over_configured_compression(
 
     assert result == {"ok": True}
     assert seen_headers == [["identity"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        {
+            "attempt_id": "other-attempt-id-1234",
+            "state": "empty",
+            "lease_expires_at": None,
+            "messages": [],
+            "consumed": False,
+        },
+        {
+            "attempt_id": "attempt-id-12345678",
+            "state": "unknown",
+            "lease_expires_at": None,
+            "messages": [],
+            "consumed": False,
+        },
+        {
+            "attempt_id": "attempt-id-12345678",
+            "state": "cancelled",
+            "lease_expires_at": None,
+            "messages": [{}],
+            "consumed": False,
+        },
+    ],
+)
+async def test_native_client_rejects_invalid_attempt_tool_result(
+    monkeypatch: pytest.MonkeyPatch,
+    result: dict[str, Any],
+) -> None:
+    payload = tool_result(
+        result,
+        tool="inbox_lease_reconcile",
+        wrapper="structured",
+    )
+    with pytest.raises(RuntimeError) as failure:
+        await call_native(
+            monkeypatch,
+            StreamingResponse(payload),
+            tool="inbox_lease_reconcile",
+            arguments={"attempt_id": "attempt-id-12345678"},
+        )
+
+    assert str(failure.value) == GENERIC_PROTOCOL_ERROR
 
 
 class ReceiptClient:

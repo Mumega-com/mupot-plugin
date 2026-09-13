@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -48,6 +49,11 @@ _GENERIC_DELIVERY_CONTEXT_ERROR = "Mupot delivery context unavailable"
 _DELIVERY_CONTEXT_METADATA_KEY = "_mupot_delivery_context"
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _REPLY_OUTBOX_VERSION = 1
+_LEASE_ATTEMPT_MARKER_VERSION = 2
+_LEASE_ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_LEASE_ATTEMPT_STATES = frozenset(
+    {"leased", "empty", "cancelled", "expired", "acked"}
+)
 _IMMUTABLE_REPLY_SOURCE_FIELDS = (
     "id",
     "seq",
@@ -132,7 +138,12 @@ def _decode_text_wrapper(value: Any, tool: str) -> Any:
     return wrapper["result"]
 
 
-def decode_mcp_result(payload: Any, request_id: int, tool: str) -> dict[str, Any]:
+def decode_mcp_result(
+    payload: Any,
+    request_id: int,
+    tool: str,
+    arguments: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """Validate one correlated JSON-RPC tools/call result and unwrap its data."""
     if (
         not isinstance(payload, dict)
@@ -185,6 +196,11 @@ def decode_mcp_result(payload: Any, request_id: int, tool: str) -> dict[str, Any
     value = structured_value if has_structured else text_value
     if not isinstance(value, dict):
         raise _protocol_error()
+    if tool in {"inbox_lease", "inbox_lease_reconcile"}:
+        attempt_id = (arguments or {}).get("attempt_id")
+        if not isinstance(attempt_id, str):
+            raise _protocol_error()
+        return validate_lease_attempt_result(value, attempt_id)
     return value
 
 
@@ -207,6 +223,63 @@ def validate_send_receipt(
     if result.get("to") != to:
         raise _protocol_error()
     if "project_id" not in result or result.get("project_id") != project_id:
+        raise _protocol_error()
+    return result
+
+
+def validate_lease_attempt_result(
+    result: Any,
+    attempt_id: str,
+) -> dict[str, Any]:
+    """Validate the server-authoritative outcome for one exact lease attempt."""
+    if (
+        not isinstance(result, dict)
+        or set(result) != {
+            "attempt_id",
+            "state",
+            "lease_expires_at",
+            "messages",
+            "consumed",
+        }
+        or not _LEASE_ATTEMPT_ID_RE.fullmatch(attempt_id)
+        or result.get("attempt_id") != attempt_id
+        or result.get("state") not in _LEASE_ATTEMPT_STATES
+        or result.get("consumed") is not False
+        or not isinstance(result.get("messages"), list)
+    ):
+        raise _protocol_error()
+    state = result["state"]
+    messages = result["messages"]
+    lease_expires_at = result.get("lease_expires_at")
+    if state != "leased":
+        if lease_expires_at is not None or messages:
+            raise _protocol_error()
+        return result
+    if (
+        not isinstance(lease_expires_at, str)
+        or not lease_expires_at.strip()
+        or len(messages) != 1
+        or not isinstance(messages[0], dict)
+    ):
+        raise _protocol_error()
+    message = messages[0]
+    if (
+        not isinstance(message.get("id"), str)
+        or not message["id"].strip()
+        or type(message.get("seq")) is not int
+        or message["seq"] <= 0
+        or type(message.get("delivery_attempts")) is not int
+        or message["delivery_attempts"] <= 0
+        or message.get("lease_expires_at") != lease_expires_at
+        or not isinstance(message.get("from_agent"), str)
+        or not message["from_agent"].strip()
+        or not isinstance(message.get("from_member"), str)
+        or not message["from_member"].strip()
+        or not isinstance(message.get("kind"), str)
+        or not isinstance(message.get("body"), str)
+        or not isinstance(message.get("created_at"), str)
+        or not message["created_at"].strip()
+    ):
         raise _protocol_error()
     return result
 
@@ -235,16 +308,24 @@ def _consumer_fence_proof(
 
 
 def _lease_reconciliation_proof(value: Any) -> Optional[dict[str, Any]]:
-    if not isinstance(value, dict) or set(value) != {
+    if not isinstance(value, dict):
+        return None
+    version = value.get("version")
+    common = {
         "version",
         "required",
         "agent_id",
         "mode",
         "generation",
-        "reconcile_after",
-    }:
+    }
+    if version == 1:
+        if set(value) != common | {"reconcile_after"}:
+            return None
+    elif version == _LEASE_ATTEMPT_MARKER_VERSION:
+        if set(value) != common | {"attempt_id"}:
+            return None
+    else:
         return None
-    deadline = value.get("reconcile_after")
     fence = _consumer_fence_proof(
         {
             "agent_id": value.get("agent_id"),
@@ -253,17 +334,25 @@ def _lease_reconciliation_proof(value: Any) -> Optional[dict[str, Any]]:
             "key_matches": True,
         }
     )
+    if value.get("required") is not True or fence is None:
+        return None
+    if version == _LEASE_ATTEMPT_MARKER_VERSION:
+        attempt_id = value.get("attempt_id")
+        if not isinstance(attempt_id, str) or not _LEASE_ATTEMPT_ID_RE.fullmatch(
+            attempt_id
+        ):
+            return None
+        return {"version": version, **fence, "attempt_id": attempt_id}
+
+    deadline = value.get("reconcile_after")
     if (
-        value.get("version") != 1
-        or value.get("required") is not True
-        or fence is None
-        or not isinstance(deadline, (int, float))
+        not isinstance(deadline, (int, float))
         or isinstance(deadline, bool)
         or not math.isfinite(deadline)
         or deadline < 0
     ):
         return None
-    return {**fence, "reconcile_after": float(deadline)}
+    return {"version": version, **fence, "reconcile_after": float(deadline)}
 
 
 def _response_limit(tool: str) -> int:
@@ -570,7 +659,7 @@ class HermesMCPClient:
                     self._client = None
                     raise MupotTransportError(_GENERIC_MCP_TRANSPORT_ERROR) from None
 
-                return decode_mcp_result(payload, req_id, tool)
+                return decode_mcp_result(payload, req_id, tool, arguments)
 
     async def close(self) -> None:
         async with self._lock:
@@ -1243,18 +1332,23 @@ class MupotAdapter(BasePlatformAdapter):
                 raise
         raise AssertionError("unreachable")
 
-    def _persist_prelease_fence(self) -> None:
+    @staticmethod
+    def _new_lease_attempt_id() -> str:
+        attempt_id = secrets.token_urlsafe(24)
+        if not _LEASE_ATTEMPT_ID_RE.fullmatch(attempt_id):
+            raise _protocol_error()
+        return attempt_id
+
+    def _persist_prelease_fence(self, attempt_id: str) -> None:
         proof = self._consumer_fence
-        if proof is None:
+        if proof is None or not _LEASE_ATTEMPT_ID_RE.fullmatch(attempt_id):
             raise _protocol_error()
         fenced = dict(self._state)
         fenced["lease_reconciliation"] = {
-            "version": 1,
+            "version": _LEASE_ATTEMPT_MARKER_VERSION,
             "required": True,
             **proof,
-            "reconcile_after": (
-                time.time() + self.rpc_timeout + self.lease_seconds
-            ),
+            "attempt_id": attempt_id,
         }
         self.store.save(fenced)
         self._state = fenced
@@ -1291,7 +1385,7 @@ class MupotAdapter(BasePlatformAdapter):
             "version": 1,
             "required": True,
             **proof,
-            "reconcile_after": time.time() + self.lease_seconds,
+            "reconcile_after": 0,
         }
         self._lease_quarantined = True
         try:
@@ -1312,13 +1406,25 @@ class MupotAdapter(BasePlatformAdapter):
         logger.error("[mupot] inbox polling quarantined; reconciliation required")
 
     async def reconcile_inbox_polling(self) -> bool:
-        """Explicitly clear a durable quarantine after expiry and exact readback."""
+        """Reconcile a durable attempt through its authoritative server receipt."""
+        if self._secret_owner is not None:
+            try:
+                with self._secret_owner.activate():
+                    return await self._reconcile_inbox_polling_with_active_scope()
+            except Exception:
+                logger.error("[mupot] inbox reconciliation profile scope failed")
+                return False
+        return await self._reconcile_inbox_polling_with_active_scope()
+
+    async def _reconcile_inbox_polling_with_active_scope(self) -> bool:
         marker = _lease_reconciliation_proof(
             self._state.get("lease_reconciliation")
         )
-        if not self._lease_quarantined or marker is None:
-            return False
-        if time.time() < marker["reconcile_after"]:
+        if (
+            not self._lease_quarantined
+            or marker is None
+            or marker.get("version") != _LEASE_ATTEMPT_MARKER_VERSION
+        ):
             return False
         try:
             require_supported_profile_runtime({})
@@ -1337,15 +1443,25 @@ class MupotAdapter(BasePlatformAdapter):
         ):
             logger.error("[mupot] inbox reconciliation readback mismatch")
             return False
-
-        cleared = dict(self._state)
-        cleared.pop("lease_reconciliation", None)
         try:
-            self.store.save(cleared)
+            result = await asyncio.wait_for(
+                self._client.call(
+                    "inbox_lease_reconcile",
+                    {"attempt_id": marker["attempt_id"]},
+                ),
+                timeout=self.rpc_timeout,
+            )
+            outcome = validate_lease_attempt_result(result, marker["attempt_id"])
+            if outcome["state"] == "leased":
+                message = outcome["messages"][0]
+                await self._process_leased_message(message)
+                message_id = message["id"]
+                if message_id not in self._state.get("processed", []):
+                    raise _protocol_error()
+            self._clear_lease_fence()
         except Exception:
-            logger.error("[mupot] inbox reconciliation clear persistence failed")
+            logger.error("[mupot] inbox attempt reconciliation failed")
             return False
-        self._state = cleared
         self._consumer_fence = proof
         self._lease_quarantined = False
         self._fatal_error_code = self._fatal_error_message = None
@@ -1398,25 +1514,21 @@ class MupotAdapter(BasePlatformAdapter):
                 continue
 
             try:
+                attempt_id = self._new_lease_attempt_id()
+                arguments = {
+                    "limit": 1,
+                    "lease_seconds": self.lease_seconds,
+                    "attempt_id": attempt_id,
+                }
                 payload = await self._call_consumer(
                     "inbox_lease",
-                    {"limit": 1, "lease_seconds": self.lease_seconds},
-                    before_attempt=self._persist_prelease_fence,
+                    arguments,
+                    before_attempt=lambda: self._persist_prelease_fence(attempt_id),
                 )
-                if not isinstance(payload, dict) or "messages" not in payload:
-                    raise _protocol_error()
-                messages = payload.get("messages")
-                if (
-                    not isinstance(messages, list)
-                    or len(messages) > 1
-                    or any(not isinstance(message, dict) for message in messages)
-                ):
-                    raise _protocol_error()
-                if messages:
-                    message = messages[0]
+                outcome = validate_lease_attempt_result(payload, attempt_id)
+                if outcome["state"] == "leased":
+                    message = outcome["messages"][0]
                     message_id = str(message.get("id") or "")
-                    if not message_id:
-                        raise _protocol_error()
                     logger.info(
                         "[mupot] leased message=%s seq=%s attempts=%s request_id=%s",
                         message_id,
@@ -1425,6 +1537,8 @@ class MupotAdapter(BasePlatformAdapter):
                         message.get("request_id"),
                     )
                     await self._process_leased_message(message)
+                    if message_id not in self._state.get("processed", []):
+                        raise _protocol_error()
                 self._clear_lease_fence()
             except asyncio.CancelledError:
                 raise
@@ -1463,6 +1577,7 @@ class MupotAdapter(BasePlatformAdapter):
         self._state["dlq"] = self._state["dlq"][-100:]
         self.store.save(self._state)
         await self._ack_expected(message_id)
+        self._commit(message_id)
 
     async def _handle_routine_event(self, message: dict[str, Any]) -> None:
         """Take custody, ACK exactly one source, then durably mark it processed."""

@@ -1,0 +1,397 @@
+"""Server-authoritative inbox lease attempt recovery contract."""
+
+from __future__ import annotations
+
+import asyncio
+import math
+import re
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from gateway.config import PlatformConfig
+
+from plugin.mupot_gateway.adapter import (
+    MupotAdapter,
+    MupotSafeRetryError,
+    MupotTransportError,
+    StateStore,
+)
+
+
+ATTEMPT_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+LEASE_EXPIRY = "2099-01-01T00:00:00.000Z"
+
+
+def attempt_result(
+    attempt_id: str,
+    state: str,
+    messages: list[dict[str, Any]] | None = None,
+    *,
+    lease_expires_at: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "attempt_id": attempt_id,
+        "state": state,
+        "lease_expires_at": lease_expires_at,
+        "messages": messages or [],
+        "consumed": False,
+    }
+
+
+def leased_ack(message_id: str = "ack-recovered") -> dict[str, Any]:
+    return {
+        "id": message_id,
+        "seq": 31,
+        "from_agent": "hadi-codex",
+        "from_member": "member-code",
+        "body": "{ack_for:request-recovered} complete",
+        "project_id": None,
+        "request_id": "ack:request-recovered",
+        "in_reply_to": "source-recovered",
+        "kind": "ack",
+        "expects_reply": False,
+        "created_at": "2026-09-13T00:00:00.000Z",
+        "delivery_attempts": 1,
+        "lease_expires_at": LEASE_EXPIRY,
+    }
+
+
+class AttemptClient:
+    def __init__(
+        self,
+        *,
+        lease_outcomes: list[Any] | None = None,
+        reconcile_outcome: Any = None,
+        status: dict[str, Any] | None = None,
+    ) -> None:
+        self.lease_outcomes = list(lease_outcomes or [])
+        self.reconcile_outcome = reconcile_outcome
+        self.status = status or {
+            "agent_id": "agent-consumer",
+            "mode": "bearer_only",
+            "generation": 7,
+            "key_matches": True,
+        }
+        self.connect_calls = 0
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.acked_ids: list[str] = []
+        self.first_lease = asyncio.Event()
+
+    async def connect(self) -> None:
+        self.connect_calls += 1
+
+    async def close(self) -> None:
+        return None
+
+    async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((tool, dict(arguments)))
+        if tool == "inbox_consumer_status":
+            return dict(self.status)
+        if tool == "inbox_lease":
+            self.first_lease.set()
+            outcome = self.lease_outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            if callable(outcome):
+                return outcome(arguments)
+            return outcome
+        if tool == "inbox_lease_reconcile":
+            outcome = self.reconcile_outcome
+            if isinstance(outcome, Exception):
+                raise outcome
+            if callable(outcome):
+                return outcome(arguments)
+            return outcome
+        if tool == "inbox_ack":
+            message_id = arguments["ids"][0]
+            self.acked_ids.append(message_id)
+            return {"acked": [message_id], "already_read": [], "refused": []}
+        raise AssertionError(f"unexpected tool: {tool} {arguments}")
+
+
+def make_adapter(state_path: Path, client: AttemptClient) -> MupotAdapter:
+    return MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "allowed_agents": "hadi-codex",
+                "lease_seconds": 30,
+                "poll_interval": 0.01,
+                "state_path": str(state_path),
+            },
+        ),
+        client_factory=lambda *_: client,
+    )
+
+
+class ScopeOwner:
+    def __init__(self) -> None:
+        self.active = False
+        self.activations = 0
+
+    @contextmanager
+    def activate(self):
+        self.activations += 1
+        self.active = True
+        try:
+            yield
+        finally:
+            self.active = False
+
+
+class ScopedAttemptClient(AttemptClient):
+    def __init__(self, owner: ScopeOwner, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.owner = owner
+
+    async def connect(self) -> None:
+        assert self.owner.active is True
+        await super().connect()
+
+    async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        assert self.owner.active is True
+        return await super().call(tool, arguments)
+
+
+async def wait_stopped(adapter: MupotAdapter) -> None:
+    for _ in range(100):
+        if not adapter._running:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("adapter did not stop")
+
+
+async def persist_v2_ambiguous(
+    state_path: Path,
+    *,
+    outcomes: list[Any] | None = None,
+) -> tuple[str, AttemptClient]:
+    client = AttemptClient(
+        lease_outcomes=outcomes or [MupotTransportError("Mupot request failed")]
+    )
+    adapter = make_adapter(state_path, client)
+    assert await adapter.connect()
+    try:
+        await asyncio.wait_for(client.first_lease.wait(), 1)
+        await wait_stopped(adapter)
+    finally:
+        await adapter.disconnect()
+    marker = StateStore(state_path).load()["lease_reconciliation"]
+    return marker["attempt_id"], client
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_attempt_is_random_bounded_durable_and_reconciled_immediately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "state.json"
+    attempt_id, first = await persist_v2_ambiguous(state_path)
+    marker = StateStore(state_path).load()["lease_reconciliation"]
+    assert marker == {
+        "version": 2,
+        "required": True,
+        "agent_id": "agent-consumer",
+        "mode": "bearer_only",
+        "generation": 7,
+        "attempt_id": attempt_id,
+    }
+    assert ATTEMPT_RE.fullmatch(attempt_id)
+    assert first.calls[-1] == (
+        "inbox_lease",
+        {"limit": 1, "lease_seconds": 30, "attempt_id": attempt_id},
+    )
+
+    monkeypatch.setattr(time, "time", lambda: math.nan)
+    recovered = AttemptClient(
+        reconcile_outcome=lambda args: attempt_result(args["attempt_id"], "cancelled")
+    )
+    adapter = make_adapter(state_path, recovered)
+    assert await adapter.reconcile_inbox_polling() is True
+    assert recovered.calls == [
+        ("inbox_consumer_status", {}),
+        ("inbox_lease_reconcile", {"attempt_id": attempt_id}),
+    ]
+    assert StateStore(state_path).load().get("lease_reconciliation") is None
+
+
+@pytest.mark.asyncio
+async def test_one_safe_retry_reuses_same_attempt_id(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    attempt_id, client = await persist_v2_ambiguous(
+        state_path,
+        outcomes=[
+            MupotSafeRetryError("Mupot request failed"),
+            MupotTransportError("Mupot request failed"),
+        ],
+    )
+    leases = [args for tool, args in client.calls if tool == "inbox_lease"]
+    assert len(leases) == 2
+    assert [entry["attempt_id"] for entry in leases] == [attempt_id, attempt_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clock", [-1e12, 0.0, 1e12, math.nan])
+async def test_v1_marker_never_uses_local_clock_to_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: float,
+) -> None:
+    state_path = tmp_path / "state.json"
+    StateStore(state_path).save(
+        {
+            "lease_reconciliation": {
+                "version": 1,
+                "required": True,
+                "agent_id": "agent-consumer",
+                "mode": "bearer_only",
+                "generation": 7,
+                "reconcile_after": 1.0,
+            }
+        }
+    )
+    monkeypatch.setattr(time, "time", lambda: clock)
+    client = AttemptClient(reconcile_outcome={})
+    adapter = make_adapter(state_path, client)
+    assert await adapter.reconcile_inbox_polling() is False
+    assert client.connect_calls == 0
+    assert client.calls == []
+    assert StateStore(state_path).load()["lease_reconciliation"]["version"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["empty", "cancelled", "expired", "acked"])
+async def test_terminal_attempt_tombstone_clears_without_processing_or_ack(
+    tmp_path: Path,
+    state: str,
+) -> None:
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    client = AttemptClient(
+        reconcile_outcome=attempt_result(attempt_id, state),
+    )
+    adapter = make_adapter(state_path, client)
+    handled: list[str] = []
+
+    async def handler(event: Any) -> None:
+        handled.append(event.message_id)
+
+    adapter.set_message_handler(handler)
+    assert await adapter.reconcile_inbox_polling() is True
+    assert handled == []
+    assert client.acked_ids == []
+    assert StateStore(state_path).load().get("lease_reconciliation") is None
+
+
+@pytest.mark.asyncio
+async def test_exact_leased_attempt_is_processed_and_acked_before_clear(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    message = leased_ack()
+    client = AttemptClient(
+        reconcile_outcome=attempt_result(
+            attempt_id,
+            "leased",
+            [message],
+            lease_expires_at=LEASE_EXPIRY,
+        )
+    )
+    adapter = make_adapter(state_path, client)
+
+    assert await adapter.reconcile_inbox_polling() is True
+    assert client.acked_ids == [message["id"]]
+    state = StateStore(state_path).load()
+    assert message["id"] in state["processed"]
+    assert state["terminal_receipts"] == [message]
+    assert state.get("lease_reconciliation") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_factory",
+    [
+        lambda attempt, _message: attempt_result("other-attempt-id-1234", "empty"),
+        lambda attempt, message: attempt_result(
+            attempt,
+            "leased",
+            [{**message, "lease_expires_at": "2098-01-01T00:00:00.000Z"}],
+            lease_expires_at=LEASE_EXPIRY,
+        ),
+        lambda attempt, message: attempt_result(attempt, "cancelled", [message]),
+        lambda attempt, _message: {
+            "attempt_id": attempt,
+            "state": "unknown",
+            "lease_expires_at": None,
+            "messages": [],
+            "consumed": False,
+        },
+    ],
+)
+async def test_reconcile_mismatch_or_malformed_response_remains_fenced(
+    tmp_path: Path,
+    response_factory: Any,
+) -> None:
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    message = leased_ack()
+    client = AttemptClient(
+        reconcile_outcome=response_factory(attempt_id, message),
+    )
+    adapter = make_adapter(state_path, client)
+
+    assert await adapter.reconcile_inbox_polling() is False
+    assert client.acked_ids == []
+    assert StateStore(state_path).load()["lease_reconciliation"]["attempt_id"] == attempt_id
+
+
+@pytest.mark.asyncio
+async def test_delayed_reconcile_stays_fenced_until_server_tombstone(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    unavailable = AttemptClient(
+        reconcile_outcome=MupotTransportError("Mupot request failed")
+    )
+    first_recovery = make_adapter(state_path, unavailable)
+    assert await first_recovery.reconcile_inbox_polling() is False
+    assert StateStore(state_path).load()["lease_reconciliation"]["attempt_id"] == attempt_id
+
+    tombstoned = AttemptClient(
+        reconcile_outcome=attempt_result(attempt_id, "expired")
+    )
+    second_recovery = make_adapter(state_path, tombstoned)
+    assert await second_recovery.reconcile_inbox_polling() is True
+    assert tombstoned.acked_ids == []
+    assert StateStore(state_path).load().get("lease_reconciliation") is None
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_uses_owning_profile_scope(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    owner = ScopeOwner()
+    client = ScopedAttemptClient(
+        owner,
+        reconcile_outcome=attempt_result(attempt_id, "cancelled"),
+    )
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"state_path": str(state_path)},
+        ),
+        client_factory=lambda *_: client,
+        secret_owner=owner,  # type: ignore[arg-type]
+    )
+
+    assert await adapter.reconcile_inbox_polling() is True
+    assert owner.activations == 1
+    assert owner.active is False

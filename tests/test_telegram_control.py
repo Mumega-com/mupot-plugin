@@ -18,6 +18,13 @@ from plugin.telegram_control import (
 )
 
 
+@pytest.fixture(autouse=True)
+def simplex_hermes_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    from plugin.tests.test_profile_scope import install_secret_scope
+
+    install_secret_scope(monkeypatch, scope=None)
+
+
 class User:
     def __init__(self, user_id: int = 123, full_name: str = "Ada Example") -> None:
         self.id = user_id
@@ -101,7 +108,10 @@ def relay_with(
     *,
     response: bytes = b'{"ok":true,"reply":"Needs: approve decision d-1."}',
 ) -> tuple[str, Opener]:
-    monkeypatch.setenv("TEST_IM_WEBHOOK_SECRET", "runtime-webhook-secret")
+    monkeypatch.setattr(
+        "plugin.telegram_control.read_profile_secret",
+        lambda _name: "runtime-webhook-secret",
+    )
     opener = Opener(Response(response))
     monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
     return relay_telegram_update(valid_settings(), update or Update()), opener
@@ -250,18 +260,51 @@ def test_relay_posts_only_the_sanitized_envelope_and_runtime_secret(
     assert "must-not-be-forwarded" not in request.data.decode()
 
 
+def test_relay_sends_only_the_active_profile_scoped_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plugin.tests.test_profile_scope import install_secret_scope
+
+    process_secret = "wrong-process-global-webhook-secret"
+    scoped_secret = "right-profile-scoped-webhook-secret"
+    monkeypatch.setenv("TEST_IM_WEBHOOK_SECRET", process_secret)
+    install_secret_scope(
+        monkeypatch,
+        scope={"TEST_IM_WEBHOOK_SECRET": scoped_secret},
+    )
+    opener = Opener(Response(b'{"ok":true,"reply":"Ready."}'))
+    monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
+
+    assert relay_telegram_update(valid_settings(), Update()) == "Ready."
+
+    headers = {key.lower(): value for key, value in opener.calls[0][0].header_items()}
+    assert headers["x-telegram-bot-api-secret-token"] == scoped_secret
+    assert process_secret not in str(headers)
+
+
 def test_relay_reads_secret_at_request_time(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = valid_settings()
-    monkeypatch.setenv("TEST_IM_WEBHOOK_SECRET", "new-runtime-secret")
+    secrets = {"TEST_IM_WEBHOOK_SECRET": "first-scoped-secret"}
+    monkeypatch.setattr(
+        "plugin.telegram_control.read_profile_secret",
+        lambda name: secrets[name],
+    )
     opener = Opener(Response(b'{"ok":true,"reply":"Ready."}'))
     monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
     assert relay_telegram_update(settings, Update()) == "Ready."
-    headers = {key.lower(): value for key, value in opener.calls[0][0].header_items()}
-    assert headers["x-telegram-bot-api-secret-token"] == "new-runtime-secret"
+    secrets["TEST_IM_WEBHOOK_SECRET"] = "rotated-scoped-secret"
+    assert relay_telegram_update(settings, Update(update_id=457)) == "Ready."
+    first_headers = {
+        key.lower(): value for key, value in opener.calls[0][0].header_items()
+    }
+    rotated_headers = {
+        key.lower(): value for key, value in opener.calls[1][0].header_items()
+    }
+    assert first_headers["x-telegram-bot-api-secret-token"] == "first-scoped-secret"
+    assert rotated_headers["x-telegram-bot-api-secret-token"] == "rotated-scoped-secret"
 
 
 def test_relay_bounds_request_before_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("TEST_IM_WEBHOOK_SECRET", "runtime-webhook-secret")
     opener = Opener(AssertionError("network must not run"))
     monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
     update = Update(message=Message("/answer " + "x" * 4097))
@@ -274,7 +317,10 @@ def test_relay_bounds_response_and_never_returns_partial_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     response = b'{"ok":true,"reply":"' + b"x" * 300_000 + b'"}'
-    monkeypatch.setenv("TEST_IM_WEBHOOK_SECRET", "runtime-webhook-secret")
+    monkeypatch.setattr(
+        "plugin.telegram_control.read_profile_secret",
+        lambda _name: "runtime-webhook-secret",
+    )
     body = Response(response)
     opener = Opener(body)
     monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
@@ -302,7 +348,9 @@ def test_relay_refuses_malformed_or_unbounded_reply(
 def test_relay_failure_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
     secret = "sensitive-secret-value"
     approval = "/approve invite-code-123"
-    monkeypatch.setenv("TEST_IM_WEBHOOK_SECRET", secret)
+    monkeypatch.setattr(
+        "plugin.telegram_control.read_profile_secret", lambda _name: secret
+    )
     opener = Opener(RuntimeError(f"failed with {secret} for {approval}"))
     monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
     with pytest.raises(RuntimeError) as failure:
@@ -351,6 +399,53 @@ async def test_native_callback_returns_safe_failure_without_starting_an_llm_turn
     assert "sensitive approval body" not in replies[0]
 
 
+@pytest.mark.asyncio
+async def test_runtime_multiplex_activation_after_registration_refuses_relay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plugin.tests.test_profile_scope import install_secret_scope
+
+    runtime = {"multiplex": False}
+    secret_scope = install_secret_scope(
+        monkeypatch,
+        scope={"TEST_IM_WEBHOOK_SECRET": "profile-secret"},
+    )
+    secret_scope.is_multiplex_active = lambda: runtime["multiplex"]
+    factories: list[object] = []
+    handlers: list[object] = []
+
+    class CommandHandler:
+        def __init__(self, command: str, callback: object) -> None:
+            self.command = command
+            self.callback = callback
+
+    telegram = types.ModuleType("telegram")
+    telegram_ext = types.ModuleType("telegram.ext")
+    telegram_ext.CommandHandler = CommandHandler
+    monkeypatch.setitem(sys.modules, "telegram", telegram)
+    monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
+    register_telegram_control(
+        types.SimpleNamespace(register_telegram_handler=factories.append),
+        valid_settings(),
+    )
+    factories[0](types.SimpleNamespace(add_handler=handlers.append), object())
+    opener = Opener(AssertionError("network must not run"))
+    monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
+    replies: list[str] = []
+
+    async def reply_text(text: str) -> None:
+        replies.append(text)
+
+    update = Update()
+    update.effective_message.reply_text = reply_text
+    runtime["multiplex"] = True
+
+    await handlers[0].callback(update, object())
+
+    assert replies == ["Mupot project control is temporarily unavailable."]
+    assert opener.calls == []
+
+
 def operator_settings(**overrides: object) -> dict[str, object]:
     return {
         "mode": "operator",
@@ -387,6 +482,7 @@ def test_plugin_registers_telegram_before_native_and_operator_side_effects() -> 
             "plugin._load_plugin_settings",
             return_value=operator_settings(native_gateway_enabled=True),
         ),
+        patch("plugin.read_profile_secret", return_value="mupot_test_agent_token"),
         patch.dict("os.environ", {"MUPOT_AGENT_TOKEN": "mupot_test_agent_token"}),
         patch.dict(sys.modules, {native.__name__: native}),
     ):

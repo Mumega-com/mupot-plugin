@@ -34,6 +34,7 @@ def test_native_receiver_registers_from_operator_plugin_and_never_starts_legacy_
     module.register = lambda context, **kwargs: calls.append((context, kwargs))
     with patch("plugin._load_plugin_settings", return_value=settings(native_gateway_enabled=True)), \
          patch("plugin._maybe_start_inbox_stream") as legacy, \
+         patch("plugin.read_profile_secret", return_value="mupot_test_agent_token"), \
          patch.dict("os.environ", {"MUPOT_AGENT_TOKEN": "mupot_test_agent_token"}), \
          patch.dict(sys.modules, {module.__name__: module}):
         register(ctx)

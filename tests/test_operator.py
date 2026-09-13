@@ -652,7 +652,9 @@ class OperatorTests(unittest.TestCase):
             },
         }
         ctx = Context()
-        with patch("plugin._load_plugin_settings", return_value=config), patch.dict(
+        with patch("plugin._load_plugin_settings", return_value=config), patch(
+            "plugin.read_profile_secret", return_value="mupot_test_agent_token"
+        ), patch.dict(
             "os.environ", {"MUPOT_AGENT_TOKEN": "mupot_test_agent_token"}, clear=False
         ):
             register(ctx)

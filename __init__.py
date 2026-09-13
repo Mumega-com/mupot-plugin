@@ -23,6 +23,7 @@ from .schemas import (
     MUPOT_STATUS_SCHEMA,
 )
 from .telegram_control import TelegramControlSettings, register_telegram_control
+from .profile_scope import read_profile_secret, require_supported_profile_runtime
 from .tools import mupot_brain_enable, mupot_provision, mupot_status
 
 # Process-global registry of running inbox streamers keyed by state-file path.
@@ -38,6 +39,7 @@ def _load_plugin_settings() -> dict[str, Any]:
         from hermes_cli.config import cfg_get, load_config
 
         config = load_config()
+        require_supported_profile_runtime(config)
         value = cfg_get(config, "plugins", "entries", "mupot", "settings", default={})
         if not isinstance(value, Mapping):
             raise ValueError("plugins.entries.mupot.settings must be a mapping")
@@ -204,7 +206,7 @@ def register(ctx: Any) -> None:
             raise ValueError("restart the gateway before switching an active legacy inbox stream to native receive")
         operator_settings = OperatorSettings.from_mapping(operator_value)
         telegram_control_settings = TelegramControlSettings.from_mapping(operator_value)
-        token = os.environ.get("MUPOT_AGENT_TOKEN", "")
+        token = read_profile_secret("MUPOT_AGENT_TOKEN")
         client = MupotOperatorClient(operator_settings, token=token)
         register_telegram_control(ctx, telegram_control_settings)
         if native_gateway:

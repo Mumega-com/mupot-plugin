@@ -21,6 +21,7 @@ from gateway.platforms.base import (
 from gateway.session import SessionSource
 from hermes_constants import get_hermes_home
 from ..mupot_operator import validate_operator_identity
+from ..profile_scope import read_profile_secret, require_supported_profile_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,10 @@ class HermesMCPClient:
         self._request_id = 0
 
     async def _ensure_client_locked(self) -> None:
+        require_supported_profile_runtime({})
+        # Validate availability at native connect as well as at request time.
+        # The value is deliberately not cached here; call() observes rotation.
+        read_profile_secret("MUPOT_AGENT_TOKEN")
         if self._client is None or self._client.is_closed:
             from hermes_cli.config import load_config
             from hermes_cli.mcp_config import _resolve_mcp_server_config
@@ -174,17 +179,13 @@ class HermesMCPClient:
             if not self._url:
                 raise RuntimeError(f"MCP server {self.server_name!r} missing url")
             self._headers = dict(cfg.get("headers") or {})
-            # If MUPOT_AGENT_TOKEN was unresolved or overridden, ensure profile-local .env is read
-            auth_val = self._headers.get("Authorization", "")
-            if "${MUPOT_AGENT_TOKEN}" in auth_val or not auth_val:
-                env_path = get_hermes_home() / ".env"
-                if env_path.exists():
-                    for line in env_path.read_text(encoding="utf-8").splitlines():
-                        if line.startswith("MUPOT_AGENT_TOKEN="):
-                            tok = line.split("=", 1)[1].strip()
-                            if tok:
-                                self._headers["Authorization"] = f"Bearer {tok}"
-                                break
+            # Authorization is always supplied per request from Hermes's active
+            # profile scope. Never retain a resolved/global fallback header.
+            self._headers = {
+                name: value
+                for name, value in self._headers.items()
+                if name.lower() != "authorization"
+            }
             timeout_sec = float(cfg.get("timeout") or 30.0)
             self._client = httpx.AsyncClient(
                 headers=self._headers,
@@ -211,15 +212,19 @@ class HermesMCPClient:
                     },
                 }
                 try:
-                    response = await self._client.post(self._url, json=body)
+                    token = read_profile_secret("MUPOT_AGENT_TOKEN")
+                    headers = {**self._headers, "Authorization": f"Bearer {token}"}
+                    client = self._client
+                    url = self._url
+                    if client is None or url is None:
+                        raise RuntimeError("Mupot request client is unavailable")
+                    response = await client.post(url, json=body, headers=headers)
                     data = response.json()
                     break
-                except Exception as exc:
+                except Exception:
                     if attempt == 0:
                         logger.warning(
-                            "[mupot] MCP HTTP call %s failed with %r; resetting client",
-                            tool,
-                            exc,
+                            "[mupot] MCP request failed; resetting client"
                         )
                         if self._client is not None:
                             try:
@@ -228,7 +233,7 @@ class HermesMCPClient:
                                 pass
                             self._client = None
                     else:
-                        raise
+                        raise RuntimeError("Mupot request failed") from None
 
         if not isinstance(data, dict):
             raise RuntimeError(f"Invalid JSON-RPC response for tool {tool}: {data!r}")
@@ -306,7 +311,7 @@ class MupotAdapter(BasePlatformAdapter):
         self.notification_recipients = dict(extra.get("notification_recipients") or {})
         self.notification_activate = extra.get("notification_activate") is True
         self.message_injector = message_injector
-        self._state = {
+        self._state: dict[str, Any] = {
             # Mupot owns retry timing through visibility leases. Never replay
             # a stale local in-flight record immediately after a crash.
             "pending": None,
@@ -326,9 +331,10 @@ class MupotAdapter(BasePlatformAdapter):
         self._current_message: Optional[dict[str, Any]] = None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        if self._running:
-            return True
         try:
+            require_supported_profile_runtime({})
+            if self._running:
+                return True
             await self._client.connect()
             await self._send_client.connect()
             if self.expected_agent_id or self.expected_tenant:

@@ -6,11 +6,12 @@ import asyncio
 from dataclasses import dataclass
 import json
 import math
-import os
 import re
 from typing import Any, Mapping
 from urllib.parse import urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from .profile_scope import read_profile_secret, require_supported_profile_runtime
 
 
 _COMMANDS = ("start", "needs", "answer", "approve", "reject")
@@ -174,6 +175,7 @@ def _sanitized_envelope(update: Any) -> dict[str, Any]:
 
 
 def relay_telegram_update(settings: TelegramControlSettings, update: Any) -> str:
+    require_supported_profile_runtime({})
     settings.validate()
     if not settings.enabled:
         raise RuntimeError("telegram control is disabled")
@@ -185,8 +187,8 @@ def relay_telegram_update(settings: TelegramControlSettings, update: Any) -> str
     if len(body) > _MAX_REQUEST_BYTES:
         raise RuntimeError("telegram control request exceeds the size limit")
 
-    secret = os.environ.get(settings.webhook_secret_env, "")
-    if not secret or len(secret) > 256:
+    secret = read_profile_secret(settings.webhook_secret_env)
+    if len(secret) > 256:
         raise RuntimeError("telegram control webhook secret is unavailable")
 
     request = Request(

@@ -12,6 +12,8 @@ description: >
   within the configured squad.
   An optional native gateway receiver connects Mupot mail and correlated receipts
   to the operator's existing private human conversations.
+  Optional deterministic Telegram project-control handlers relay only five scoped
+  commands to Mupot without starting an LLM turn.
 
 provides_tools:
   - name: mupot_provision
@@ -71,6 +73,9 @@ optional_env:
     secret: true
   - name: MUPOT_PLUGIN_MODE
     description: Compatibility override; prefer plugins.entries.mupot.settings.mode.
+  - name: IM_WEBHOOK_SECRET
+    description: Shared Mupot IM webhook secret used only when deterministic Telegram project control is explicitly enabled.
+    secret: true
   - name: MUPOT_SLUG
     description: Default pot slug for provisioner workflows.
   - name: MUPOT_BRAND

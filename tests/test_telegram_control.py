@@ -1,0 +1,411 @@
+"""Contract tests for deterministic Telegram project-control relay."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+import json
+import sys
+import types
+from unittest.mock import patch
+
+import pytest
+
+from plugin import register
+from plugin.telegram_control import (
+    TelegramControlSettings,
+    register_telegram_control,
+    relay_telegram_update,
+)
+
+
+class User:
+    def __init__(self, user_id: int = 123, full_name: str = "Ada Example") -> None:
+        self.id = user_id
+        self.full_name = full_name
+        self.username = "must-not-be-forwarded"
+
+
+class Chat:
+    def __init__(self, chat_id: int = 123, chat_type: str = "private") -> None:
+        self.id = chat_id
+        self.type = chat_type
+        self.title = "must-not-be-forwarded"
+
+
+class Message:
+    def __init__(self, text: str = "/needs", **forwarding: object) -> None:
+        self.text = text
+        self.message_id = 999
+        self.caption = "must-not-be-forwarded"
+        for key, value in forwarding.items():
+            setattr(self, key, value)
+
+
+class Update:
+    def __init__(
+        self,
+        *,
+        update_id: int = 456,
+        user: User | None = None,
+        chat: Chat | None = None,
+        message: Message | None = None,
+    ) -> None:
+        self.update_id = update_id
+        self.effective_user = user if user is not None else User()
+        self.effective_chat = chat if chat is not None else Chat()
+        self.effective_message = message if message is not None else Message()
+        self.callback_query = "must-not-be-forwarded"
+
+
+class Response:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.read_sizes: list[int] = []
+
+    def __enter__(self) -> "Response":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        return self.body if size < 0 else self.body[:size]
+
+
+class Opener:
+    def __init__(self, response: Response | BaseException) -> None:
+        self.response = response
+        self.calls: list[tuple[object, float]] = []
+
+    def open(self, request: object, timeout: float) -> Response:
+        self.calls.append((request, timeout))
+        if isinstance(self.response, BaseException):
+            raise self.response
+        return self.response
+
+
+def valid_settings(**changes: object) -> TelegramControlSettings:
+    settings = TelegramControlSettings(
+        enabled=True,
+        base_url="https://pot.example.invalid/base",
+        webhook_secret_env="TEST_IM_WEBHOOK_SECRET",
+        timeout=7.0,
+    )
+    return replace(settings, **changes)
+
+
+def relay_with(
+    monkeypatch: pytest.MonkeyPatch,
+    update: Update | None = None,
+    *,
+    response: bytes = b'{"ok":true,"reply":"Needs: approve decision d-1."}',
+) -> tuple[str, Opener]:
+    monkeypatch.setenv("TEST_IM_WEBHOOK_SECRET", "runtime-webhook-secret")
+    opener = Opener(Response(response))
+    monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
+    return relay_telegram_update(valid_settings(), update or Update()), opener
+
+
+def test_settings_are_explicitly_opt_in_and_require_boolean() -> None:
+    settings = TelegramControlSettings.from_mapping(
+        {"base_url": "https://pot.example.invalid"}
+    )
+    assert settings.enabled is False
+    with pytest.raises(ValueError, match="boolean"):
+        TelegramControlSettings.from_mapping(
+            {
+                "base_url": "https://pot.example.invalid",
+                "telegram_control_enabled": "true",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://pot.example.invalid",
+        "https://user:pass@pot.example.invalid",
+        "https://pot.example.invalid?secret=value",
+        "https://pot.example.invalid#fragment",
+        "not-a-url",
+    ],
+)
+def test_settings_require_a_credential_free_https_base_url(bad_url: str) -> None:
+    with pytest.raises(ValueError, match="base_url"):
+        valid_settings(base_url=bad_url).validate()
+
+
+@pytest.mark.parametrize(
+    "bad_env_name",
+    ["", "IM-WEBHOOK-SECRET", "1M_WEBHOOK_SECRET", "lowercase", "A" * 129],
+)
+def test_settings_validate_secret_environment_variable_name(bad_env_name: str) -> None:
+    with pytest.raises(ValueError, match="environment-variable name"):
+        valid_settings(webhook_secret_env=bad_env_name).validate()
+
+
+@pytest.mark.parametrize("bad_timeout", [0, 0.9, 121, float("inf")])
+def test_settings_bound_timeout(bad_timeout: float) -> None:
+    with pytest.raises(ValueError, match="timeout"):
+        valid_settings(timeout=bad_timeout).validate()
+
+
+def test_disabled_control_registers_no_native_handler() -> None:
+    calls: list[object] = []
+    ctx = types.SimpleNamespace(register_telegram_handler=calls.append)
+    register_telegram_control(ctx, replace(valid_settings(), enabled=False))
+    assert calls == []
+
+
+def test_factory_registers_only_the_five_exact_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factories: list[object] = []
+    ctx = types.SimpleNamespace(register_telegram_handler=factories.append)
+    register_telegram_control(ctx, valid_settings())
+    assert len(factories) == 1
+
+    handlers: list[object] = []
+
+    class CommandHandler:
+        def __init__(self, command: str, callback: object) -> None:
+            self.command = command
+            self.callback = callback
+
+    telegram = types.ModuleType("telegram")
+    telegram_ext = types.ModuleType("telegram.ext")
+    telegram_ext.CommandHandler = CommandHandler
+    monkeypatch.setitem(sys.modules, "telegram", telegram)
+    monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
+    application = types.SimpleNamespace(add_handler=handlers.append)
+    factories[0](application, object())
+
+    assert [handler.command for handler in handlers] == [
+        "start",
+        "needs",
+        "answer",
+        "approve",
+        "reject",
+    ]
+    assert all(handler.callback is handlers[0].callback for handler in handlers)
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        Update(chat=Chat(chat_type="group")),
+        Update(user=User(user_id=124)),
+    ],
+)
+def test_relay_refuses_non_private_or_mismatched_identity_before_network(
+    monkeypatch: pytest.MonkeyPatch, update: Update
+) -> None:
+    opener = Opener(AssertionError("network must not run"))
+    monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
+    with pytest.raises(ValueError, match="private"):
+        relay_telegram_update(valid_settings(), update)
+    assert opener.calls == []
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ["forward_origin", "forward_from", "forward_from_chat", "forward_date"],
+)
+def test_relay_refuses_every_forwarding_marker_before_network(
+    monkeypatch: pytest.MonkeyPatch, marker: str
+) -> None:
+    opener = Opener(AssertionError("network must not run"))
+    monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
+    update = Update(message=Message("/approve d-1", **{marker: object()}))
+    with pytest.raises(ValueError, match="forwarded"):
+        relay_telegram_update(valid_settings(), update)
+    assert opener.calls == []
+
+
+def test_relay_posts_only_the_sanitized_envelope_and_runtime_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    update = Update(message=Message("/answer d-1 accept"))
+    reply, opener = relay_with(monkeypatch, update)
+    assert reply == "Needs: approve decision d-1."
+    assert len(opener.calls) == 1
+    request, timeout = opener.calls[0]
+    assert request.full_url == "https://pot.example.invalid/im/webhook"
+    assert timeout == 7.0
+    headers = {key.lower(): value for key, value in request.header_items()}
+    assert headers == {
+        "content-type": "application/json",
+        "x-telegram-bot-api-secret-token": "runtime-webhook-secret",
+    }
+    assert json.loads(request.data) == {
+        "update_id": 456,
+        "message": {
+            "from": {"id": 123, "first_name": "Ada Example"},
+            "chat": {"id": 123, "type": "private"},
+            "text": "/answer d-1 accept",
+        },
+    }
+    assert "runtime-webhook-secret" not in request.data.decode()
+    assert "must-not-be-forwarded" not in request.data.decode()
+
+
+def test_relay_reads_secret_at_request_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = valid_settings()
+    monkeypatch.setenv("TEST_IM_WEBHOOK_SECRET", "new-runtime-secret")
+    opener = Opener(Response(b'{"ok":true,"reply":"Ready."}'))
+    monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
+    assert relay_telegram_update(settings, Update()) == "Ready."
+    headers = {key.lower(): value for key, value in opener.calls[0][0].header_items()}
+    assert headers["x-telegram-bot-api-secret-token"] == "new-runtime-secret"
+
+
+def test_relay_bounds_request_before_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TEST_IM_WEBHOOK_SECRET", "runtime-webhook-secret")
+    opener = Opener(AssertionError("network must not run"))
+    monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
+    update = Update(message=Message("/answer " + "x" * 4097))
+    with pytest.raises(RuntimeError, match="request"):
+        relay_telegram_update(valid_settings(), update)
+    assert opener.calls == []
+
+
+def test_relay_bounds_response_and_never_returns_partial_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = b'{"ok":true,"reply":"' + b"x" * 300_000 + b'"}'
+    monkeypatch.setenv("TEST_IM_WEBHOOK_SECRET", "runtime-webhook-secret")
+    body = Response(response)
+    opener = Opener(body)
+    monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
+    with pytest.raises(RuntimeError, match="response"):
+        relay_telegram_update(valid_settings(), Update())
+    assert body.read_sizes and body.read_sizes[0] < len(response)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        b"not-json",
+        b'{"ok":false,"reply":"do not trust this"}',
+        b'{"ok":true,"reply":17}',
+        json.dumps({"ok": True, "reply": "x" * 5000}).encode(),
+    ],
+)
+def test_relay_refuses_malformed_or_unbounded_reply(
+    monkeypatch: pytest.MonkeyPatch, response: bytes
+) -> None:
+    with pytest.raises(RuntimeError, match="response"):
+        relay_with(monkeypatch, response=response)
+
+
+def test_relay_failure_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret = "sensitive-secret-value"
+    approval = "/approve invite-code-123"
+    monkeypatch.setenv("TEST_IM_WEBHOOK_SECRET", secret)
+    opener = Opener(RuntimeError(f"failed with {secret} for {approval}"))
+    monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
+    with pytest.raises(RuntimeError) as failure:
+        relay_telegram_update(valid_settings(), Update(message=Message(approval)))
+    rendered = str(failure.value)
+    assert secret not in rendered
+    assert "invite-code-123" not in rendered
+    assert approval not in rendered
+
+
+@pytest.mark.asyncio
+async def test_native_callback_returns_safe_failure_without_starting_an_llm_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factories: list[object] = []
+    handlers: list[object] = []
+
+    class CommandHandler:
+        def __init__(self, command: str, callback: object) -> None:
+            self.command = command
+            self.callback = callback
+
+    telegram = types.ModuleType("telegram")
+    telegram_ext = types.ModuleType("telegram.ext")
+    telegram_ext.CommandHandler = CommandHandler
+    monkeypatch.setitem(sys.modules, "telegram", telegram)
+    monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
+    monkeypatch.setattr(
+        "plugin.telegram_control.relay_telegram_update",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("sensitive approval body")),
+    )
+    register_telegram_control(
+        types.SimpleNamespace(register_telegram_handler=factories.append),
+        valid_settings(),
+    )
+    factories[0](types.SimpleNamespace(add_handler=handlers.append), object())
+    replies: list[str] = []
+
+    async def reply_text(text: str) -> None:
+        replies.append(text)
+
+    update = Update()
+    update.effective_message.reply_text = reply_text
+    await handlers[0].callback(update, object())
+    assert replies == ["Mupot project control is temporarily unavailable."]
+    assert "sensitive approval body" not in replies[0]
+
+
+def operator_settings(**overrides: object) -> dict[str, object]:
+    return {
+        "mode": "operator",
+        "operator": {
+            "base_url": "https://pot.example.invalid",
+            "expected_tenant": "tenant-test",
+            "squad_id": "squad-test",
+            "agent_id": "agent-test",
+            "approval_owner": "human-test",
+            "telegram_control_enabled": True,
+            "telegram_control_webhook_secret_env": "TEST_IM_WEBHOOK_SECRET",
+            **overrides,
+        },
+    }
+
+
+class RegistrationContext:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def register_telegram_handler(self, factory: object) -> None:
+        self.events.append("telegram")
+
+    def register_tool(self, **_: object) -> None:
+        self.events.append("tool")
+
+
+def test_plugin_registers_telegram_before_native_and_operator_side_effects() -> None:
+    ctx = RegistrationContext()
+    native = types.ModuleType("plugin.mupot_gateway.adapter")
+    native.register = lambda *_args, **_kwargs: ctx.events.append("native")
+    with (
+        patch(
+            "plugin._load_plugin_settings",
+            return_value=operator_settings(native_gateway_enabled=True),
+        ),
+        patch.dict("os.environ", {"MUPOT_AGENT_TOKEN": "mupot_test_agent_token"}),
+        patch.dict(sys.modules, {native.__name__: native}),
+    ):
+        register(ctx)
+    assert ctx.events[0] == "telegram"
+    assert ctx.events[1] == "native"
+    assert "tool" in ctx.events[2:]
+
+
+def test_invalid_telegram_config_leaves_no_partial_plugin_surface() -> None:
+    ctx = RegistrationContext()
+    with (
+        patch(
+            "plugin._load_plugin_settings",
+            return_value=operator_settings(
+                telegram_control_webhook_secret_env="invalid-secret-env"
+            ),
+        ),
+        pytest.raises(ValueError, match="environment-variable name"),
+    ):
+        register(ctx)
+    assert ctx.events == []

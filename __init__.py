@@ -22,6 +22,7 @@ from .schemas import (
     MUPOT_PROVISION_SCHEMA,
     MUPOT_STATUS_SCHEMA,
 )
+from .telegram_control import TelegramControlSettings, register_telegram_control
 from .tools import mupot_brain_enable, mupot_provision, mupot_status
 
 # Process-global registry of running inbox streamers keyed by state-file path.
@@ -202,8 +203,10 @@ def register(ctx: Any) -> None:
         if native_gateway and _ACTIVE_WATCHERS:
             raise ValueError("restart the gateway before switching an active legacy inbox stream to native receive")
         operator_settings = OperatorSettings.from_mapping(operator_value)
+        telegram_control_settings = TelegramControlSettings.from_mapping(operator_value)
         token = os.environ.get("MUPOT_AGENT_TOKEN", "")
         client = MupotOperatorClient(operator_settings, token=token)
+        register_telegram_control(ctx, telegram_control_settings)
         if native_gateway:
             from .mupot_gateway.adapter import register as register_native_gateway
             register_native_gateway(ctx, expected_agent_id=operator_settings.agent_id,

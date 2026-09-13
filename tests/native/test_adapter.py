@@ -523,6 +523,74 @@ async def test_corrupt_existing_state_fails_closed_without_network(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_prelease_fence_write_failure_makes_zero_lease_calls(tmp_path: Path) -> None:
+    client = LeasePayloadClient({"messages": []})
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"poll_interval": 0.01, "state_path": str(tmp_path / "state.json")},
+        ),
+        client_factory=lambda *_: client,
+    )
+
+    def fail_save(_state: dict) -> None:
+        raise OSError("state unavailable")
+
+    adapter.store.save = fail_save
+    assert await adapter.connect()
+    try:
+        await asyncio.sleep(0.05)
+        assert client.lease_calls == 0
+        assert adapter._running is False
+        assert adapter.fatal_error_retryable is False
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_postlease_save_failure_leaves_prelease_fence_for_restart(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    client = LeasePayloadClient({"messages": []})
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"poll_interval": 0.01, "state_path": str(state_path)},
+        ),
+        client_factory=lambda *_: client,
+    )
+    real_save = adapter.store.save
+    save_calls = 0
+
+    def fail_after_prelease(state: dict) -> None:
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls > 1:
+            raise OSError("post-lease state unavailable")
+        real_save(state)
+
+    adapter.store.save = fail_after_prelease
+    assert await adapter.connect()
+    try:
+        await asyncio.sleep(0.05)
+    finally:
+        await adapter.disconnect()
+
+    assert save_calls >= 2
+    assert isinstance(StateStore(state_path).load().get("lease_reconciliation"), dict)
+    reconstructed_client = ReconciliationClient({})
+    reconstructed = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
+        client_factory=lambda *_: reconstructed_client,
+    )
+    assert await reconstructed.connect() is False
+    assert reconstructed_client.connect_calls == 0
+    assert reconstructed_client.tools == []
+    assert reconstructed_client.lease_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_explicit_reconciliation_before_lease_deadline_does_no_network(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

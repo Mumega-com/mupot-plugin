@@ -592,9 +592,12 @@ class MupotAdapter(BasePlatformAdapter):
         self,
         tool: str,
         arguments: dict[str, Any],
+        before_attempt: Optional[Callable[[], None]] = None,
     ) -> Any:
         """Retry once only when transport proves no request bytes were sent."""
         for attempt in range(2):
+            if before_attempt is not None:
+                before_attempt()
             try:
                 return await asyncio.wait_for(
                     self._client.call(tool, arguments),
@@ -609,7 +612,38 @@ class MupotAdapter(BasePlatformAdapter):
                 raise
         raise AssertionError("unreachable")
 
+    def _persist_prelease_fence(self) -> None:
+        proof = self._consumer_fence
+        if proof is None:
+            raise _protocol_error()
+        fenced = dict(self._state)
+        fenced["lease_reconciliation"] = {
+            "version": 1,
+            "required": True,
+            **proof,
+            "reconcile_after": time.time() + self.lease_seconds,
+        }
+        self.store.save(fenced)
+        self._state = fenced
+
+    def _clear_lease_fence(self) -> None:
+        cleared = dict(self._state)
+        cleared.pop("lease_reconciliation", None)
+        self.store.save(cleared)
+        self._state = cleared
+
     def _quarantine_inbox_polling(self) -> None:
+        if _lease_reconciliation_proof(
+            self._state.get("lease_reconciliation")
+        ) is not None:
+            self._lease_quarantined = True
+            self._set_fatal_error(
+                "mupot_inbox_reconciliation_required",
+                "Mupot inbox polling requires reconciliation",
+                retryable=False,
+            )
+            logger.error("[mupot] inbox polling quarantined; reconciliation required")
+            return
         proof = self._consumer_fence
         if proof is None:
             self._lease_quarantined = True
@@ -703,6 +737,7 @@ class MupotAdapter(BasePlatformAdapter):
                 payload = await self._call_consumer(
                     "inbox_lease",
                     {"limit": 1, "lease_seconds": self.lease_seconds},
+                    before_attempt=self._persist_prelease_fence,
                 )
                 if not isinstance(payload, dict) or "messages" not in payload:
                     raise _protocol_error()
@@ -733,6 +768,8 @@ class MupotAdapter(BasePlatformAdapter):
                         await self._handle_ack_envelope(message)
                     elif should_accept_message(message, self.allowed_agents):
                         await self._deliver(message)
+                        if message_id not in self._state["processed"]:
+                            raise _protocol_error()
                     else:
                         self._state["dlq"].append(
                             {"message": message, "reason": "sender_policy"}
@@ -740,6 +777,7 @@ class MupotAdapter(BasePlatformAdapter):
                         self._state["dlq"] = self._state["dlq"][-100:]
                         self.store.save(self._state)
                         await self._ack_expected(message_id)
+                self._clear_lease_fence()
             except asyncio.CancelledError:
                 raise
             except Exception:

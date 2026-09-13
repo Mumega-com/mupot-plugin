@@ -125,9 +125,9 @@ receive, and the same retained state path. Do not invite a participant during th
 2. **Redeem privately.** The participant opens a direct chat with the one approved bot and
    sends `/start <pairing-code>`. Forwarded commands, groups, sender/chat mismatch, expired
    or reused codes, and an identity already bound elsewhere must have no onboarding effect.
-3. **Confirm scope.** Stop unless Mupot's reply identifies the intended project and role.
-   The operator separately reads back an active, tokenless member and only the approved
-   squad capability.
+3. **Confirm scope.** Stop unless `/start` identifies the intended project. Its response is
+   not authoritative role evidence. The operator separately reads back an active, tokenless
+   member and only the approved squad capability; that readback confirms the role.
 4. **Inspect attention.** The participant sends `/needs <project-id>` (or `/needs` across
    their accessible projects). The reply must contain only role-authorized items and
    server-provided actions. A different project must be absent or refused.
@@ -146,6 +146,15 @@ receive, and the same retained state path. Do not invite a participant during th
    private conversation once. Record the resulting queued, running, blocked, failed, or
    completed update's channel delivery receipt separately from scheduling/activation
    acceptance.
+
+The receipts are deliberately non-substitutable:
+
+1. Routine custody proves the server stored the human wait.
+2. Exact source ACK proves the plugin consumed that leased envelope.
+3. `activation_queued` proves Hermes accepted private-session scheduling.
+4. A transport receipt plus conversation-mirror readback proves channel delivery.
+5. A Telegram webhook receipt plus Routine answer or task verdict proves the human decision.
+6. Terminal Routine/task evidence proves domain completion.
 
 Ordinary Telegram text is not captured by these handlers and continues through Hermes.
 Only `/start`, `/needs`, `/answer`, `/approve`, and `/reject` use the deterministic relay.
@@ -218,14 +227,15 @@ a stop signal, not permission to widen a predicate or edit around the invariant.
       exact production origin/config keys.
 - [ ] No secret value appears in configuration or evidence.
 - [ ] The dedicated squad reverse edge reaches only the intended project.
-- [ ] Pairing occurred once in the intended private chat; project and role were confirmed.
+- [ ] Pairing occurred once in the intended private chat; `/start` confirmed the project and
+      separate authoritative member/capability readback confirmed the role.
 - [ ] `/needs` proves role-scoped visibility and actions.
 - [ ] One exact answer or independently authorized verdict has both Telegram and domain
       receipts.
 - [ ] The materialized Routine run's `assigned_agent_id` exactly equals the configured
       native profile `agent_id`; receiver configuration alone was not treated as proof.
-- [ ] Routine continuation and automatic result delivery to the same conversation have
-      separate activation/channel/domain receipts.
+- [ ] Routine custody, source ACK, activation scheduling, channel delivery, human decision,
+      and domain completion each have separate receipts.
 - [ ] Identical replay, conflict, stale/terminal, wrong-project, and unauthorized cases have
       no duplicate effect.
 - [ ] Suspension, exact capability revocation, and post-revocation denial are proven.

@@ -75,4 +75,3 @@ class TelegramControlSettings:
 - [ ] Run `./scripts/test.sh`, native suite, `git diff --check`, and secret-pattern scan.
 - [ ] Commit, push, and update plugin PR #6.
 - [ ] After reviewed Mupot deployment, run one real non-admin pilot and record invite, identity binding, authorized attention, decision, routine continuation, result delivery, duplicate/stale refusal, capability revocation, post-revocation denial, restart/retry, and rollback evidence.
-

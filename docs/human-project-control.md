@@ -23,6 +23,10 @@ through their conversation while Mupot remains authoritative about their role.
 - Native tests establish locally that the scoped command handlers coexist with ordinary
   Hermes text handling and that a Mupot result activates the same private conversation
   once. This is repository evidence, not proof of a deployed profile or live participant.
+- Cross-repository acceptance establishes locally, against a migration-built Mupot database,
+  that one real Routine human wait is leased into the native plugin, durably accepted, ACKed
+  by exact source ID, and scheduled once for the bound private session without a peer turn or
+  send. It is not deployment, migration-ledger, configuration, invitation, or pilot evidence.
 - The previous split-plugin Telegram deployment verified Mupot receipt/reply,
   automatic activation of the existing private conversation, and native channel
   delivery. Each consolidated-package rollout must reverify that chain; copied code
@@ -79,13 +83,18 @@ role and with a revoked/stale decision; both must be refused without side effect
 Reuse Mupot's existing questions and approvals instead of adding a competing system.
 
 The participant flow is deliberately explicit: deliver the single-use pairing code out of
-band; redeem it with private `/start`; confirm the returned project and role; inspect
-`/needs`; issue one exact `/answer` or an independently authorized verdict; then observe
-Routine continuation and automatic result delivery. Identical transport replays must not
-repeat the effect; stale, terminal, unauthorized, and conflicting commands must fail
-closed. Suspension and capability revocation must deny subsequent commands. After a
+band; redeem it with private `/start`; confirm the project from that response; separately
+read back the active member and exact squad capability as authoritative role evidence;
+inspect `/needs`; issue one exact `/answer` or an independently authorized verdict; then
+observe Routine continuation and automatic result delivery. Identical transport replays
+must not repeat the effect; stale, terminal, unauthorized, and conflicting commands must
+fail closed. Suspension and capability revocation must deny subsequent commands. After a
 restart, timeout, or ambiguous reply, reconcile the durable Telegram and domain receipts
 before retrying a decision.
+
+Receipt meanings stay separate throughout: Routine custody, exact source ACK, private
+activation scheduling, channel delivery, human decision, and domain completion each need
+their own readback. No earlier receipt proves a later boundary.
 
 This flow grants no merge, deploy, publish, spending, organization-admin, token, or
 independent gate authority. See the

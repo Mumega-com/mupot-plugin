@@ -41,10 +41,14 @@ authorization and prevents the injected event from executing human slash approva
 The previous split deployment verified Telegram; other platforms require their own
 identity binding and end-to-end verification.
 
-Scheduling acceptance is recorded as `activation_queued`, not as delivered work.
-Conversation and native delivery receipts establish completion separately.
-Interrupted/ambiguous sends are retained for reconciliation rather than blindly
-replayed. This integration does not grant the agent human decision authority.
+Keep each receipt at its own boundary: server Routine custody proves the human wait exists;
+source ACK proves only that the leased envelope was consumed; `activation_queued` proves
+only that Hermes accepted private-session scheduling; a channel receipt plus conversation
+mirror readback proves channel delivery; a Telegram webhook receipt plus Routine answer or
+task verdict proves the human decision; and terminal Routine/task evidence proves domain
+completion. None substitutes for another. Interrupted or ambiguous sends are retained for
+reconciliation rather than blindly replayed. This integration does not grant the agent
+human decision authority.
 
 For the broader project-onboarding and human-control scope, see
 [`docs/human-project-control.md`](docs/human-project-control.md).
@@ -87,13 +91,14 @@ Keep `IM_WEBHOOK_SECRET`, the Telegram bot token, and `MUPOT_AGENT_TOKEN` in the
 profile's protected environment; never put values in YAML. Enabling Telegram control is a
 local relay configuration, not a capability grant.
 
-The participant receives a one-time pairing code through an approved out-of-band channel,
-sends `/start <pairing-code>` in the approved bot's private chat, confirms the returned
-project and role, and uses `/needs` to see only currently authorized attention. They then
-submit one exact `/answer <run-id> <choice>` or, only when independently authorized by the
-existing gate, `/approve <task-id>` or `/reject <task-id> <reason>`. Mupot records the
-decision, continues the Routine, and the native receiver returns the resulting update to
-the same private conversation automatically.
+The participant receives a one-time pairing code through an approved out-of-band channel
+and sends `/start <pairing-code>` in the approved bot's private chat. That response confirms
+the project; it is not authoritative role evidence. An operator must separately read back
+the active member and exact squad capability before `/needs` is treated as role-scoped.
+The participant then submits one exact `/answer <run-id> <choice>` or, only when
+independently authorized by the existing gate, `/approve <task-id>` or
+`/reject <task-id> <reason>`. Mupot records the decision, continues the Routine, and the
+native receiver returns the resulting update to the same private conversation automatically.
 
 Duplicate transport updates replay the stored response without a second effect. Stale or
 terminal decisions, invalid choices, unauthorized actions, and conflicting reuse of an
@@ -116,6 +121,19 @@ Native gateway tests use the actual Hermes runtime and its isolated test runner:
 ```bash
 HERMES_SOURCE=/path/to/hermes-agent bash scripts/test-native.sh
 ```
+
+The cross-repository acceptance additionally requires clean, pinned Mupot and Hermes
+checkouts and uses no credentials:
+
+```bash
+MUPOT_SERVER_SOURCE=/path/to/mupot \
+HERMES_SOURCE=/path/to/hermes-agent \
+HERMES_PYTHON=/usr/bin/python3 \
+  bash scripts/test-integration.sh
+```
+
+The bounded local receipt is recorded in
+[`docs/telegram-onboarding-evidence.md`](docs/telegram-onboarding-evidence.md).
 
 The CI native job pins Hermes commit
 `233757037df1f03f9fe1cfddc097acd5ad7f7510`; it exercises plugin registration,

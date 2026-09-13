@@ -9,6 +9,71 @@ restricted, agent-bound operator. Version 0.3 separates these trust zones by pro
 
 Do not combine the modes in one Hermes profile.
 
+## Native gateway receive and human conversation activation
+
+The native Mupot receiver and human-channel routing are owned by this repository
+under `mupot_gateway/`. Installing the operator plugin is sufficient; do not also
+install a separate `platforms/mupot` copy. See
+[`examples/native-gateway-config.yaml`](examples/native-gateway-config.yaml).
+
+Enable `settings.operator.native_gateway_enabled: true` to register the Mupot
+platform alongside the existing restricted operator tools. It is mutually exclusive
+with `inbox_watch_enabled`; enabling both is rejected before registration. Existing
+CLI/SSE-stream configurations remain opt-in and unchanged when native mode is off.
+
+The native receiver uses Mupot's existing `inbox_lease`/`inbox_ack` interface, verifies
+the operator's expected agent/tenant before receiving, preserves message correlation,
+and consumes a source only after successful handling. Terminal ACKs are preserved
+without generating another peer reply. It does not start an SOS connection.
+
+For human updates, configure `mupot.notification_recipients` with the immutable user
+ID for each linked platform. Only matching active private conversations are eligible.
+With `mupot.notification_activate: true` and
+`plugins.entries.mupot.allow_gateway_injection: true`, Hermes's native plugin API
+starts a normal turn in the selected conversation. The native gateway rechecks
+authorization and prevents the injected event from executing human slash approvals.
+The previous split deployment verified Telegram; other platforms require their own
+identity binding and end-to-end verification.
+
+Scheduling acceptance is recorded as `activation_queued`, not as delivered work.
+Conversation and native delivery receipts establish completion separately.
+Interrupted/ambiguous sends are retained for reconciliation rather than blindly
+replayed. This integration does not grant the agent human decision authority.
+
+For the broader project-onboarding and human-control scope, see
+[`docs/human-project-control.md`](docs/human-project-control.md).
+
+### Testing with Hermes
+
+`./scripts/test.sh` runs the standalone operator/provisioner and legacy stream tests.
+Native gateway tests use the actual Hermes runtime and its isolated test runner:
+
+```bash
+HERMES_SOURCE=/path/to/hermes-agent bash scripts/test-native.sh
+```
+
+The CI native job pins Hermes commit
+`233757037df1f03f9fe1cfddc097acd5ad7f7510`; it exercises plugin registration,
+lease/ACK handling, private recipient selection, delivery/mirroring, retry recovery,
+and the normal conversation activation path. No API credentials are required.
+
+### Consolidating an existing split installation
+
+1. Preserve the old adapter/config and their receipt state outside plugin discovery.
+2. Update this `mupot` plugin; enable native mode and the `mupot` injection permission.
+3. Disable obsolete `platforms/mupot` and `mupot-platform` plugin entries so exactly
+   one plugin owns the Mupot platform. Keep the configured state path to retain ACK
+   and notification receipts. If the split adapter used its old default, explicitly
+   set that exact old path; the new default is profile-local. Verify processed IDs
+   and pending/notification records before and after the switch.
+4. Restart the gateway after checking that no turn/delivery is active, then verify
+   one authenticated source message, correlated ACK, native human-conversation turn,
+   and channel delivery receipt.
+
+Use a full gateway restart for this migration, not forced plugin reload. Existing
+legacy stream threads belong to the old process; a restart makes the single-receiver
+transition explicit. Native registration refuses a known active legacy stream.
+
 ## Restricted operator mode
 
 Copy `examples/operator-config.yaml` into an isolated Hermes profile, replace every

@@ -450,22 +450,27 @@ class MupotOperatorClient:
     def _validate_identity(self, response: JsonObject) -> JsonObject | None:
         if response.get("ok") is not True:
             return response
-        result = response.get("result")
-        if not isinstance(result, dict):
-            return {"ok": False, "error": "identity_unverifiable"}
-        if result.get("tenant") != self.settings.expected_tenant:
-            return {"ok": False, "error": "tenant_mismatch"}
-        if result.get("bound_agent_id") != self.settings.agent_id:
-            return {"ok": False, "error": "identity_mismatch"}
-        if result.get("role") != "member":
+        return validate_operator_identity(response.get("result"),
+            expected_tenant=self.settings.expected_tenant, agent_id=self.settings.agent_id)
+
+
+def validate_operator_identity(result: Any, *, expected_tenant: str, agent_id: str) -> JsonObject | None:
+    """Shared identity/privilege fence for operator tools and native receive."""
+    if not isinstance(result, dict):
+        return {"ok": False, "error": "identity_unverifiable"}
+    if result.get("tenant") != expected_tenant:
+        return {"ok": False, "error": "tenant_mismatch"}
+    if result.get("bound_agent_id") != agent_id:
+        return {"ok": False, "error": "identity_mismatch"}
+    if result.get("role") != "member":
+        return {"ok": False, "error": "overprivileged_identity"}
+    capabilities = result.get("capabilities")
+    if not isinstance(capabilities, list):
+        return {"ok": False, "error": "identity_unverifiable"}
+    for grant in capabilities:
+        if isinstance(grant, dict) and grant.get("capability") in _OVERPRIVILEGED_CAPABILITIES:
             return {"ok": False, "error": "overprivileged_identity"}
-        capabilities = result.get("capabilities")
-        if not isinstance(capabilities, list):
-            return {"ok": False, "error": "identity_unverifiable"}
-        for grant in capabilities:
-            if isinstance(grant, dict) and grant.get("capability") in _OVERPRIVILEGED_CAPABILITIES:
-                return {"ok": False, "error": "overprivileged_identity"}
-        return None
+    return None
 
 
 def _sanitize_response(value: Any, token: str) -> JsonObject:

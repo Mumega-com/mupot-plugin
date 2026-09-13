@@ -194,11 +194,23 @@ def register(ctx: Any) -> None:
         operator_value = settings.get("operator", settings)
         if not isinstance(operator_value, Mapping):
             raise ValueError("plugins.entries.mupot.settings.operator must be a mapping")
+        native_gateway = operator_value.get("native_gateway_enabled", False)
+        if not isinstance(native_gateway, bool):
+            raise ValueError("native_gateway_enabled must be a boolean")
+        if native_gateway and operator_value.get("inbox_watch_enabled"):
+            raise ValueError("native_gateway_enabled and inbox_watch_enabled are mutually exclusive")
+        if native_gateway and _ACTIVE_WATCHERS:
+            raise ValueError("restart the gateway before switching an active legacy inbox stream to native receive")
         operator_settings = OperatorSettings.from_mapping(operator_value)
         token = os.environ.get("MUPOT_AGENT_TOKEN", "")
         client = MupotOperatorClient(operator_settings, token=token)
+        if native_gateway:
+            from .mupot_gateway.adapter import register as register_native_gateway
+            register_native_gateway(ctx, expected_agent_id=operator_settings.agent_id,
+                                    expected_tenant=operator_settings.expected_tenant)
         register_operator_tools(ctx, client)
-        _maybe_start_inbox_stream(ctx, operator_value)
+        if not native_gateway:
+            _maybe_start_inbox_stream(ctx, operator_value)
         return
 
     if mode == "provisioner":

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Tests supply their own credentials; never inherit a live agent/bus token.
+unset MUPOT_AGENT_TOKEN MUPOT_MEMBER_TOKEN MUPOT_CF_API_TOKEN CYRUS_SOS_TOKEN
+
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 tmp="$(mktemp -d)"
 python="${PYTHON:-python3}"

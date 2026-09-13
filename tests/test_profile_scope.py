@@ -61,6 +61,20 @@ def test_scoped_secret_wins_over_distinct_process_global_value(
     assert read_profile_secret("MUPOT_AGENT_TOKEN") == "right-profile-scoped-secret"
 
 
+def test_absent_scope_never_falls_back_to_process_global(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process_secret = "must-not-satisfy-absent-profile-scope"
+    monkeypatch.setenv("MUPOT_AGENT_TOKEN", process_secret)
+    install_secret_scope(monkeypatch, scope=None)
+
+    with pytest.raises(RuntimeError) as failure:
+        read_profile_secret("MUPOT_AGENT_TOKEN")
+
+    assert str(failure.value) == "profile secret is unavailable"
+    assert process_secret not in str(failure.value)
+
+
 def test_installed_scope_miss_never_falls_back_to_process_global(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

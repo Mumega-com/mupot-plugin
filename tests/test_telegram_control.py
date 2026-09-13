@@ -6,7 +6,7 @@ from dataclasses import replace
 import json
 import sys
 import types
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -22,7 +22,13 @@ from plugin.telegram_control import (
 def simplex_hermes_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     from plugin.tests.test_profile_scope import install_secret_scope
 
-    install_secret_scope(monkeypatch, scope=None)
+    install_secret_scope(
+        monkeypatch,
+        scope={
+            "TEST_IM_WEBHOOK_SECRET": "test-profile-webhook-secret",
+            "MUPOT_AGENT_TOKEN": "test-profile-agent-token",
+        },
+    )
 
 
 class User:
@@ -282,6 +288,25 @@ def test_relay_sends_only_the_active_profile_scoped_secret(
     assert process_secret not in str(headers)
 
 
+def test_relay_without_profile_scope_refuses_global_secret_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plugin.tests.test_profile_scope import install_secret_scope
+
+    process_secret = "must-not-reach-telegram-request"
+    monkeypatch.setenv("TEST_IM_WEBHOOK_SECRET", process_secret)
+    install_secret_scope(monkeypatch, scope=None)
+    opener = Opener(AssertionError("network must not run"))
+    monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
+
+    with pytest.raises(RuntimeError) as failure:
+        relay_telegram_update(valid_settings(), Update())
+
+    assert str(failure.value) == "profile secret is unavailable"
+    assert process_secret not in str(failure.value)
+    assert opener.calls == []
+
+
 def test_relay_reads_secret_at_request_time(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = valid_settings()
     secrets = {"TEST_IM_WEBHOOK_SECRET": "first-scoped-secret"}
@@ -490,6 +515,33 @@ def test_plugin_registers_telegram_before_native_and_operator_side_effects() -> 
     assert ctx.events[0] == "telegram"
     assert ctx.events[1] == "native"
     assert "tool" in ctx.events[2:]
+
+
+def test_plugin_registration_injects_secret_reader_without_resolving_token() -> None:
+    ctx = RegistrationContext()
+    captured: list[object] = []
+    secret_reader = Mock(
+        side_effect=AssertionError("registration must not read the token")
+    )
+
+    class Client:
+        def __init__(self, _settings: object, **kwargs: object) -> None:
+            captured.append(kwargs.get("secret_reader"))
+
+    with (
+        patch(
+            "plugin._load_plugin_settings",
+            return_value=operator_settings(native_gateway_enabled=False),
+        ),
+        patch("plugin.MupotOperatorClient", Client),
+        patch("plugin.read_profile_secret", secret_reader),
+        patch("plugin.register_operator_tools"),
+        patch("plugin._maybe_start_inbox_stream"),
+    ):
+        register(ctx)
+
+    assert captured == [secret_reader]
+    secret_reader.assert_not_called()
 
 
 def test_invalid_telegram_config_leaves_no_partial_plugin_surface() -> None:

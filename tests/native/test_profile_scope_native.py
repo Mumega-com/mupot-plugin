@@ -110,12 +110,15 @@ def test_telegram_scoped_miss_refuses_global_secret_before_network(
 
 
 class JsonRpcResponse:
-    def json(self) -> dict[str, Any]:
-        return {
+    def __init__(self, payload: Any | None = None) -> None:
+        self.payload = payload if payload is not None else {
             "jsonrpc": "2.0",
             "id": 1,
             "result": {"structuredContent": {"ok": True}},
         }
+
+    def json(self) -> Any:
+        return self.payload
 
 
 class HttpClient:
@@ -139,6 +142,98 @@ class HttpClient:
 
     async def aclose(self) -> None:
         self.is_closed = True
+
+
+def install_mcp_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hermes_cli import config as config_module
+    from hermes_cli import mcp_config
+
+    raw_config = {
+        "mcp_servers": {
+            "mupot": {
+                "url": "https://pot.example.invalid/mcp",
+                "headers": {},
+                "timeout": 5,
+            }
+        }
+    }
+    monkeypatch.setattr(config_module, "load_config", lambda: raw_config)
+    monkeypatch.setattr(mcp_config, "_resolve_mcp_server_config", lambda value: value)
+
+
+@pytest.mark.asyncio
+async def test_mupot_client_without_scope_refuses_global_token_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plugin.mupot_gateway import adapter as adapter_module
+
+    install_mcp_config(monkeypatch)
+    network_calls: list[object] = []
+
+    def client_factory(**kwargs: Any) -> HttpClient:
+        network_calls.append(kwargs)
+        return HttpClient(**kwargs)
+
+    monkeypatch.setattr(adapter_module.httpx, "AsyncClient", client_factory)
+    monkeypatch.setenv("MUPOT_AGENT_TOKEN", "must-not-reach-mcp-request")
+    token = set_secret_scope(None)
+    try:
+        with pytest.raises(RuntimeError) as failure:
+            await HermesMCPClient("mupot").call("status", {})
+    finally:
+        reset_secret_scope(token)
+
+    assert str(failure.value) == "profile secret is unavailable"
+    assert network_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"jsonrpc": "2.0", "id": 1, "error": {"message": "reflected-secret"}},
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": "reflected-secret"}],
+            },
+        },
+        "reflected-secret",
+    ],
+)
+async def test_mupot_client_never_propagates_server_controlled_error_detail(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: Any,
+) -> None:
+    from plugin.mupot_gateway import adapter as adapter_module
+
+    install_mcp_config(monkeypatch)
+
+    class ErrorHttpClient(HttpClient):
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict[str, Any],
+            headers: dict[str, str] | None = None,
+        ) -> JsonRpcResponse:
+            self.calls.append(
+                {"url": url, "json": json, "headers": headers or self.headers}
+            )
+            return JsonRpcResponse(payload)
+
+    monkeypatch.setattr(adapter_module.httpx, "AsyncClient", ErrorHttpClient)
+    token = set_secret_scope({"MUPOT_AGENT_TOKEN": "profile-agent-token"})
+    try:
+        with pytest.raises(RuntimeError) as failure:
+            await HermesMCPClient("mupot").call("status", {})
+    finally:
+        reset_secret_scope(token)
+
+    assert str(failure.value) == "Mupot MCP request failed"
+    assert "reflected-secret" not in str(failure.value)
 
 
 @pytest.mark.asyncio

@@ -206,8 +206,10 @@ def register(ctx: Any) -> None:
             raise ValueError("restart the gateway before switching an active legacy inbox stream to native receive")
         operator_settings = OperatorSettings.from_mapping(operator_value)
         telegram_control_settings = TelegramControlSettings.from_mapping(operator_value)
-        token = read_profile_secret("MUPOT_AGENT_TOKEN")
-        client = MupotOperatorClient(operator_settings, token=token)
+        client = MupotOperatorClient(
+            operator_settings,
+            secret_reader=read_profile_secret,
+        )
         register_telegram_control(ctx, telegram_control_settings)
         if native_gateway:
             from .mupot_gateway.adapter import register as register_native_gateway

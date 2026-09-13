@@ -236,19 +236,15 @@ class HermesMCPClient:
                         raise RuntimeError("Mupot request failed") from None
 
         if not isinstance(data, dict):
-            raise RuntimeError(f"Invalid JSON-RPC response for tool {tool}: {data!r}")
+            raise RuntimeError("Mupot MCP request failed")
         if "error" in data:
-            err = data["error"]
-            detail = err.get("message") if isinstance(err, dict) else str(err)
-            raise RuntimeError(f"MCP tool {tool} error: {detail}")
+            raise RuntimeError("Mupot MCP request failed")
 
         result = data.get("result", {})
+        if not isinstance(result, dict):
+            raise RuntimeError("Mupot MCP request failed")
         if bool(result.get("isError", False)):
-            content = result.get("content", [])
-            detail = " ".join(
-                str(item.get("text", "")) for item in content if isinstance(item, dict)
-            ).strip()
-            raise RuntimeError(detail or f"MCP tool {tool} failed")
+            raise RuntimeError("Mupot MCP request failed")
 
         content = result.get("content", [])
         texts = [

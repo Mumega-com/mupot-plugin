@@ -47,14 +47,15 @@ def read_profile_secret(name: str) -> str:
         from agent.secret_scope import current_secret_scope, get_secret
 
         scope = current_secret_scope()
+        if scope is None:
+            raise RuntimeError(_UNAVAILABLE)
         # In pinned Hermes simplex mode get_secret intentionally falls through
         # to the process environment after an installed-scope miss. For this
         # plugin an installed scope is authoritative: another profile's global
         # value must never satisfy the miss.
-        if scope is not None:
-            scoped_value = scope.get(name)
-            if not isinstance(scoped_value, str) or not scoped_value.strip():
-                raise RuntimeError(_UNAVAILABLE)
+        scoped_value = scope.get(name)
+        if not isinstance(scoped_value, str) or not scoped_value.strip():
+            raise RuntimeError(_UNAVAILABLE)
         value = get_secret(name, None)
     except Exception:
         raise RuntimeError(_UNAVAILABLE) from None

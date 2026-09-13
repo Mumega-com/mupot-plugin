@@ -41,6 +41,10 @@ class MupotTransportError(RuntimeError):
     """A detail-free transport failure whose server outcome may be unknown."""
 
 
+class MupotSafeRetryError(RuntimeError):
+    """A connection failure proven to occur before any request bytes were sent."""
+
+
 def _protocol_error() -> MupotProtocolError:
     return MupotProtocolError(_GENERIC_MCP_PROTOCOL_ERROR)
 
@@ -368,6 +372,14 @@ class HermesMCPClient:
                     payload = await _read_mcp_response(response, tool)
             except MupotProtocolError:
                 raise
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                logger.warning("[mupot] MCP connection failed before request send")
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+                self._client = None
+                raise MupotSafeRetryError(_GENERIC_MCP_TRANSPORT_ERROR) from None
             except Exception:
                 logger.warning("[mupot] MCP request failed; resetting client")
                 try:
@@ -445,8 +457,12 @@ class MupotAdapter(BasePlatformAdapter):
         self._completion_event = asyncio.Event()
         self._completion_outcome: Optional[ProcessingOutcome] = None
         self._current_message: Optional[dict[str, Any]] = None
+        self._lease_quarantined = False
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        if self._lease_quarantined:
+            logger.error("[mupot] connect blocked; inbox reconciliation required")
+            return False
         try:
             require_supported_profile_runtime({})
             if self._running:
@@ -508,23 +524,68 @@ class MupotAdapter(BasePlatformAdapter):
             await self._send_client.close()
         self._mark_disconnected()
 
+    async def _call_consumer(
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+    ) -> Any:
+        """Retry once only when transport proves no request bytes were sent."""
+        for attempt in range(2):
+            try:
+                return await asyncio.wait_for(
+                    self._client.call(tool, arguments),
+                    timeout=self.rpc_timeout,
+                )
+            except MupotSafeRetryError:
+                if attempt == 0:
+                    logger.warning(
+                        "[mupot] retrying consumer request after safe pre-send failure"
+                    )
+                    continue
+                raise
+        raise AssertionError("unreachable")
+
+    def _quarantine_inbox_polling(self) -> None:
+        self._lease_quarantined = True
+        self._set_fatal_error(
+            "mupot_inbox_reconciliation_required",
+            "Mupot inbox polling requires reconciliation",
+            retryable=False,
+        )
+        logger.error("[mupot] inbox polling quarantined; reconciliation required")
+
     async def _poll_loop(self) -> None:
         while self._running:
             try:
                 await self._flush_notifications()
-                payload = await asyncio.wait_for(
-                    self._client.call(
-                        "inbox_lease",
-                        {"limit": 1, "lease_seconds": self.lease_seconds},
-                    ),
-                    timeout=self.rpc_timeout,
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[mupot] notification flush error: %s", exc, exc_info=True
                 )
-                if not isinstance(payload, dict):
-                    raise RuntimeError("Mupot inbox_lease returned an invalid payload")
-                messages = payload.get("messages", [])
-                if messages and isinstance(messages[0], dict):
+                await asyncio.sleep(self.poll_interval)
+                continue
+
+            try:
+                payload = await self._call_consumer(
+                    "inbox_lease",
+                    {"limit": 1, "lease_seconds": self.lease_seconds},
+                )
+                if not isinstance(payload, dict) or "messages" not in payload:
+                    raise _protocol_error()
+                messages = payload.get("messages")
+                if (
+                    not isinstance(messages, list)
+                    or len(messages) > 1
+                    or any(not isinstance(message, dict) for message in messages)
+                ):
+                    raise _protocol_error()
+                if messages:
                     message = messages[0]
                     message_id = str(message.get("id") or "")
+                    if not message_id:
+                        raise _protocol_error()
                     logger.info(
                         "[mupot] leased message=%s seq=%s attempts=%s request_id=%s",
                         message_id,
@@ -549,8 +610,9 @@ class MupotAdapter(BasePlatformAdapter):
                         await self._ack_expected(message_id)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                logger.warning("[mupot] poll error: %s", exc, exc_info=True)
+            except Exception:
+                self._quarantine_inbox_polling()
+                return
             await asyncio.sleep(self.poll_interval)
 
     async def _handle_ack_envelope(self, message: dict[str, Any]) -> None:
@@ -604,9 +666,9 @@ class MupotAdapter(BasePlatformAdapter):
         self._current_message = None
 
     async def _ack_expected(self, expected_id: str) -> None:
-        payload = await asyncio.wait_for(
-            self._client.call("inbox_ack", {"ids": [expected_id]}),
-            timeout=self.rpc_timeout,
+        payload = await self._call_consumer(
+            "inbox_ack",
+            {"ids": [expected_id]},
         )
         if not isinstance(payload, dict):
             raise _protocol_error()

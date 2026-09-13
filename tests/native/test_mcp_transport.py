@@ -376,6 +376,29 @@ async def test_ambiguous_inbox_lease_transport_is_not_repeated_inside_one_call(
         reset_secret_scope(scope)
 
     assert str(failure.value) == "Mupot request failed"
+    assert type(failure.value).__name__ == "MupotTransportError"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_connect_failure_is_the_only_explicit_safe_before_send_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = StreamingResponse(tool_result({"messages": []}, tool="inbox_lease"))
+    calls = install_transport(
+        monkeypatch,
+        response,
+        error=httpx.ConnectError("connection was never established"),
+    )
+    scope = set_secret_scope({"MUPOT_AGENT_TOKEN": "native-test-token"})
+    try:
+        with pytest.raises(RuntimeError) as failure:
+            await HermesMCPClient("mupot").call("inbox_lease", {"limit": 1})
+    finally:
+        reset_secret_scope(scope)
+
+    assert str(failure.value) == "Mupot request failed"
+    assert type(failure.value).__name__ == "MupotSafeRetryError"
     assert len(calls) == 1
 
 

@@ -9,6 +9,8 @@ import pytest
 from gateway.config import PlatformConfig
 
 from plugin.mupot_gateway.adapter import (  # noqa: E402
+    MupotProtocolError,
+    MupotTransportError,
     MupotAdapter,
     StateStore,
     build_mupot_event,
@@ -21,6 +23,7 @@ class FakeMupotClient:
     def __init__(self) -> None:
         self.sent: list[dict] = []
         self.acked = False
+        self.lease_calls = 0
         self.message = {
             "id": "m-1",
             "seq": 7,
@@ -40,6 +43,7 @@ class FakeMupotClient:
 
     async def call(self, tool: str, arguments: dict) -> dict:
         if tool == "inbox_lease":
+            self.lease_calls += 1
             return {
                 "messages": [] if self.acked else [self.message],
                 "remaining": 0,
@@ -67,7 +71,12 @@ class FakeMupotClient:
 
 
 class AckMupotClient(FakeMupotClient):
-    def __init__(self, *, fail_ack_once: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_ack_once: bool = False,
+        safe_ack_once: bool = False,
+    ) -> None:
         super().__init__()
         self.message = {
             "id": "ack-1",
@@ -80,15 +89,50 @@ class AckMupotClient(FakeMupotClient):
             "expects_reply": False,
         }
         self.fail_ack_once = fail_ack_once
+        self.safe_ack_once = safe_ack_once
         self.ack_calls = 0
 
     async def call(self, tool: str, arguments: dict) -> dict:
         if tool == "inbox_ack":
             self.ack_calls += 1
+            if self.safe_ack_once and self.ack_calls == 1:
+                from plugin.mupot_gateway import adapter as adapter_module
+
+                safe_error = getattr(adapter_module, "MupotSafeRetryError", RuntimeError)
+                raise safe_error("Mupot request failed")
             if self.fail_ack_once and self.ack_calls == 1:
                 return {"acked": [], "already_read": [], "refused": ["ack-1"]}
             self.acked = True
             return {"acked": ["ack-1"], "already_read": [], "refused": []}
+        return await super().call(tool, arguments)
+
+
+class LeaseFailureClient(FakeMupotClient):
+    def __init__(self, failure: Exception) -> None:
+        super().__init__()
+        self.failure = failure
+        self.lease_calls = 0
+        self.first_lease = asyncio.Event()
+
+    async def call(self, tool: str, arguments: dict) -> dict:
+        if tool == "inbox_lease":
+            self.lease_calls += 1
+            self.first_lease.set()
+            raise self.failure
+        return await super().call(tool, arguments)
+
+
+class LeasePayloadClient(FakeMupotClient):
+    def __init__(self, payload: object) -> None:
+        super().__init__()
+        self.payload = payload
+        self.first_lease = asyncio.Event()
+
+    async def call(self, tool: str, arguments: dict) -> dict:
+        if tool == "inbox_lease":
+            self.lease_calls += 1
+            self.first_lease.set()
+            return self.payload  # type: ignore[return-value]
         return await super().call(tool, arguments)
 
 
@@ -214,13 +258,15 @@ async def test_terminal_ack_is_consumed_without_outbound_response(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_terminal_ack_failure_is_retried_before_commit(tmp_path: Path) -> None:
+async def test_terminal_ack_domain_failure_quarantines_without_retry(
+    tmp_path: Path,
+) -> None:
     client = AckMupotClient(fail_ack_once=True)
     handled: list[str] = []
     config = PlatformConfig(
         enabled=True,
         typing_indicator=False,
-        extra={"poll_interval": 0.2, "state_path": str(tmp_path / "state.json")},
+        extra={"poll_interval": 0.01, "state_path": str(tmp_path / "state.json")},
     )
     adapter = MupotAdapter(config, client_factory=lambda *_: client)
     async def handler(event):
@@ -235,16 +281,139 @@ async def test_terminal_ack_failure_is_retried_before_commit(tmp_path: Path) -> 
             await asyncio.sleep(0.01)
         assert client.ack_calls == 1
         assert "ack-1" not in StateStore(tmp_path / "state.json").load().get("processed", [])
-        for _ in range(200):
-            if client.ack_calls >= 2 and client.acked:
-                break
-            await asyncio.sleep(0.01)
-        assert client.ack_calls >= 2
-        assert client.acked
+        await asyncio.sleep(0.05)
+        assert client.ack_calls == 1
+        assert client.acked is False
+        assert getattr(adapter, "_lease_quarantined", False) is True
+        assert adapter._running is False
         assert handled == []
         state = StateStore(tmp_path / "state.json").load()
-        assert "ack-1" in state["processed"]
+        assert "ack-1" not in state["processed"]
         assert len(state["terminal_receipts"]) == 1
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_terminal_ack_retries_one_safe_before_send_failure_without_releasing(
+    tmp_path: Path,
+) -> None:
+    client = AckMupotClient(safe_ack_once=True)
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"poll_interval": 0.01, "state_path": str(tmp_path / "state.json")},
+        ),
+        client_factory=lambda *_: client,
+    )
+
+    assert await adapter.connect()
+    try:
+        for _ in range(100):
+            if client.acked:
+                break
+            await asyncio.sleep(0.01)
+        assert client.acked is True
+        assert client.ack_calls == 2
+        assert client.lease_calls == 1
+        assert getattr(adapter, "_lease_quarantined", False) is False
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        MupotTransportError("Mupot request failed"),
+        MupotProtocolError("Mupot MCP request failed"),
+    ],
+)
+async def test_poll_loop_quarantines_ambiguous_or_protocol_lease_without_releasing(
+    tmp_path: Path,
+    failure: Exception,
+) -> None:
+    client = LeaseFailureClient(failure)
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "poll_interval": 0.01,
+                "state_path": str(tmp_path / "state.json"),
+            },
+        ),
+        client_factory=lambda *_: client,
+    )
+
+    assert await adapter.connect()
+    try:
+        await asyncio.wait_for(client.first_lease.wait(), 1)
+        await asyncio.sleep(0.05)
+        assert client.lease_calls == 1
+        assert getattr(adapter, "_lease_quarantined", False) is True
+        assert adapter._running is False
+        assert await adapter.connect(is_reconnect=True) is False
+        assert client.lease_calls == 1
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{}, {"messages": "not-a-list"}, {"messages": [{}, {}]}])
+async def test_poll_loop_quarantines_malformed_lease_result_without_releasing(
+    tmp_path: Path,
+    payload: object,
+) -> None:
+    client = LeasePayloadClient(payload)
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"poll_interval": 0.01, "state_path": str(tmp_path / "state.json")},
+        ),
+        client_factory=lambda *_: client,
+    )
+
+    assert await adapter.connect()
+    try:
+        await asyncio.wait_for(client.first_lease.wait(), 1)
+        await asyncio.sleep(0.05)
+        assert client.lease_calls == 1
+        assert getattr(adapter, "_lease_quarantined", False) is True
+        assert adapter._running is False
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_retries_only_classified_safe_before_send_failure(
+    tmp_path: Path,
+) -> None:
+    from plugin.mupot_gateway import adapter as adapter_module
+
+    safe_error = getattr(adapter_module, "MupotSafeRetryError", None)
+    assert safe_error is not None
+    client = LeaseFailureClient(safe_error("Mupot request failed"))
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "poll_interval": 0.01,
+                "state_path": str(tmp_path / "state.json"),
+            },
+        ),
+        client_factory=lambda *_: client,
+    )
+
+    assert await adapter.connect()
+    try:
+        for _ in range(100):
+            if client.lease_calls >= 2:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        assert client.lease_calls == 2
+        assert getattr(adapter, "_lease_quarantined", False) is True
+        assert adapter._running is False
     finally:
         await adapter.disconnect()
 

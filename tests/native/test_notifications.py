@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import sys
 from pathlib import Path
 
 import pytest
@@ -253,12 +251,31 @@ async def test_registered_plugin_activates_native_gateway_and_preserves_control_
     from gateway.run import GatewayRunner
     from gateway.session import SessionStore, SessionSource
     from hermes_cli import plugins
-    from plugin.mupot_gateway.adapter import register
     from plugin.mupot_gateway import notifications
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    config_file = tmp_path / "config.yaml"
-    config_file.write_text(yaml.safe_dump({"plugins": {"entries": {
-        "mupot": {"allow_gateway_injection": True}}}}))
+    home = tmp_path / "hermes-home"
+    plugin_dir = home / "plugins" / "mupot"
+    plugin_dir.parent.mkdir(parents=True)
+    plugin_dir.symlink_to(Path(__file__).resolve().parents[2], target_is_directory=True)
+    config_file = home / "config.yaml"
+    config_file.write_text(yaml.safe_dump({"plugins": {
+        "enabled": ["mupot"],
+        "entries": {"mupot": {
+            "allow_gateway_injection": True,
+            "settings": {"mode": "operator", "operator": {
+                "base_url": "https://pot.example.invalid",
+                "expected_tenant": "tenant-test",
+                "squad_id": "squad-test",
+                "agent_id": "agent-test",
+                "approval_owner": "human-test",
+                "native_gateway_enabled": True,
+            }},
+        }},
+    }}))
+    empty_bundled = tmp_path / "empty-bundled"
+    empty_bundled.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(empty_bundled))
+    monkeypatch.setenv("MUPOT_AGENT_TOKEN", "test-agent-token")
     store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
     entry = store.get_or_create_session(SessionSource(platform=Platform.TELEGRAM,
         chat_id="123", user_id="owner", chat_type="dm"))
@@ -290,12 +307,12 @@ async def test_registered_plugin_activates_native_gateway_and_preserves_control_
     runner._draining = False
     runner._background_tasks = set()
     runner._is_user_authorized = lambda *a, **kw: True
-    manager = plugins.PluginManager()
-    context = plugins.PluginContext(plugins.PluginManifest(name="mupot-platform",
-        key="mupot", source="user"), manager)
+    manager = plugins.PluginManager(scope_key=str(home.resolve()))
+    monkeypatch.setattr(manager, "_scan_entry_points", lambda: [])
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
     runner._install_plugin_message_injector()
-    register(context)
+    manager.discover_and_load()
+    assert manager._plugins["mupot"].enabled is True
     adapter = platform_registry.get("mupot").adapter_factory(PlatformConfig(enabled=True, extra={
         "state_path": str(tmp_path / "outbox.json"), "notification_activate": True,
         "notification_recipients": {"telegram": "owner"}}))
@@ -315,7 +332,11 @@ async def test_registered_plugin_activates_native_gateway_and_preserves_control_
         assert event.allow_gateway_control is False
         assert event.internal is True
         assert event.source.chat_id == "123"
+        await adapter._flush_notifications()
+        await asyncio.sleep(0)
+        assert len(seen) == 1
     finally:
         runner._clear_plugin_message_injector()
+        manager.unload("mupot")
         await asyncio.gather(*list(runner._background_tasks), return_exceptions=True)
         await asyncio.gather(*list(target_adapter._session_tasks.values()), return_exceptions=True)

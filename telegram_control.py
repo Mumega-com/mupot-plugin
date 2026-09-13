@@ -225,10 +225,15 @@ def register_telegram_control(ctx: Any, settings: TelegramControlSettings) -> No
     if not settings.enabled:
         return
 
+    wired_applications: list[tuple[Any, list[Any]]] = []
+
     def factory(application: Any, adapter: Any) -> None:
         # Hermes loads backend plugins without platform SDK dependencies. Keep
         # the optional PTB import inside the native factory invoked at connect.
         from telegram.ext import CommandHandler
+
+        if any(existing is application for existing, _ in wired_applications):
+            return
 
         async def handle(update: Any, context: Any) -> None:
             try:
@@ -241,7 +246,31 @@ def register_telegram_control(ctx: Any, settings: TelegramControlSettings) -> No
             if message is not None:
                 await message.reply_text(reply)
 
+        handlers: list[Any] = []
         for command in _COMMANDS:
-            application.add_handler(CommandHandler(command, handle))
+            handler = CommandHandler(command, handle)
+            application.add_handler(handler)
+            handlers.append(handler)
+        wired_applications.append((application, handlers))
+
+    def unload() -> None:
+        for application, handlers in wired_applications:
+            for handler in handlers:
+                application.remove_handler(handler, group=0)
+        wired_applications.clear()
+
+        manager = getattr(ctx, "_manager", None)
+        factories = getattr(manager, "_platform_handler_factories", None)
+        if not isinstance(factories, dict):
+            return
+        telegram_factories = factories.get("telegram", [])
+        telegram_factories[:] = [
+            entry for entry in telegram_factories if entry[0] is not factory
+        ]
+        if not telegram_factories:
+            factories.pop("telegram", None)
 
     ctx.register_telegram_handler(factory)
+    on_unload = getattr(ctx, "on_unload", None)
+    if callable(on_unload):
+        on_unload(unload)

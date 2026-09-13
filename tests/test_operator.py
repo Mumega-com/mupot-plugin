@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -757,8 +758,12 @@ class OperatorTests(unittest.TestCase):
             },
         }
         ctx = Context()
+        secret_owner = type("SecretOwner", (), {
+            "activate": staticmethod(nullcontext),
+            "read_secret": staticmethod(lambda _name: "mupot_test_agent_token"),
+        })()
         with patch("plugin._load_plugin_settings", return_value=config), patch(
-            "plugin.read_profile_secret", return_value="mupot_test_agent_token"
+            "plugin.ProfileSecretOwner.from_context", return_value=secret_owner
         ), patch.dict(
             "os.environ", {"MUPOT_AGENT_TOKEN": "mupot_test_agent_token"}, clear=False
         ):

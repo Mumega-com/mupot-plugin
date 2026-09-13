@@ -11,7 +11,11 @@ from typing import Any, Mapping
 from urllib.parse import urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from .profile_scope import read_profile_secret, require_supported_profile_runtime
+from .profile_scope import (
+    ProfileSecretOwner,
+    read_profile_secret,
+    require_supported_profile_runtime,
+)
 
 
 _COMMANDS = ("start", "needs", "answer", "approve", "reject")
@@ -222,7 +226,12 @@ def relay_telegram_update(settings: TelegramControlSettings, update: Any) -> str
     return reply
 
 
-def register_telegram_control(ctx: Any, settings: TelegramControlSettings) -> None:
+def register_telegram_control(
+    ctx: Any,
+    settings: TelegramControlSettings,
+    *,
+    secret_owner: ProfileSecretOwner | None = None,
+) -> None:
     settings.validate()
     if not settings.enabled:
         return
@@ -239,7 +248,13 @@ def register_telegram_control(ctx: Any, settings: TelegramControlSettings) -> No
 
         async def handle(update: Any, context: Any) -> None:
             try:
-                reply = await asyncio.to_thread(relay_telegram_update, settings, update)
+                def relay() -> str:
+                    if secret_owner is None:
+                        return relay_telegram_update(settings, update)
+                    with secret_owner.activate():
+                        return relay_telegram_update(settings, update)
+
+                reply = await asyncio.to_thread(relay)
             except ValueError:
                 reply = _REFUSAL_REPLY
             except Exception:

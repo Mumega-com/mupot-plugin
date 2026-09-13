@@ -1,4 +1,5 @@
 """The single plugin must select one receiver without partially registering an invalid mode."""
+from contextlib import nullcontext
 import sys
 import types
 from unittest.mock import patch
@@ -30,15 +31,23 @@ class Context:
 def test_native_receiver_registers_from_operator_plugin_and_never_starts_legacy_stream():
     ctx = Context()
     calls = []
+    secret_owner = types.SimpleNamespace(
+        activate=nullcontext,
+        read_secret=lambda _name: "mupot_test_agent_token",
+    )
     module = types.ModuleType("plugin.mupot_gateway.adapter")
     module.register = lambda context, **kwargs: calls.append((context, kwargs))
     with patch("plugin._load_plugin_settings", return_value=settings(native_gateway_enabled=True)), \
          patch("plugin._maybe_start_inbox_stream") as legacy, \
-         patch("plugin.read_profile_secret", return_value="mupot_test_agent_token"), \
+         patch("plugin.ProfileSecretOwner.from_context", return_value=secret_owner), \
          patch.dict("os.environ", {"MUPOT_AGENT_TOKEN": "mupot_test_agent_token"}), \
          patch.dict(sys.modules, {module.__name__: module}):
         register(ctx)
-    assert calls == [(ctx, {"expected_agent_id": "agent-test", "expected_tenant": "tenant-test"})]
+    assert calls == [(ctx, {
+        "expected_agent_id": "agent-test",
+        "expected_tenant": "tenant-test",
+        "secret_owner": secret_owner,
+    })]
     assert ctx.tools
     legacy.assert_not_called()
 

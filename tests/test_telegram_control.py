@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 import json
 import sys
@@ -500,6 +501,10 @@ class RegistrationContext:
 
 def test_plugin_registers_telegram_before_native_and_operator_side_effects() -> None:
     ctx = RegistrationContext()
+    secret_owner = types.SimpleNamespace(
+        activate=nullcontext,
+        read_secret=lambda _name: "mupot_test_agent_token",
+    )
     native = types.ModuleType("plugin.mupot_gateway.adapter")
     native.register = lambda *_args, **_kwargs: ctx.events.append("native")
     with (
@@ -507,7 +512,7 @@ def test_plugin_registers_telegram_before_native_and_operator_side_effects() -> 
             "plugin._load_plugin_settings",
             return_value=operator_settings(native_gateway_enabled=True),
         ),
-        patch("plugin.read_profile_secret", return_value="mupot_test_agent_token"),
+        patch("plugin.ProfileSecretOwner.from_context", return_value=secret_owner),
         patch.dict("os.environ", {"MUPOT_AGENT_TOKEN": "mupot_test_agent_token"}),
         patch.dict(sys.modules, {native.__name__: native}),
     ):
@@ -523,6 +528,10 @@ def test_plugin_registration_injects_secret_reader_without_resolving_token() -> 
     secret_reader = Mock(
         side_effect=AssertionError("registration must not read the token")
     )
+    secret_owner = types.SimpleNamespace(
+        activate=nullcontext,
+        read_secret=secret_reader,
+    )
 
     class Client:
         def __init__(self, _settings: object, **kwargs: object) -> None:
@@ -534,7 +543,7 @@ def test_plugin_registration_injects_secret_reader_without_resolving_token() -> 
             return_value=operator_settings(native_gateway_enabled=False),
         ),
         patch("plugin.MupotOperatorClient", Client),
-        patch("plugin.read_profile_secret", secret_reader),
+        patch("plugin.ProfileSecretOwner.from_context", return_value=secret_owner),
         patch("plugin.register_operator_tools"),
         patch("plugin._maybe_start_inbox_stream"),
     ):

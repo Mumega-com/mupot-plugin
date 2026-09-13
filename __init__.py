@@ -23,7 +23,7 @@ from .schemas import (
     MUPOT_STATUS_SCHEMA,
 )
 from .telegram_control import TelegramControlSettings, register_telegram_control
-from .profile_scope import read_profile_secret, require_supported_profile_runtime
+from .profile_scope import ProfileSecretOwner, require_supported_profile_runtime
 from .tools import mupot_brain_enable, mupot_provision, mupot_status
 
 # Process-global registry of running inbox streamers keyed by state-file path.
@@ -206,18 +206,28 @@ def register(ctx: Any) -> None:
             raise ValueError("restart the gateway before switching an active legacy inbox stream to native receive")
         operator_settings = OperatorSettings.from_mapping(operator_value)
         telegram_control_settings = TelegramControlSettings.from_mapping(operator_value)
-        client = MupotOperatorClient(
-            operator_settings,
-            secret_reader=read_profile_secret,
-        )
-        register_telegram_control(ctx, telegram_control_settings)
-        if native_gateway:
-            from .mupot_gateway.adapter import register as register_native_gateway
-            register_native_gateway(ctx, expected_agent_id=operator_settings.agent_id,
-                                    expected_tenant=operator_settings.expected_tenant)
-        register_operator_tools(ctx, client)
-        if not native_gateway:
-            _maybe_start_inbox_stream(ctx, operator_value)
+        secret_owner = ProfileSecretOwner.from_context(ctx)
+        with secret_owner.activate():
+            client = MupotOperatorClient(
+                operator_settings,
+                secret_reader=secret_owner.read_secret,
+            )
+            register_telegram_control(
+                ctx,
+                telegram_control_settings,
+                secret_owner=secret_owner,
+            )
+            if native_gateway:
+                from .mupot_gateway.adapter import register as register_native_gateway
+                register_native_gateway(
+                    ctx,
+                    expected_agent_id=operator_settings.agent_id,
+                    expected_tenant=operator_settings.expected_tenant,
+                    secret_owner=secret_owner,
+                )
+            register_operator_tools(ctx, client)
+            if not native_gateway:
+                _maybe_start_inbox_stream(ctx, operator_value)
         return
 
     if mode == "provisioner":

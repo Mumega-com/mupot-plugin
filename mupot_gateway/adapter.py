@@ -11,6 +11,7 @@ import os
 import re
 import time
 from collections import deque
+from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -29,7 +30,11 @@ from gateway.platforms.base import (
 from gateway.session import SessionSource
 from hermes_constants import get_hermes_home
 from ..mupot_operator import validate_operator_identity
-from ..profile_scope import read_profile_secret, require_supported_profile_runtime
+from ..profile_scope import (
+    ProfileSecretOwner,
+    read_profile_secret,
+    require_supported_profile_runtime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -459,15 +464,30 @@ class StateStore:
 
 
 class HermesMCPClient:
-    def __init__(self, server_name: str):
+    def __init__(
+        self,
+        server_name: str,
+        *,
+        secret_owner: ProfileSecretOwner | None = None,
+    ):
         self.server_name = server_name
+        self._secret_owner = secret_owner
         self._client: Optional[httpx.AsyncClient] = None
         self._url: Optional[str] = None
         self._headers: dict[str, str] = {}
         self._lock = asyncio.Lock()
         self._request_id = 0
 
+    def _profile_scope(self):
+        if self._secret_owner is None:
+            return nullcontext()
+        return self._secret_owner.activate()
+
     async def _ensure_client_locked(self) -> None:
+        with self._profile_scope():
+            self._ensure_client()
+
+    def _ensure_client(self) -> None:
         require_supported_profile_runtime({})
         # Validate availability at native connect as well as at request time.
         # The value is deliberately not cached here; call() observes rotation.
@@ -503,49 +523,50 @@ class HermesMCPClient:
 
     async def call(self, tool: str, arguments: dict[str, Any]) -> Any:
         async with self._lock:
-            await self._ensure_client_locked()
-            self._request_id += 1
-            req_id = self._request_id
-            body = {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "method": "tools/call",
-                "params": {
-                    "name": tool,
-                    "arguments": arguments,
-                },
-            }
-            token = read_profile_secret("MUPOT_AGENT_TOKEN")
-            headers = {**self._headers, "Authorization": f"Bearer {token}"}
-            client = self._client
-            url = self._url
-            if client is None or url is None:
-                raise MupotTransportError(_GENERIC_MCP_TRANSPORT_ERROR)
-            try:
-                async with client.stream(
-                    "POST", url, json=body, headers=headers
-                ) as response:
-                    payload = await _read_mcp_response(response, tool)
-            except MupotProtocolError:
-                raise
-            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
-                logger.warning("[mupot] MCP connection failed before request send")
+            with self._profile_scope():
+                self._ensure_client()
+                self._request_id += 1
+                req_id = self._request_id
+                body = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": tool,
+                        "arguments": arguments,
+                    },
+                }
+                token = read_profile_secret("MUPOT_AGENT_TOKEN")
+                headers = {**self._headers, "Authorization": f"Bearer {token}"}
+                client = self._client
+                url = self._url
+                if client is None or url is None:
+                    raise MupotTransportError(_GENERIC_MCP_TRANSPORT_ERROR)
                 try:
-                    await client.aclose()
+                    async with client.stream(
+                        "POST", url, json=body, headers=headers
+                    ) as response:
+                        payload = await _read_mcp_response(response, tool)
+                except MupotProtocolError:
+                    raise
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                    logger.warning("[mupot] MCP connection failed before request send")
+                    try:
+                        await client.aclose()
+                    except Exception:
+                        pass
+                    self._client = None
+                    raise MupotSafeRetryError(_GENERIC_MCP_TRANSPORT_ERROR) from None
                 except Exception:
-                    pass
-                self._client = None
-                raise MupotSafeRetryError(_GENERIC_MCP_TRANSPORT_ERROR) from None
-            except Exception:
-                logger.warning("[mupot] MCP request failed; resetting client")
-                try:
-                    await client.aclose()
-                except Exception:
-                    pass
-                self._client = None
-                raise MupotTransportError(_GENERIC_MCP_TRANSPORT_ERROR) from None
+                    logger.warning("[mupot] MCP request failed; resetting client")
+                    try:
+                        await client.aclose()
+                    except Exception:
+                        pass
+                    self._client = None
+                    raise MupotTransportError(_GENERIC_MCP_TRANSPORT_ERROR) from None
 
-        return decode_mcp_result(payload, req_id, tool)
+                return decode_mcp_result(payload, req_id, tool)
 
     async def close(self) -> None:
         async with self._lock:
@@ -566,6 +587,7 @@ class MupotAdapter(BasePlatformAdapter):
         config: PlatformConfig,
         client_factory: Callable[[str], Any] = HermesMCPClient,
         message_injector: Optional[Callable[..., bool]] = None,
+        secret_owner: ProfileSecretOwner | None = None,
     ) -> None:
         super().__init__(config, _platform_for_mupot())
         extra = config.extra or {}
@@ -600,6 +622,7 @@ class MupotAdapter(BasePlatformAdapter):
             raise ValueError("routine_events_enabled must be a boolean")
         self.routine_events_enabled = routine_events_enabled
         self.message_injector = message_injector
+        self._secret_owner = secret_owner
         self._state: dict[str, Any] = copy.deepcopy(loaded) if state_valid else {}
         loaded_reply_outbox = loaded.get("reply_outbox")
         reply_outbox_valid = loaded_reply_outbox is None or isinstance(
@@ -1098,6 +1121,19 @@ class MupotAdapter(BasePlatformAdapter):
             self._mark_reply_complete(source_id)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        if self._secret_owner is not None:
+            try:
+                with self._secret_owner.activate():
+                    return await self._connect_with_active_scope(
+                        is_reconnect=is_reconnect
+                    )
+            except Exception:
+                logger.error("[mupot] connect failed: profile scope unavailable")
+                self._mark_disconnected()
+                return False
+        return await self._connect_with_active_scope(is_reconnect=is_reconnect)
+
+    async def _connect_with_active_scope(self, *, is_reconnect: bool = False) -> bool:
         if (
             self._reply_state_invalid
             or self._legacy_pending_ambiguous
@@ -1760,12 +1796,27 @@ def _apply_yaml_config(_yaml: dict, platform: dict) -> dict:
     }
 
 
-def register(ctx, *, expected_agent_id=None, expected_tenant=None) -> None:
+def register(
+    ctx,
+    *,
+    expected_agent_id=None,
+    expected_tenant=None,
+    secret_owner: ProfileSecretOwner | None = None,
+) -> None:
     def adapter_factory(config):
         extra = dict(config.extra or {})
         if expected_agent_id is not None or expected_tenant is not None:
             extra.update(expected_agent_id=expected_agent_id, expected_tenant=expected_tenant)
-        return MupotAdapter(replace(config, extra=extra), message_injector=ctx.inject_message)
+
+        def client_factory(server_name: str) -> HermesMCPClient:
+            return HermesMCPClient(server_name, secret_owner=secret_owner)
+
+        return MupotAdapter(
+            replace(config, extra=extra),
+            client_factory=client_factory,
+            message_injector=ctx.inject_message,
+            secret_owner=secret_owner,
+        )
 
     ctx.register_platform(
         name="mupot",

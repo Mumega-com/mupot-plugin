@@ -8,7 +8,7 @@ or pilot completion.
 
 ## Exact local contracts
 
-- Plugin head before this evidence slice: `efddb743666167eaa52b133b52bfed365d070ab3`.
+- Final verified plugin head: `457ac9816ec1b2532eb959b05a664cbccde2532c`.
 - Mupot server checkout: `80001a11c29d93a5dd83f09f87eeaff92514f851`,
   clean tracked tree.
 - Hermes native contract: `233757037df1f03f9fe1cfddc097acd5ad7f7510`.
@@ -38,8 +38,8 @@ or activation and leaves the server message unread. The matched path also proves
 exposes the pending question and one exact `/answer` records the human decision.
 
 Fresh verification passed the two cross-repository tests 2/2, standalone pytest 220 plus 12
-subtests, standalone unittest 27/27, local native 240/240, and clean-detached pinned-Hermes
-native 240/240. Ruff, mypy, Python compilation, shell parsing, four-file YAML parsing,
+subtests, standalone unittest 27/27, local native 243/243, and clean-detached pinned-Hermes
+native 243/243. Ruff, mypy, Python compilation, shell parsing, four-file YAML parsing,
 relative-link checks, working and full-base whitespace checks, and credential-shape checks
 also passed. The current lease-attempt commands are retained in the ignored hostile Task 2
 report; the earlier integration mutation results remain in the Task 8 report.
@@ -65,3 +65,38 @@ No receipt above substitutes for a later one.
 Independent exact-head review and required remote CI, push or PR update, merge, deployment,
 remote migration-ledger readback, live profile and credential configuration, participant
 invitation, and pilot execution remain separately controlled and unproven.
+
+## Final attempt-v3 and notification-fence verification
+
+The final cross-repository run used the real plugin HTTP client against the registered Mupot
+MCP application at server head `80001a11c29d93a5dd83f09f87eeaff92514f851` and migration
+order `0152_telegram_project_onboarding.sql` then
+`0153_inbox_lease_attempt_reconciliation.sql`. It passed 2/2 cases and observed strict scope,
+random attempt lease, exact attempt ACK, the `acked` server tombstone, consumed message
+readback, matched assigned/profile agent identity, and one activation acceptance. The
+mismatched profile performed no custody or ACK.
+
+Five plugin mutations were applied separately in a disposable detached worktree, each
+produced the expected RED, and each was restored:
+
+1. Accepting a non-strict consumer-scope echo allowed a reconciliation network write; the
+   strict-scope no-write test failed.
+2. Ignoring the attempt-v3 profile-owner fingerprint let another profile reconcile the same
+   server scope; the owner-swap test failed.
+3. Downgrading the durable pre-activation state to `pending` caused accepted scheduling plus
+   queued-save failure to become replayable; the save-failure test failed.
+4. Requiring the bounded recent `processed` list instead of the exact durable Routine receipt
+   broke activation after processed-window eviction; the eviction test failed.
+5. Changing the native HTTP MCP transport from POST to GET made the matched cross-repository
+   case fail before `boot_context`, proving the acceptance uses the actual HTTP boundary.
+
+After restoration both disposable trees were diff-clean. The plugin's final release matrix
+also passed full-base changed-file Ruff, mypy over eight source files, Python compilation,
+shell parsing, four YAML files, four onboarding-document link checks, full-base whitespace,
+and the repository no-secrets scan. The broader repository Ruff invocation still reports
+pre-existing lint debt outside this branch's changed paths; it is not represented as green.
+
+The exact plugin head remains local in this receipt. Current-head push/PR checks, independent
+review, merge, deployment, ordered remote migration readback for 0152/0153, protected live
+profile/webhook configuration, transport/mirror receipt, invitation, and the real non-admin
+Telegram pilot remain separately gated and unproven.

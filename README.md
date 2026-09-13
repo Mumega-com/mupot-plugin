@@ -22,7 +22,9 @@ with `inbox_watch_enabled`; enabling both is rejected before registration. Exist
 CLI/SSE-stream configurations remain opt-in and unchanged when native mode is off.
 
 The native receiver uses Mupot's server-authoritative `inbox_lease` attempt receipts and
-attempt-bound `inbox_lease_ack`. It first reads the strict tenant/agent/effective-seat
+attempt-bound `inbox_lease_ack`. Its current attempt-v3 state requires server migration
+`0153_inbox_lease_attempt_reconciliation.sql`, applied after
+`0152_telegram_project_onboarding.sql`. It first reads the strict tenant/agent/effective-seat
 consumer scope, durably records that scope with one random attempt ID and the owning
 profile's non-secret immutable fingerprint, and reuses the ID for the single proven-safe
 transport retry. An ambiguous or restarted attempt is resolved through
@@ -60,6 +62,11 @@ task verdict proves the human decision; and terminal Routine/task evidence prove
 completion. None substitutes for another. Interrupted or ambiguous sends are retained for
 reconciliation rather than blindly replayed. This integration does not grant the agent
 human decision authority.
+
+`activating` and `activation_unknown` are durable no-replay states. If Hermes accepts
+scheduling but persisting `activation_queued` fails, the receiver retains the earlier
+uncertain state and requires operator reconciliation. Routine activation is authorized by
+the exact durable processed Routine receipt, not by the bounded recent `processed` list.
 
 For the broader project-onboarding and human-control scope, see
 [`docs/human-project-control.md`](docs/human-project-control.md).

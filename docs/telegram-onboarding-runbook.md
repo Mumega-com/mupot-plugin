@@ -33,7 +33,9 @@ Do not configure or pilot a live profile until all of these have separate receip
 1. Independent review and required checks pass on the exact plugin and Mupot server heads.
 2. Merge and deployment are authorized for those exact heads and the intended tenant.
 3. `https://mupot.mumega.com/health` reports the expected clean deployed commit.
-4. The remote migration ledger contains `0152_telegram_project_onboarding.sql`.
+4. The remote migration ledger contains `0152_telegram_project_onboarding.sql` followed by
+   `0153_inbox_lease_attempt_reconciliation.sql`. Migration 0152 owns onboarding/webhook
+   receipts; migration 0153 owns the strict-scope lease-attempt and attempt-ACK receipts.
 5. `IM_WEBHOOK_SECRET` is configured at both the Mupot Worker and Hermes profile without
    reading or recording its value.
 6. One dedicated participant squad is linked to exactly one intended project, and the
@@ -108,8 +110,9 @@ Before restart or participant invitation:
 4. Verify the configured tenant and welded agent ID against authenticated Mupot readback.
 5. Verify the notification recipient is the participant's immutable Telegram user ID and
    the destination is an active private conversation.
-6. Verify the retained state file parses and its processed, pending, and notification
-   records have been inventoried without exposing message bodies or secrets.
+6. Verify the retained state file parses and its processed, pending, notification, and
+   attempt-v3 reconciliation records have been inventoried without exposing message bodies
+   or secrets. A pre-v3 marker or owner mismatch remains fenced for manual reconciliation.
 7. Confirm no turn or delivery is active before the one planned full gateway restart.
 
 Use a full gateway restart for initial installation or split-receiver consolidation. Forced
@@ -197,6 +200,13 @@ On gateway interruption:
    same Routine action/stable request ID. Record activation, channel delivery, and domain
    completion as separate receipts.
 
+An activation receipt is also state-specific. `activating` and `activation_unknown` mean the
+external scheduling outcome is uncertain and must not be replayed automatically.
+`activation_queued` proves only that Hermes accepted scheduling; it is not channel delivery
+or a completed turn. If saving the queued state fails after acceptance, the earlier durable
+uncertain state remains the replay fence. Routine activation eligibility is read from the
+exact durable processed Routine receipt, not the bounded recent `processed` ID window.
+
 ## Suspension, revocation, and rollback
 
 When access must stop, suspend the exact Mupot member first so subsequent Telegram lookup
@@ -221,8 +231,8 @@ a stop signal, not permission to widen a predicate or edit around the invariant.
 ## Evidence checklist
 
 - [ ] Exact plugin and Mupot server heads have independent review and required checks.
-- [ ] Merge/deployment approvals, deployed `/health` SHA, and migration-ledger readback are
-      attached separately.
+- [ ] Merge/deployment approvals, deployed `/health` SHA, and ordered migration-ledger
+      readback for 0152 then 0153 are attached separately.
 - [ ] The profile has one receiver, one Telegram bot, no legacy Mupot platform, and the
       exact production origin/config keys.
 - [ ] No secret value appears in configuration or evidence.

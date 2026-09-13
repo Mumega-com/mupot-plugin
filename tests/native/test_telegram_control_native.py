@@ -171,3 +171,29 @@ async def test_discovered_handlers_isolate_commands_and_are_owned_on_unload(
     assert manager.unload("mupot") is True
     assert manager.get_telegram_handler_factories() == []
     assert all(handler not in application.handlers[0] for handler in plugin_handlers)
+
+
+def test_targeted_unload_preserves_another_owner_of_the_same_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_cli.plugins import PluginContext, PluginManifest
+
+    manager, _loaded = _discover_plugin(tmp_path, monkeypatch)
+    factory, owner = manager.get_telegram_handler_factories()[0]
+    assert owner == "mupot"
+    competing_context = PluginContext(
+        PluginManifest(name="unrelated-plugin", source="user"), manager
+    )
+    competing_context.register_telegram_handler(factory)
+    assert manager.get_telegram_handler_factories() == [
+        (factory, "mupot"),
+        (factory, "unrelated-plugin"),
+    ]
+
+    try:
+        assert manager.unload("mupot") is True
+        assert manager.get_telegram_handler_factories() == [
+            (factory, "unrelated-plugin")
+        ]
+    finally:
+        manager.unload()

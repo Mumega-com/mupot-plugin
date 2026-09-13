@@ -263,9 +263,12 @@ def register_telegram_control(ctx: Any, settings: TelegramControlSettings) -> No
         factories = getattr(manager, "_platform_handler_factories", None)
         if not isinstance(factories, dict):
             return
+        plugin_name = getattr(getattr(ctx, "manifest", None), "name", None)
         telegram_factories = factories.get("telegram", [])
         telegram_factories[:] = [
-            entry for entry in telegram_factories if entry[0] is not factory
+            entry
+            for entry in telegram_factories
+            if not (entry[0] is factory and entry[1] == plugin_name)
         ]
         if not telegram_factories:
             factories.pop("telegram", None)

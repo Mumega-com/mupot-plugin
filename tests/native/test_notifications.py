@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -28,6 +31,304 @@ def adapter_at(tmp_path):
         "state_path": str(tmp_path / "inbox.json"),
         "notification_recipients": {"telegram": "owner"},
     }), client_factory=lambda _: Client())
+
+
+def source(source_id="source-1", **updates):
+    value = {
+        "id": source_id,
+        "from_agent": "kasra",
+        "request_id": f"request-{source_id}",
+        "kind": "ack",
+        "expects_reply": False,
+    }
+    value.update(updates)
+    return value
+
+
+def test_enqueue_failed_save_is_copy_on_write_and_retry_establishes_custody(tmp_path, monkeypatch):
+    """Mutating live dedupe state before persistence can make every retry a false success."""
+    from plugin.mupot_gateway.notifications import enqueue
+
+    state = {"notification_outbox": {}}
+    store = StateStore(tmp_path / "inbox.json")
+    real_save = store.save
+    attempts = 0
+
+    def fail_once(value):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("notification disk unavailable")
+        real_save(value)
+
+    monkeypatch.setattr(store, "save", fail_once)
+    with pytest.raises(OSError, match="notification disk unavailable"):
+        enqueue(state, store, source(), "Exact human notice.")
+    assert state == {"notification_outbox": {}}
+    assert store.load() == {}
+
+    enqueue(state, store, source(), "Exact human notice.")
+    persisted = store.load()
+    assert state == persisted
+    notice = persisted["notification_outbox"]["source-1"]
+    assert notice["custody_status"] == "durable"
+    assert notice["activation_status"] == "not_started"
+    assert notice["delivery_status"] == "pending"
+    assert len(notice["source_fingerprint"]) == 64
+    assert notice["text"].startswith("Mupot update\n\nExact human notice.")
+
+
+def test_duplicate_enqueue_revalidates_durable_exact_notice(tmp_path):
+    """An in-memory duplicate cannot succeed when its durable record is unreadable."""
+    from plugin.mupot_gateway.notifications import enqueue
+
+    state = {"notification_outbox": {}}
+    store = StateStore(tmp_path / "inbox.json")
+    enqueue(state, store, source(), "Exact human notice.")
+    store.path.write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="custody"):
+        enqueue(state, store, source(), "Exact human notice.")
+
+
+def test_retry_completes_save_that_failed_after_replacement(tmp_path, monkeypatch):
+    """A rename-visible record is not published in memory until a retry fully syncs it."""
+    from plugin.mupot_gateway import adapter as adapter_module
+    from plugin.mupot_gateway.notifications import enqueue
+
+    state = {"notification_outbox": {}}
+    store = StateStore(tmp_path / "inbox.json")
+    real_fsync = os.fsync
+    failed_directory_sync = False
+
+    def fail_first_directory_sync(fd):
+        nonlocal failed_directory_sync
+        if stat.S_ISDIR(os.fstat(fd).st_mode) and not failed_directory_sync:
+            failed_directory_sync = True
+            raise OSError("directory sync unavailable")
+        real_fsync(fd)
+
+    monkeypatch.setattr(adapter_module.os, "fsync", fail_first_directory_sync)
+    with pytest.raises(OSError, match="directory sync unavailable"):
+        enqueue(state, store, source(), "Exact human notice.")
+    assert state == {"notification_outbox": {}}
+    assert "source-1" in store.load()["notification_outbox"]
+
+    enqueue(state, store, source(), "Exact human notice.")
+    assert state == store.load()
+    assert state["notification_outbox"]["source-1"]["custody_status"] == "durable"
+
+
+def test_conflicting_source_content_preserves_original_notice(tmp_path):
+    """Reusing a source ID for different content must not overwrite or dedupe it."""
+    from plugin.mupot_gateway.notifications import enqueue
+
+    state = {"notification_outbox": {}}
+    store = StateStore(tmp_path / "inbox.json")
+    enqueue(state, store, source(), "Original human notice.")
+    original = copy.deepcopy(store.load())
+
+    with pytest.raises(RuntimeError, match="conflict"):
+        enqueue(state, store, source(), "Conflicting human notice.")
+    assert state == original
+    assert store.load() == original
+
+
+def test_matching_legacy_duplicate_keeps_completed_delivery_and_destination(tmp_path):
+    """Adding custody metadata must not regress a completed legacy notice to pending."""
+    from plugin.mupot_gateway.notifications import enqueue
+
+    legacy = {
+        "status": "delivered",
+        "completed_at": 7,
+        "target": {"platform": "telegram", "chat_id": "11"},
+        "text": (
+            "Mupot update\n\nExact human notice.\n\nFrom agent: kasra\n"
+            "Reference: source-1\nReply here to guide the next step."
+        ),
+    }
+    state = {"notification_outbox": {"source-1": copy.deepcopy(legacy)}}
+    store = StateStore(tmp_path / "inbox.json")
+    store.save(state)
+
+    enqueue(state, store, source(), "Exact human notice.")
+    notice = store.load()["notification_outbox"]["source-1"]
+    assert notice["status"] == "delivered"
+    assert notice["delivery_status"] == "delivered"
+    assert notice["activation_status"] == "not_started"
+    assert notice["target"] == legacy["target"]
+
+
+def test_enqueue_prunes_only_oldest_completed_notices(tmp_path):
+    """Bounding completed receipts must never discard pending or uncertain custody."""
+    from plugin.mupot_gateway.notifications import enqueue
+
+    outbox = {
+        f"done-{index:04d}": {
+            "status": "delivered",
+            "completed_at": index,
+            "text": f"Completed {index}",
+        }
+        for index in range(1001)
+    }
+    outbox["keep-pending"] = {"status": "pending", "text": "Pending"}
+    outbox["keep-unknown"] = {
+        "status": "transport_unknown",
+        "text": "Uncertain",
+    }
+    state = {"notification_outbox": outbox}
+    store = StateStore(tmp_path / "inbox.json")
+    store.save(state)
+
+    enqueue(state, store, source("new-source"), "New notice.")
+    persisted = store.load()["notification_outbox"]
+    assert "done-0000" not in persisted
+    assert "done-0001" not in persisted
+    assert "done-0002" in persisted
+    assert persisted["keep-pending"] == {"status": "pending", "text": "Pending"}
+    assert persisted["keep-unknown"] == {
+        "status": "transport_unknown",
+        "text": "Uncertain",
+    }
+
+
+def test_state_store_fsyncs_replacement_directory(tmp_path, monkeypatch):
+    """A renamed state file is not crash-durable until its parent directory is synced."""
+    from plugin.mupot_gateway import adapter as adapter_module
+
+    observed = []
+    real_fsync = os.fsync
+
+    def record_fsync(fd):
+        observed.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+        real_fsync(fd)
+
+    monkeypatch.setattr(adapter_module.os, "fsync", record_fsync)
+    StateStore(tmp_path / "state" / "inbox.json").save({"notification_outbox": {}})
+    assert observed == [False, True]
+
+
+def test_adapter_preserves_legacy_root_and_pending_uncertain_notices(tmp_path):
+    """Loading and extending state must not rewrite unknown fields or live legacy notices."""
+    state_path = tmp_path / "inbox.json"
+    original_notices = {
+        "legacy-pending": {
+            "status": "pending",
+            "destination": {"platform": "telegram", "chat_id": "11"},
+            "text": "Legacy pending notice.",
+        },
+        "legacy-unknown": {
+            "status": "transport_unknown",
+            "target": {"platform": "telegram", "chat_id": "12"},
+            "text": "Legacy uncertain notice.",
+        },
+    }
+    StateStore(state_path).save({
+        "legacy_extension": {"version": 7},
+        "notification_outbox": copy.deepcopy(original_notices),
+    })
+
+    adapter = adapter_at(tmp_path)
+    adapter._current_message = source("new-source")
+    result = asyncio.run(adapter.send("kasra", "New human notice."))
+
+    assert result.success is True
+    persisted = StateStore(state_path).load()
+    assert persisted["legacy_extension"] == {"version": 7}
+    assert {
+        key: persisted["notification_outbox"][key] for key in original_notices
+    } == original_notices
+
+
+@pytest.mark.asyncio
+async def test_persistent_notification_disk_failure_never_permits_source_ack(tmp_path, monkeypatch):
+    """A terminal source may be ACKed only after its human notice has durable custody."""
+    calls = []
+
+    class AckClient:
+        async def call(self, tool, args):
+            calls.append((tool, args))
+            return {"acked": ["terminal-disk"], "already_read": [], "refused": []}
+
+    adapter = adapter_at(tmp_path)
+    adapter._client = AckClient()
+    real_save = adapter.store.save
+
+    def fail_notice(value):
+        if "terminal-disk" in value.get("notification_outbox", {}):
+            raise OSError("notification disk unavailable")
+        real_save(value)
+
+    monkeypatch.setattr(adapter.store, "save", fail_notice)
+    message = source("terminal-disk", body="Human decision required.")
+    for _ in range(2):
+        with pytest.raises(OSError, match="notification disk unavailable"):
+            await adapter._handle_ack_envelope(message)
+    assert calls == []
+    assert "terminal-disk" not in StateStore(tmp_path / "inbox.json").load().get(
+        "notification_outbox", {}
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_after_enqueue_before_source_ack_keeps_exactly_one_notice(tmp_path):
+    """A crash before source ACK must reuse the durably fingerprinted notice on redelivery."""
+    class CrashBeforeAck:
+        async def call(self, tool, args):
+            raise OSError("crash before source ACK")
+
+    message = source("terminal-retry", body="Human decision required.")
+    first = adapter_at(tmp_path)
+    first._client = CrashBeforeAck()
+    with pytest.raises(OSError, match="crash before source ACK"):
+        await first._handle_ack_envelope(message)
+    before = StateStore(tmp_path / "inbox.json").load()
+    fingerprint = before["notification_outbox"]["terminal-retry"]["source_fingerprint"]
+
+    calls = []
+
+    class AckAfterRestart:
+        async def call(self, tool, args):
+            calls.append((tool, args))
+            return {"acked": ["terminal-retry"], "already_read": [], "refused": []}
+
+    restarted = adapter_at(tmp_path)
+    restarted._client = AckAfterRestart()
+    await restarted._handle_ack_envelope(message)
+    after = StateStore(tmp_path / "inbox.json").load()
+    assert calls == [("inbox_ack", {"ids": ["terminal-retry"]})]
+    assert list(after["notification_outbox"]) == ["terminal-retry"]
+    assert after["notification_outbox"]["terminal-retry"]["source_fingerprint"] == fingerprint
+
+
+@pytest.mark.asyncio
+async def test_crash_after_source_ack_before_processed_marker_retains_notice(tmp_path, monkeypatch):
+    """A failed processed-marker save cannot erase the already-custodied notice."""
+    calls = []
+
+    class AckClient:
+        async def call(self, tool, args):
+            calls.append((tool, args))
+            return {"acked": ["terminal-commit"], "already_read": [], "refused": []}
+
+    adapter = adapter_at(tmp_path)
+    adapter._client = AckClient()
+    real_save = adapter.store.save
+
+    def fail_processed(value):
+        if "terminal-commit" in value.get("processed", []):
+            raise OSError("crash before processed marker")
+        real_save(value)
+
+    monkeypatch.setattr(adapter.store, "save", fail_processed)
+    with pytest.raises(OSError, match="crash before processed marker"):
+        await adapter._handle_ack_envelope(
+            source("terminal-commit", body="Human decision required.")
+        )
+    persisted = StateStore(tmp_path / "inbox.json").load()
+    assert calls == [("inbox_ack", {"ids": ["terminal-commit"]})]
+    assert "terminal-commit" not in persisted.get("processed", [])
+    assert persisted["notification_outbox"]["terminal-commit"]["custody_status"] == "durable"
 
 
 @pytest.mark.asyncio
@@ -136,6 +437,9 @@ async def test_native_delivery_is_visible_in_real_human_conversation(tmp_path, m
         assert len(db.get_messages("other")) == 1
         notice = StateStore(tmp_path / "inbox.json").load()["notification_outbox"]["source-native"]
         assert notice["status"] == "delivered"
+        assert notice["custody_status"] == "durable"
+        assert notice["activation_status"] == "not_started"
+        assert notice["delivery_status"] == "delivered"
         assert notice["delivery_receipt"]["message_id"] == "tg-17"
         # Existing Hermes mirroring is best-effort: success without a DB write
         # must not be promoted into a completed notification receipt.
@@ -204,6 +508,7 @@ async def test_uncertain_delivery_never_resends_after_restart(tmp_path, monkeypa
     await restarted._flush_notifications()
     assert len(sends) == 1
     assert restarted._state["notification_outbox"]["uncertain-source"]["status"] == "transport_unknown"
+    assert restarted._state["notification_outbox"]["uncertain-source"]["delivery_status"] == "transport_unknown"
 
 
 @pytest.mark.asyncio
@@ -245,6 +550,9 @@ async def test_activation_queues_existing_human_conversation_instead_of_passive_
     assert "activate-1" in calls[0][0]
     notice = StateStore(tmp_path / "inbox.json").load()["notification_outbox"]["activate-1"]
     assert notice["status"] == "activation_queued"
+    assert notice["custody_status"] == "durable"
+    assert notice["activation_status"] == "queued"
+    assert notice["delivery_status"] == "pending"
     await adapter._flush_notifications()
     assert len(calls) == 1
 

@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
+import json
 import logging
 import time
 
@@ -16,6 +19,14 @@ class RetryLater(RuntimeError):
     def __init__(self, seconds=0):
         self.seconds = max(0, float(seconds or 0))
         super().__init__("Notification delivery was refused with a retryable result")
+
+
+class NotificationCustodyError(RuntimeError):
+    """A notification is not proven to exist in durable local custody."""
+
+
+class NotificationConflict(NotificationCustodyError):
+    """One source ID was presented with different notification content."""
 
 
 def active_sessions():
@@ -89,25 +100,135 @@ def mirror_text(target, text):
         raise RuntimeError("Notification conversation mirror readback failed")
 
 
+def _notice_text(source, text):
+    source_id = str(source.get("id") or "")
+    return (
+        "Mupot update\n\n"
+        + text
+        + "\n\nFrom agent: "
+        + str(source.get("from_agent") or "unknown")
+        + "\nReference: "
+        + source_id
+        + "\nReply here to guide the next step."
+    )
+
+
+def _source_fingerprint(source, notice_text):
+    stable_source = {
+        name: source.get(name)
+        for name in (
+            "id",
+            "from_agent",
+            "request_id",
+            "in_reply_to",
+            "project_id",
+            "kind",
+            "expects_reply",
+        )
+    }
+    payload = json.dumps(
+        {"notice": notice_text, "source": stable_source},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _persist_notice(state, store, candidate, source_id, expected):
+    store.save(candidate)
+    durable, valid = store.load_checked()
+    durable_outbox = durable.get("notification_outbox")
+    if (
+        not valid
+        or not isinstance(durable_outbox, dict)
+        or durable_outbox.get(source_id) != expected
+    ):
+        raise NotificationCustodyError("Notification custody readback failed")
+    state.clear()
+    state.update(durable)
+
+
 def enqueue(state, store, source, text):
     source_id = str(source.get("id") or "")
     if not source_id or not text.strip():
+        raise NotificationCustodyError("Notification custody input is invalid")
+
+    notice_text = _notice_text(source, text)
+    fingerprint = _source_fingerprint(source, notice_text)
+    durable, valid = store.load_checked()
+    if not valid:
+        raise NotificationCustodyError("Notification custody storage is unavailable")
+    durable_outbox = durable.get("notification_outbox")
+    if durable_outbox is not None and not isinstance(durable_outbox, dict):
+        raise NotificationCustodyError("Notification custody storage is invalid")
+
+    existing = (durable_outbox or {}).get(source_id)
+    if existing is None and source_id in state.get("notification_outbox", {}):
+        raise NotificationCustodyError("Notification custody record is missing")
+    if existing is not None:
+        if not isinstance(existing, dict):
+            raise NotificationConflict("Notification source conflict")
+        existing_fingerprint = existing.get("source_fingerprint")
+        if existing.get("text") != notice_text or (
+            existing_fingerprint is not None and existing_fingerprint != fingerprint
+        ):
+            raise NotificationConflict("Notification source conflict")
+        candidate = copy.deepcopy(durable)
+        expected = candidate["notification_outbox"][source_id]
+        legacy_status = expected.get("status")
+        expected.setdefault("source_fingerprint", fingerprint)
+        expected.setdefault("custody_status", "durable")
+        expected.setdefault(
+            "activation_status",
+            {
+                "activating": "attempting",
+                "activation_queued": "queued",
+                "activation_unknown": "unknown",
+            }.get(legacy_status, "not_started"),
+        )
+        expected.setdefault(
+            "delivery_status",
+            {
+                "sending": "sending",
+                "transport_unknown": "transport_unknown",
+                "delivered": "delivered",
+            }.get(legacy_status, "pending"),
+        )
+        # Rewriting and syncing the exact record completes a prior save that
+        # may have reached rename but failed before directory durability.
+        _persist_notice(state, store, candidate, source_id, expected)
         return
-    outbox = state["notification_outbox"]
-    if source_id in outbox:
-        return
+
+    candidate = copy.deepcopy(durable if store.path.exists() else state)
+    outbox = candidate.setdefault("notification_outbox", {})
+    if not isinstance(outbox, dict):
+        raise NotificationCustodyError("Notification custody storage is invalid")
     # Keep all pending notifications and bounded completed receipts.
-    completed = sorted((key for key, value in outbox.items() if value.get("status") == "delivered"),
-                       key=lambda key: outbox[key].get("completed_at", 0))
+    completed = sorted(
+        (
+            key
+            for key, value in outbox.items()
+            if isinstance(value, dict)
+            and (
+                value.get("status") == "delivered"
+                or value.get("delivery_status") == "delivered"
+            )
+        ),
+        key=lambda key: outbox[key].get("completed_at", 0),
+    )
     for key in completed[:-999]:
         del outbox[key]
-    outbox[source_id] = {
+    expected = {
         "status": "pending", "attempts": 0, "retry_at": 0,
-        "text": ("Mupot update\n\n" + text + "\n\nFrom agent: "
-                 + str(source.get("from_agent") or "unknown")
-                 + "\nReference: " + source_id + "\nReply here to guide the next step."),
+        "custody_status": "durable",
+        "activation_status": "not_started",
+        "delivery_status": "pending",
+        "source_fingerprint": fingerprint,
+        "text": notice_text,
     }
-    store.save(state)
+    outbox[source_id] = expected
+    _persist_notice(state, store, candidate, source_id, expected)
 
 
 async def flush(state, store, recipients, *, activate=None):
@@ -117,12 +238,14 @@ async def flush(state, store, recipients, *, activate=None):
         if notice.get("status") in {"delivered", "transport_unknown", "activation_queued", "activation_unknown"} or notice.get("retry_at", 0) > time.time():
             continue
         if notice.get("status") == "activating":
-            notice.update(status="activation_unknown", last_error="InterruptedActivation")
+            notice.update(status="activation_unknown", activation_status="unknown",
+                          last_error="InterruptedActivation")
             store.save(state)
             logger.warning("[mupot] interrupted human activation requires reconciliation source=%s", source_id)
             continue
         if notice.get("status") == "sending":
-            notice.update(status="transport_unknown", last_error="InterruptedSend")
+            notice.update(status="transport_unknown", delivery_status="transport_unknown",
+                          last_error="InterruptedSend")
             store.save(state)
             logger.warning("[mupot] interrupted human notification requires reconciliation source=%s", source_id)
             continue
@@ -146,19 +269,21 @@ async def flush(state, store, recipients, *, activate=None):
                          "any existing pending decision. Preserve Mupot permissions; do not replay "
                          "completed work or invent an approval. The Mupot requester already received "
                          "a reply, so no additional peer ACK is needed.\n\n" + notice["text"])
-                notice["status"] = "activating"
+                notice.update(status="activating", activation_status="attempting")
                 store.save(state)
                 try:
                     accepted = activate(event, session_key=target["session_key"])
                 except Exception as exc:
-                    notice.update(status="activation_unknown", last_error=type(exc).__name__)
+                    notice.update(status="activation_unknown", activation_status="unknown",
+                                  last_error=type(exc).__name__)
                     store.save(state)
                     break
                 if not accepted:
                     raise RuntimeError("Native gateway activation was not accepted")
                 # Native plugin API confirms scheduling only. Never label this
                 # a completed agent turn or Telegram delivery receipt.
-                notice.update(status="activation_queued", activation_accepted_at=time.time())
+                notice.update(status="activation_queued", activation_status="queued",
+                              activation_accepted_at=time.time())
                 store.save(state)
                 logger.info("[mupot] human conversation activation queued source=%s session=%s",
                             source_id, target["session_key"])
@@ -166,20 +291,22 @@ async def flush(state, store, recipients, *, activate=None):
             if not notice.get("delivery_receipt"):
                 # A crash anywhere across the external send must never cause a
                 # blind replay: Telegram has no idempotency key for sendMessage.
-                notice["status"] = "sending"
+                notice.update(status="sending", delivery_status="sending")
                 store.save(state)
                 notice["delivery_receipt"] = await deliver_text(target, notice["text"])
-                notice["status"] = "pending"
+                notice.update(status="pending", delivery_status="receipt_recorded")
                 store.save(state)
             # A mirror failure retries only the mirror, never the platform send.
             await asyncio.to_thread(mirror_text, target, notice["text"])
-            notice.update(status="delivered", completed_at=time.time())
+            notice.update(status="delivered", delivery_status="delivered",
+                          completed_at=time.time())
             notice.pop("last_error", None)
             store.save(state)
             logger.info("[mupot] human notification delivered source=%s platform=%s message_id=%s",
                         source_id, target["platform"], notice["delivery_receipt"].get("message_id"))
         except DeliveryUnknown:
-            notice.update(status="transport_unknown", last_error="DeliveryUnknown")
+            notice.update(status="transport_unknown", delivery_status="transport_unknown",
+                          last_error="DeliveryUnknown")
             store.save(state)
             logger.warning("[mupot] human notification requires reconciliation source=%s", source_id)
         except Exception as exc:

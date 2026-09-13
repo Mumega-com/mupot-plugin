@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import httpx
 import json
 import logging
@@ -358,6 +359,16 @@ class StateStore:
                 os.fsync(handle.fileno())
             os.replace(temporary, self.path)
             os.chmod(self.path, 0o600)
+            directory_flag = getattr(os, "O_DIRECTORY", None)
+            if directory_flag is not None:
+                directory_fd = os.open(
+                    self.path.parent,
+                    os.O_RDONLY | directory_flag,
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
             try:
                 temporary.unlink()
@@ -502,7 +513,8 @@ class MupotAdapter(BasePlatformAdapter):
         self.notification_recipients = dict(extra.get("notification_recipients") or {})
         self.notification_activate = extra.get("notification_activate") is True
         self.message_injector = message_injector
-        self._state: dict[str, Any] = {
+        self._state: dict[str, Any] = copy.deepcopy(loaded) if state_valid else {}
+        self._state.update({
             # Mupot owns retry timing through visibility leases. Never replay
             # a stale local in-flight record immediately after a crash.
             "pending": None,
@@ -515,7 +527,7 @@ class MupotAdapter(BasePlatformAdapter):
                 if state_valid
                 else {"state_invalid": True}
             ),
-        }
+        })
         # Keep durable inbox lease/ACK traffic isolated from outbound sends.
         # Cancelling a timed-out MCP send can close that SDK session; it must
         # never poison the authoritative consumer transport.

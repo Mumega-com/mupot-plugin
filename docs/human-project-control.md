@@ -62,9 +62,13 @@ protected profile environment, never in YAML.
 Configure an explicit persistent executor binding for each coordination responsibility
 (which may reuse an existing Hermes harness). Connect the project's existing routines
 to that runtime with appropriate scope, budgets, retry/stop policy, and human decision
-routing. Verify dispatch, runtime receipt, actual work, human response where required,
-and terminal readback. Do not infer a working internal coordinator from a roster label,
-an enabled cron entry, or a successful communication canary.
+routing. Before claiming automatic return to the same private conversation, read back the
+materialized Routine run and require its `assigned_agent_id` to equal the native profile's
+configured operator `agent_id`. If they differ, stop and correct the assignment through the
+approved Mupot surface; receiver configuration is not assignment proof. Verify dispatch,
+runtime receipt, actual work, human response where required, and terminal readback. Do not
+infer a working internal coordinator from a roster label, an enabled cron entry, or a
+successful communication canary.
 
 ## First onboarding milestone
 

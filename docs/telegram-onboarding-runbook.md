@@ -40,6 +40,12 @@ Do not configure or pilot a live profile until all of these have separate receip
    reverse project-edge readback proves no additional linked project.
 7. The project's Routine has an explicit executor, budget, retry/stop policy, and human
    decision route.
+8. Read back the materialized Routine run and verify its `assigned_agent_id` exactly equals
+   the native Hermes profile's configured operator `agent_id`. This equality, not the
+   receiver configuration alone, connects the run's outbound message to this profile and
+   its private Telegram conversation. If the values differ, stop the pilot, correct the
+   assignment through the approved Mupot Routine/run administration surface, and repeat the
+   readback before claiming automatic result delivery.
 
 Stop if any identity, deployed SHA, migration, project edge, receiver owner, bot owner,
 credential binding, or pending receipt is ambiguous. Local tests are not deployment or
@@ -125,10 +131,15 @@ receive, and the same retained state path. Do not invite a participant during th
      the existing independent gate authority Mupot requires.
 6. **Prove the effect.** Reconcile the completed Telegram receipt with the Routine answer
    receipt or task verdict. A Telegram `200` alone is not completion proof.
-7. **Observe continuation.** Mupot continues the Routine through its configured executor.
-   The native receiver must activate the same private conversation once and deliver the
-   resulting queued, running, blocked, failed, or completed update automatically. Record
-   the channel delivery receipt separately from scheduling/activation acceptance.
+7. **Verify return-path assignment.** Read back this materialized run's
+   `assigned_agent_id` and the native profile's configured operator `agent_id`; require
+   exact equality. If they differ, stop, correct the assignment through the approved Mupot
+   surface, and repeat the readback. Do not infer this binding from receiver configuration.
+8. **Observe continuation.** Only after that equality is proven, Mupot continues the
+   Routine through the assigned executor and the native receiver must activate the same
+   private conversation once. Record the resulting queued, running, blocked, failed, or
+   completed update's channel delivery receipt separately from scheduling/activation
+   acceptance.
 
 Ordinary Telegram text is not captured by these handlers and continues through Hermes.
 Only `/start`, `/needs`, `/answer`, `/approve`, and `/reject` use the deterministic relay.
@@ -205,6 +216,8 @@ a stop signal, not permission to widen a predicate or edit around the invariant.
 - [ ] `/needs` proves role-scoped visibility and actions.
 - [ ] One exact answer or independently authorized verdict has both Telegram and domain
       receipts.
+- [ ] The materialized Routine run's `assigned_agent_id` exactly equals the configured
+      native profile `agent_id`; receiver configuration alone was not treated as proof.
 - [ ] Routine continuation and automatic result delivery to the same conversation have
       separate activation/channel/domain receipts.
 - [ ] Identical replay, conflict, stale/terminal, wrong-project, and unauthorized cases have

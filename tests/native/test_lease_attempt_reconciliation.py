@@ -147,7 +147,11 @@ class AttemptClient:
         raise AssertionError(f"unexpected tool: {tool} {arguments}")
 
 
-def make_adapter(state_path: Path, client: AttemptClient) -> MupotAdapter:
+def make_adapter(
+    state_path: Path,
+    client: AttemptClient,
+    owner: ScopeOwner | None = None,
+) -> MupotAdapter:
     return MupotAdapter(
         PlatformConfig(
             enabled=True,
@@ -159,13 +163,15 @@ def make_adapter(state_path: Path, client: AttemptClient) -> MupotAdapter:
             },
         ),
         client_factory=lambda *_: client,
+        secret_owner=owner,  # type: ignore[arg-type]
     )
 
 
 class ScopeOwner:
-    def __init__(self) -> None:
+    def __init__(self, fingerprint: str = "a" * 64) -> None:
         self.active = False
         self.activations = 0
+        self.fingerprint = fingerprint
 
     @contextmanager
     def activate(self):
@@ -210,11 +216,12 @@ async def persist_v2_ambiguous(
     state_path: Path,
     *,
     outcomes: list[Any] | None = None,
+    owner: ScopeOwner | None = None,
 ) -> tuple[str, AttemptClient]:
     client = AttemptClient(
         lease_outcomes=outcomes or [MupotTransportError("Mupot request failed")]
     )
-    adapter = make_adapter(state_path, client)
+    adapter = make_adapter(state_path, client, owner)
     assert await adapter.connect()
     try:
         await asyncio.wait_for(client.first_lease.wait(), 1)
@@ -233,6 +240,8 @@ async def test_ambiguous_attempt_is_random_bounded_durable_and_reconciled_immedi
     state_path = tmp_path / "state.json"
     attempt_id, first = await persist_v2_ambiguous(state_path)
     marker = StateStore(state_path).load()["lease_reconciliation"]
+    owner_fingerprint = marker.pop("profile_owner_fingerprint")
+    assert re.fullmatch(r"[0-9a-f]{64}", owner_fingerprint)
     assert marker == {
         "version": 3,
         "required": True,
@@ -305,6 +314,35 @@ async def test_v1_marker_never_uses_local_clock_to_clear(
     assert client.connect_calls == 0
     assert client.calls == []
     assert StateStore(state_path).load()["lease_reconciliation"]["version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_pre_owner_v3_marker_remains_fenced_without_network(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    StateStore(state_path).save(
+        {
+            "lease_reconciliation": {
+                "version": 3,
+                "required": True,
+                **SCOPE,
+                "mode": "bearer_only",
+                "generation": 7,
+                "attempt_id": "legacy-attempt-id-1234",
+            }
+        }
+    )
+    client = AttemptClient()
+    adapter = make_adapter(state_path, client, ScopeOwner())
+
+    assert await adapter.connect() is False
+    assert await adapter.reconcile_inbox_polling() is False
+    assert client.connect_calls == 0
+    assert client.calls == []
+    assert StateStore(state_path).load()["lease_reconciliation"]["attempt_id"] == (
+        "legacy-attempt-id-1234"
+    )
 
 
 @pytest.mark.asyncio
@@ -512,6 +550,88 @@ async def test_profile_scope_failure_stays_fenced_without_network(
 
 
 @pytest.mark.asyncio
+async def test_same_server_scope_distinct_profile_owner_stays_fenced_without_network(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    first_client = AttemptClient(
+        lease_outcomes=[MupotTransportError("Mupot request failed")]
+    )
+    first_owner = ScopeOwner("a" * 64)
+    first = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "allowed_agents": "hadi-codex",
+                "lease_seconds": 30,
+                "poll_interval": 0.01,
+                "state_path": str(state_path),
+            },
+        ),
+        client_factory=lambda *_: first_client,
+        secret_owner=first_owner,  # type: ignore[arg-type]
+    )
+    assert await first.connect()
+    try:
+        await asyncio.wait_for(first_client.first_lease.wait(), 1)
+        await wait_stopped(first)
+    finally:
+        await first.disconnect()
+
+    marker = StateStore(state_path).load()["lease_reconciliation"]
+    assert marker["profile_owner_fingerprint"] == first_owner.fingerprint
+
+    second_client = AttemptClient(
+        reconcile_outcome=attempt_result(marker["attempt_id"], "cancelled")
+    )
+    second = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
+        client_factory=lambda *_: second_client,
+        secret_owner=ScopeOwner("b" * 64),  # type: ignore[arg-type]
+    )
+
+    assert await second.reconcile_inbox_polling() is False
+    assert second_client.connect_calls == 0
+    assert second_client.calls == []
+    assert StateStore(state_path).load()["lease_reconciliation"] == marker
+
+
+@pytest.mark.asyncio
+async def test_distinct_profile_owner_cannot_attempt_ack(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(
+        state_path,
+        owner=ScopeOwner("a" * 64),
+    )
+    client = AttemptClient()
+    adapter = make_adapter(state_path, client, ScopeOwner("b" * 64))
+
+    with pytest.raises(RuntimeError, match="Mupot MCP request failed"):
+        await adapter._ack_expected("untrusted-message", attempt_id=attempt_id)
+
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_current_adapter_owner_change_cannot_attempt_ack(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    owner = ScopeOwner("a" * 64)
+    attempt_id, _first = await persist_v2_ambiguous(state_path, owner=owner)
+    client = AttemptClient()
+    adapter = make_adapter(state_path, client, owner)
+    owner.fingerprint = "b" * 64
+
+    with pytest.raises(RuntimeError, match="Mupot MCP request failed"):
+        await adapter._ack_expected("untrusted-message", attempt_id=attempt_id)
+
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
 async def test_nonattempt_legacy_ack_uses_generic_exact_id(
     tmp_path: Path,
 ) -> None:
@@ -567,8 +687,9 @@ async def test_delayed_reconcile_stays_fenced_until_server_tombstone(
 @pytest.mark.asyncio
 async def test_reconciliation_uses_owning_profile_scope(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
-    attempt_id, _first = await persist_v2_ambiguous(state_path)
     owner = ScopeOwner()
+    attempt_id, _first = await persist_v2_ambiguous(state_path, owner=owner)
+    owner.activations = 0
     client = ScopedAttemptClient(
         owner,
         reconcile_outcome=attempt_result(attempt_id, "cancelled"),
@@ -585,3 +706,28 @@ async def test_reconciliation_uses_owning_profile_scope(tmp_path: Path) -> None:
     assert await adapter.reconcile_inbox_polling() is True
     assert owner.activations == 1
     assert owner.active is False
+
+
+@pytest.mark.asyncio
+async def test_same_profile_token_rotation_may_reconcile_exact_scope(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    first_owner = ScopeOwner("c" * 64)
+    attempt_id, _first = await persist_v2_ambiguous(
+        state_path,
+        owner=first_owner,
+    )
+    rotated_owner = ScopeOwner("c" * 64)
+    client = ScopedAttemptClient(
+        rotated_owner,
+        reconcile_outcome=attempt_result(attempt_id, "cancelled"),
+    )
+    adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
+        client_factory=lambda *_: client,
+        secret_owner=rotated_owner,  # type: ignore[arg-type]
+    )
+
+    assert await adapter.reconcile_inbox_polling() is True
+    assert StateStore(state_path).load().get("lease_reconciliation") is None

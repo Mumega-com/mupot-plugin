@@ -23,9 +23,12 @@ CLI/SSE-stream configurations remain opt-in and unchanged when native mode is of
 
 The native receiver uses Mupot's server-authoritative `inbox_lease` attempt receipts and
 attempt-bound `inbox_lease_ack`. It first reads the strict tenant/agent/effective-seat
-consumer scope, durably records that scope with one random attempt ID, and reuses the ID for
-the single proven-safe transport retry. An ambiguous or restarted attempt is resolved
-through `inbox_lease_reconcile` before admitting new work. Only an exact scope-matching
+consumer scope, durably records that scope with one random attempt ID and the owning
+profile's non-secret immutable fingerprint, and reuses the ID for the single proven-safe
+transport retry. An ambiguous or restarted attempt is resolved through
+`inbox_lease_reconcile` only from the same profile owner. Token rotation inside that profile
+remains valid; a different profile presenting the same server scope stays fenced. Only an
+exact scope-matching
 `leased` tuple is processed, and only an exact `acked`/`consumed:true` attempt receipt permits
 local commit and marker clearing. Terminal non-consumed or mismatched receipts remain fenced.
 Legacy non-attempt paths alone use `inbox_ack`; older reconciliation markers stay fenced for

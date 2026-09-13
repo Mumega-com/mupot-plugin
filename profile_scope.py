@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -59,6 +60,19 @@ class ProfileSecretOwner:
     device: int
     inode: int
 
+    @property
+    def fingerprint(self) -> str:
+        """Return a non-secret identity digest for this immutable profile home."""
+        payload = (
+            f"mupot-profile-owner-v1\0{self.home}\0{self.device}\0{self.inode}"
+        ).encode("utf-8")
+        return sha256(payload).hexdigest()
+
+    def validated_fingerprint(self) -> str:
+        """Revalidate the active profile before returning its identity digest."""
+        self._validate()
+        return self.fingerprint
+
     @classmethod
     def from_context(cls, ctx: Any) -> "ProfileSecretOwner":
         try:
@@ -69,6 +83,18 @@ class ProfileSecretOwner:
         except Exception:
             raise RuntimeError(_UNAVAILABLE) from None
         if active_home != home or not home.is_dir():
+            raise RuntimeError(_UNAVAILABLE)
+        return cls(home=home, device=metadata.st_dev, inode=metadata.st_ino)
+
+    @classmethod
+    def from_active_home(cls) -> "ProfileSecretOwner":
+        """Capture the current simplex profile for direct adapter callers."""
+        try:
+            home = _active_home()
+            metadata = home.stat()
+        except Exception:
+            raise RuntimeError(_UNAVAILABLE) from None
+        if not home.is_dir():
             raise RuntimeError(_UNAVAILABLE)
         return cls(home=home, device=metadata.st_dev, inode=metadata.st_ino)
 

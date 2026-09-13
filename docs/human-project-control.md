@@ -55,9 +55,12 @@ loop. Ordinary project members receive no agent token or administrator access.
 
 Native inbox recovery is server-authoritative. Before each one-message lease, the plugin
 reads strict tenant/agent/effective-seat scope and fsyncs that scope with a bounded random
-attempt ID. A safe pre-send retry reuses that ID. After restart or an ambiguous response,
-the plugin verifies the same strict scope and asks Mupot for the durable attempt receipt;
-local wall-clock movement cannot authorize recovery. Only the exact scoped leased tuple is
+attempt ID plus a non-secret immutable fingerprint of the owning Hermes profile. A safe
+pre-send retry reuses that ID. After restart or an ambiguous response, the plugin verifies
+the same profile owner and strict server scope before asking Mupot for the durable attempt
+receipt; local wall-clock movement cannot authorize recovery. Token rotation within the
+same profile remains valid, but a second profile presenting an identical server scope does
+not. Only the exact scoped leased tuple is
 processed. Attempt-originated work uses `inbox_lease_ack`, never the generic ACK path, and
 local commit requires an exact `acked` receipt with `consumed: true`. Scope changes,
 non-consumed ACKs, malformed responses, and older markers remain fenced for explicit

@@ -37,6 +37,24 @@ def write_secrets(
     (home / ".env").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def test_profile_owner_fingerprint_is_stable_and_home_specific(tmp_path: Path) -> None:
+    from plugin.profile_scope import ProfileSecretOwner
+
+    first_home = tmp_path / "profile-a"
+    second_home = tmp_path / "profile-b"
+    first_home.mkdir()
+    second_home.mkdir()
+    first_stat = first_home.stat()
+    second_stat = second_home.stat()
+    first = ProfileSecretOwner(first_home.resolve(), first_stat.st_dev, first_stat.st_ino)
+    same = ProfileSecretOwner(first_home.resolve(), first_stat.st_dev, first_stat.st_ino)
+    second = ProfileSecretOwner(second_home.resolve(), second_stat.st_dev, second_stat.st_ino)
+
+    assert first.fingerprint == same.fingerprint
+    assert first.fingerprint != second.fingerprint
+    assert len(first.fingerprint) == 64
+
+
 def discover_plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from hermes_cli import plugins
 

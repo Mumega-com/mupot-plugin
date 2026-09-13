@@ -51,6 +51,7 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _REPLY_OUTBOX_VERSION = 1
 _LEASE_ATTEMPT_MARKER_VERSION = 3
 _LEASE_ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_PROFILE_OWNER_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 _LEASE_ATTEMPT_STATES = frozenset(
     {"leased", "empty", "cancelled", "expired", "acked"}
 )
@@ -356,6 +357,28 @@ def _attempt_scope_echo(value: Any) -> Optional[dict[str, Any]]:
     }
 
 
+def _profile_owner_fingerprint(
+    owner: Any,
+    *,
+    validate: bool = False,
+) -> Optional[str]:
+    if owner is None:
+        try:
+            owner = ProfileSecretOwner.from_active_home()
+        except Exception:
+            return None
+    try:
+        validated = getattr(owner, "validated_fingerprint", None)
+        value = validated() if validate and callable(validated) else owner.fingerprint
+    except Exception:
+        return None
+    if not isinstance(value, str) or not _PROFILE_OWNER_FINGERPRINT_RE.fullmatch(
+        value
+    ):
+        return None
+    return value
+
+
 def _consumer_fence_proof(
     value: Any,
     expected_agent_id: Optional[str] = None,
@@ -414,6 +437,7 @@ def _lease_reconciliation_proof(value: Any) -> Optional[dict[str, Any]]:
         if set(value) != common | {
             "tenant",
             "effective_inbox_seat",
+            "profile_owner_fingerprint",
             "attempt_id",
         }:
             return None
@@ -438,10 +462,21 @@ def _lease_reconciliation_proof(value: Any) -> Optional[dict[str, Any]]:
         if version == 2:
             return {"version": version, **fence, "attempt_id": attempt_id}
         scope = _attempt_scope_echo(value)
-        if scope is None:
+        owner_fingerprint = value.get("profile_owner_fingerprint")
+        if (
+            scope is None
+            or not isinstance(owner_fingerprint, str)
+            or not _PROFILE_OWNER_FINGERPRINT_RE.fullmatch(owner_fingerprint)
+        ):
             return None
-        return {"version": version, **scope, "mode": fence["mode"],
-                "generation": fence["generation"], "attempt_id": attempt_id}
+        return {
+            "version": version,
+            **scope,
+            "mode": fence["mode"],
+            "generation": fence["generation"],
+            "profile_owner_fingerprint": owner_fingerprint,
+            "attempt_id": attempt_id,
+        }
 
     deadline = value.get("reconcile_after")
     if (
@@ -815,6 +850,7 @@ class MupotAdapter(BasePlatformAdapter):
         self.routine_events_enabled = routine_events_enabled
         self.message_injector = message_injector
         self._secret_owner = secret_owner
+        self._profile_owner_fingerprint = _profile_owner_fingerprint(secret_owner)
         self._state: dict[str, Any] = copy.deepcopy(loaded) if state_valid else {}
         loaded_reply_outbox = loaded.get("reply_outbox")
         reply_outbox_valid = loaded_reply_outbox is None or isinstance(
@@ -1329,6 +1365,13 @@ class MupotAdapter(BasePlatformAdapter):
 
     async def _connect_with_active_scope(self, *, is_reconnect: bool = False) -> bool:
         if (
+            self._profile_owner_fingerprint is None
+            or _profile_owner_fingerprint(self._secret_owner, validate=True)
+            != self._profile_owner_fingerprint
+        ):
+            logger.error("[mupot] connect blocked; profile owner unavailable")
+            return False
+        if (
             self._reply_state_invalid
             or self._legacy_pending_ambiguous
             or self._reply_reconciliation_required
@@ -1447,13 +1490,21 @@ class MupotAdapter(BasePlatformAdapter):
 
     def _persist_prelease_fence(self, attempt_id: str) -> None:
         proof = self._consumer_fence
-        if proof is None or not _LEASE_ATTEMPT_ID_RE.fullmatch(attempt_id):
+        owner_fingerprint = self._profile_owner_fingerprint
+        if (
+            proof is None
+            or owner_fingerprint is None
+            or _profile_owner_fingerprint(self._secret_owner, validate=True)
+            != owner_fingerprint
+            or not _LEASE_ATTEMPT_ID_RE.fullmatch(attempt_id)
+        ):
             raise _protocol_error()
         fenced = dict(self._state)
         fenced["lease_reconciliation"] = {
             "version": _LEASE_ATTEMPT_MARKER_VERSION,
             "required": True,
             **proof,
+            "profile_owner_fingerprint": owner_fingerprint,
             "attempt_id": attempt_id,
         }
         self.store.save(fenced)
@@ -1528,10 +1579,17 @@ class MupotAdapter(BasePlatformAdapter):
         marker = _lease_reconciliation_proof(
             self._state.get("lease_reconciliation")
         )
+        current_owner_fingerprint = _profile_owner_fingerprint(
+            self._secret_owner,
+            validate=True,
+        )
         if (
             not self._lease_quarantined
             or marker is None
             or marker.get("version") != _LEASE_ATTEMPT_MARKER_VERSION
+            or current_owner_fingerprint != self._profile_owner_fingerprint
+            or marker.get("profile_owner_fingerprint")
+            != current_owner_fingerprint
         ):
             return False
         try:
@@ -1881,10 +1939,17 @@ class MupotAdapter(BasePlatformAdapter):
             marker = _lease_reconciliation_proof(
                 self._state.get("lease_reconciliation")
             )
+            current_owner_fingerprint = _profile_owner_fingerprint(
+                self._secret_owner,
+                validate=True,
+            )
             if (
                 marker is None
                 or marker.get("version") != _LEASE_ATTEMPT_MARKER_VERSION
                 or marker.get("attempt_id") != attempt_id
+                or current_owner_fingerprint != self._profile_owner_fingerprint
+                or marker.get("profile_owner_fingerprint")
+                != current_owner_fingerprint
             ):
                 raise _protocol_error()
             payload = await self._call_consumer(

@@ -1,0 +1,3 @@
+# Keep these exact pins aligned with the Hermes runtime used by native CI.
+pytest==9.1.1
+pytest-asyncio==1.3.0

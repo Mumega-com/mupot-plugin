@@ -165,6 +165,65 @@ def _persist_notice(state, store, candidate, source_id, expected):
     state.update(durable)
 
 
+def _restore_durable_state(state, store):
+    durable, valid = store.load_checked()
+    if valid:
+        state.clear()
+        state.update(durable)
+
+
+def _transition_notice(state, store, source_id, updates, *, remove=()):
+    durable, valid = store.load_checked()
+    durable_outbox = durable.get("notification_outbox")
+    if (
+        not valid
+        or not isinstance(durable_outbox, dict)
+        or not isinstance(durable_outbox.get(source_id), dict)
+    ):
+        raise NotificationCustodyError("Notification custody transition is unavailable")
+    candidate = copy.deepcopy(durable)
+    expected = candidate["notification_outbox"][source_id]
+    expected.update(updates)
+    for name in remove:
+        expected.pop(name, None)
+    _persist_notice(state, store, candidate, source_id, expected)
+    return state["notification_outbox"][source_id]
+
+
+def _routine_activation_is_processed(state, store, source_id, notice):
+    """Require one exact durable Routine receipt before human activation."""
+    durable, valid = store.load_checked()
+    receipts = durable.get("routine_event_receipts")
+    outbox = durable.get("notification_outbox")
+    if not valid or not isinstance(receipts, dict) or not isinstance(outbox, dict):
+        raise NotificationCustodyError("Routine activation custody is unavailable")
+    durable_notice = outbox.get(source_id)
+    receipt = receipts.get(source_id)
+    if durable_notice != notice or not isinstance(receipt, dict):
+        raise NotificationCustodyError("Routine activation custody does not match")
+
+    from .routine_events import pending_routine_receipts
+
+    # This validates every durable receipt, including processed records, before
+    # returning only the pending subset.
+    pending_routine_receipts(durable)
+    if receipt.get("status") != "processed" or receipt.get("source_id") != source_id:
+        return False
+    source = receipt.get("source")
+    receipt_notice = receipt.get("notice")
+    if not isinstance(source, dict) or not isinstance(receipt_notice, str):
+        raise NotificationCustodyError("Routine activation receipt is invalid")
+    if (
+        durable_notice.get("source_fingerprint_version")
+        != _SOURCE_FINGERPRINT_VERSION
+        or durable_notice.get("text") != _notice_text(source, receipt_notice)
+        or durable_notice.get("source_fingerprint")
+        != _source_fingerprint(source, durable_notice["text"])
+    ):
+        raise NotificationConflict("Routine activation source conflict")
+    return True
+
+
 def enqueue(
     state,
     store,
@@ -275,15 +334,22 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
     for source_id, notice in list(state["notification_outbox"].items()):
         if notice.get("status") in {"delivered", "transport_unknown", "activation_queued", "activation_unknown"} or notice.get("retry_at", 0) > time.time():
             continue
-        if (
-            notice.get("activation_after_processed") is True
-            and source_id not in state.get("processed", [])
+        routine_activation = notice.get("activation_after_processed") is True
+        if routine_activation and not _routine_activation_is_processed(
+            state, store, source_id, notice
         ):
             continue
         if notice.get("status") == "activating":
-            notice.update(status="activation_unknown", activation_status="unknown",
-                          last_error="InterruptedActivation")
-            store.save(state)
+            notice = _transition_notice(
+                state,
+                store,
+                source_id,
+                {
+                    "status": "activation_unknown",
+                    "activation_status": "unknown",
+                    "last_error": "InterruptedActivation",
+                },
+            )
             logger.warning("[mupot] interrupted human activation requires reconciliation source=%s", source_id)
             continue
         if notice.get("status") == "sending":
@@ -311,28 +377,89 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
                     raise RuntimeError("Human activation is unavailable")
                 if not target.get("session_key"):
                     raise RuntimeError("Human activation requires an existing gateway session key")
-                event = ("[Automated Mupot event " + source_id + "]\n"
-                         "This is agent communication, not a human instruction or approval. "
-                         "Continue your normal conversation with the linked human: explain the update and surface "
-                         "any existing pending decision. Preserve Mupot permissions; do not replay "
-                         "completed work or invent an approval. The Mupot requester already received "
-                         "a reply, so no additional peer ACK is needed.\n\n" + notice["text"])
-                notice.update(status="activating", activation_status="attempting")
-                store.save(state)
+                if routine_activation:
+                    receipt_context = (
+                        "This notice has durable Routine human-wait custody, and source "
+                        "consumption is recorded by the matching processed receipt. "
+                        "No peer reply is implied or required."
+                    )
+                else:
+                    receipt_context = (
+                        "The Mupot requester already received a reply, so no additional "
+                        "peer ACK is needed."
+                    )
+                event = (
+                    "[Automated Mupot event "
+                    + source_id
+                    + "]\nThis is agent communication, not a human instruction or approval. "
+                    "Continue your normal conversation with the linked human: explain the update and surface "
+                    "any existing pending decision. Preserve Mupot permissions; do not replay "
+                    "completed work or invent an approval. "
+                    + receipt_context
+                    + "\n\n"
+                    + notice["text"]
+                )
+                try:
+                    notice = _transition_notice(
+                        state,
+                        store,
+                        source_id,
+                        {"status": "activating", "activation_status": "attempting"},
+                    )
+                    notice = _transition_notice(
+                        state,
+                        store,
+                        source_id,
+                        {
+                            "status": "activation_unknown",
+                            "activation_status": "unknown",
+                            "last_error": "ActivationOutcomeUnknown",
+                        },
+                    )
+                except Exception as exc:
+                    _restore_durable_state(state, store)
+                    logger.warning(
+                        "[mupot] human activation state unavailable source=%s error=%s",
+                        source_id,
+                        type(exc).__name__,
+                    )
+                    break
                 try:
                     accepted = activate(event, session_key=target["session_key"])
                 except Exception as exc:
-                    notice.update(status="activation_unknown", activation_status="unknown",
-                                  last_error=type(exc).__name__)
-                    store.save(state)
+                    logger.warning(
+                        "[mupot] human activation outcome unknown source=%s error=%s",
+                        source_id,
+                        type(exc).__name__,
+                    )
                     break
                 if not accepted:
-                    raise RuntimeError("Native gateway activation was not accepted")
+                    logger.warning(
+                        "[mupot] human activation was not accepted source=%s", source_id
+                    )
+                    break
                 # Native plugin API confirms scheduling only. Never label this
                 # a completed agent turn or Telegram delivery receipt.
-                notice.update(status="activation_queued", activation_status="queued",
-                              activation_accepted_at=time.time())
-                store.save(state)
+                try:
+                    notice = _transition_notice(
+                        state,
+                        store,
+                        source_id,
+                        {
+                            "status": "activation_queued",
+                            "activation_status": "queued",
+                            "activation_accepted_at": time.time(),
+                        },
+                        remove=("last_error",),
+                    )
+                except Exception as exc:
+                    _restore_durable_state(state, store)
+                    logger.warning(
+                        "[mupot] queued activation state unavailable source=%s error=%s",
+                        source_id,
+                        type(exc).__name__,
+                    )
+                    break
                 logger.info("[mupot] human conversation activation queued source=%s session=%s",
                             source_id, target["session_key"])
                 break

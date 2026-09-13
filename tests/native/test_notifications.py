@@ -693,6 +693,8 @@ async def test_activation_queues_existing_human_conversation_instead_of_passive_
     assert len(calls) == 1
     assert calls[0][1] == {"session_key": "agent:main:telegram:dm:123"}
     assert "activate-1" in calls[0][0]
+    assert "Mupot requester already received a reply" in calls[0][0]
+    assert "Routine human-wait" not in calls[0][0]
     notice = StateStore(tmp_path / "inbox.json").load()["notification_outbox"]["activate-1"]
     assert notice["status"] == "activation_queued"
     assert notice["custody_status"] == "durable"

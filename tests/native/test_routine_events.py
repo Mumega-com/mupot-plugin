@@ -346,12 +346,182 @@ async def test_valid_event_custody_then_exact_ack_then_processed_then_one_activa
     assert ordering == ["ack", "activate"]
     assert activations[0][1] == {"session_key": "agent:main:telegram:dm:123"}
     assert "not executable consent" in activations[0][0]
+    assert "durable Routine human-wait custody" in activations[0][0]
+    assert "source consumption is recorded by the matching processed receipt" in activations[0][0]
+    assert "requester already received a reply" not in activations[0][0]
     notice = StateStore(tmp_path / "state.json").load()["notification_outbox"][
         "routine-message-1"
     ]
     assert notice["activation_status"] == "queued"
     assert notice["delivery_status"] == "pending"
     await adapter._flush_notifications()
+    assert len(activations) == 1
+
+
+@pytest.mark.asyncio
+async def test_accepted_activation_with_queued_save_failure_is_never_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from plugin.mupot_gateway import notifications
+
+    calls: list[str] = []
+    client = RoutineClient()
+    adapter = adapter_at(
+        tmp_path,
+        client,
+        injector=lambda content, **_kwargs: calls.append(content) or True,
+    )
+    monkeypatch.setattr(
+        notifications,
+        "active_sessions",
+        lambda: [
+            {
+                "id": "human",
+                "session_key": "agent:main:telegram:dm:123",
+                "source": "telegram",
+                "user_id": "owner",
+                "chat_id": "123",
+                "chat_type": "dm",
+                "last_active": 1,
+            }
+        ],
+    )
+    await adapter._handle_routine_event(routine_message())
+    real_save = adapter.store.save
+
+    def fail_queued(value: dict) -> None:
+        notice = value.get("notification_outbox", {}).get("routine-message-1", {})
+        if notice.get("status") == "activation_queued":
+            raise OSError("queued state unavailable")
+        real_save(value)
+
+    monkeypatch.setattr(adapter.store, "save", fail_queued)
+    await adapter._flush_notifications()
+    assert len(calls) == 1
+    durable = StateStore(tmp_path / "state.json").load()
+    assert durable["notification_outbox"]["routine-message-1"]["status"] in {
+        "activating",
+        "activation_unknown",
+    }
+    assert adapter._state["notification_outbox"]["routine-message-1"]["status"] in {
+        "activating",
+        "activation_unknown",
+    }
+
+    restarted = adapter_at(
+        tmp_path,
+        RoutineClient(already_read=True),
+        injector=lambda content, **_kwargs: calls.append(content) or True,
+    )
+    await restarted._flush_notifications()
+    await restarted._flush_notifications()
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_activation_unknown_save_failure_prevents_external_call_and_restart_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from plugin.mupot_gateway import notifications
+
+    calls: list[str] = []
+
+    def ambiguous_activate(content, **_kwargs):
+        calls.append(content)
+        raise RuntimeError("activation outcome unavailable")
+
+    adapter = adapter_at(
+        tmp_path,
+        RoutineClient(),
+        injector=ambiguous_activate,
+    )
+    monkeypatch.setattr(
+        notifications,
+        "active_sessions",
+        lambda: [
+            {
+                "id": "human",
+                "session_key": "agent:main:telegram:dm:123",
+                "source": "telegram",
+                "user_id": "owner",
+                "chat_id": "123",
+                "chat_type": "dm",
+                "last_active": 1,
+            }
+        ],
+    )
+    await adapter._handle_routine_event(routine_message())
+    real_save = adapter.store.save
+    failed = False
+
+    def fail_unknown_once(value: dict) -> None:
+        nonlocal failed
+        notice = value.get("notification_outbox", {}).get("routine-message-1", {})
+        if notice.get("status") == "activation_unknown" and not failed:
+            failed = True
+            raise OSError("unknown state unavailable")
+        real_save(value)
+
+    monkeypatch.setattr(adapter.store, "save", fail_unknown_once)
+    await adapter._flush_notifications()
+    assert calls == []
+    durable = StateStore(tmp_path / "state.json").load()
+    assert durable["notification_outbox"]["routine-message-1"]["status"] == "activating"
+    assert adapter._state["notification_outbox"]["routine-message-1"]["status"] == "activating"
+
+    restarted = adapter_at(
+        tmp_path,
+        RoutineClient(already_read=True),
+        injector=lambda content, **_kwargs: calls.append(content) or True,
+    )
+    await restarted._flush_notifications()
+    await restarted._flush_notifications()
+    assert calls == []
+    assert StateStore(tmp_path / "state.json").load()["notification_outbox"][
+        "routine-message-1"
+    ]["status"] == "activation_unknown"
+
+
+@pytest.mark.asyncio
+async def test_processed_routine_receipt_survives_processed_window_eviction_for_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from plugin.mupot_gateway import notifications
+
+    first = adapter_at(tmp_path, RoutineClient())
+    await first._handle_routine_event(routine_message())
+    for index in range(1001):
+        first._commit(f"later-peer-{index}")
+    durable = StateStore(tmp_path / "state.json").load()
+    assert "routine-message-1" not in durable["processed"]
+    assert (
+        durable["routine_event_receipts"]["routine-message-1"]["status"]
+        == "processed"
+    )
+
+    activations: list[str] = []
+    restarted = adapter_at(
+        tmp_path,
+        RoutineClient(already_read=True),
+        injector=lambda content, **_kwargs: activations.append(content) or True,
+    )
+    monkeypatch.setattr(
+        notifications,
+        "active_sessions",
+        lambda: [
+            {
+                "id": "human",
+                "session_key": "agent:main:telegram:dm:123",
+                "source": "telegram",
+                "user_id": "owner",
+                "chat_id": "123",
+                "chat_type": "dm",
+                "last_active": 1,
+            }
+        ],
+    )
+    await restarted._flush_notifications()
+    await restarted._flush_notifications()
     assert len(activations) == 1
 
 

@@ -8,7 +8,7 @@ or pilot completion.
 
 ## Exact local contracts
 
-- Plugin head before this repair slice: `0c68246c5764303c1382d05f9caa2a2e58f13116`.
+- Plugin head before this repair slice: `a6553296cf31695ce6a3d09b1d91a92a003afce0`.
 - Mupot server checkout: `22c778d88d7378a1c4df164552bd541a1be1f812`
   (attempt contract introduced at `80001a11c29d93a5dd83f09f87eeaff92514f851`),
   clean tracked tree.
@@ -41,8 +41,8 @@ or activation and leaves the server message unread. The matched path also proves
 exposes the pending question and one exact `/answer` records the human decision.
 
 Fresh verification passed the two cross-repository tests 2/2, standalone pytest 220 plus 12
-subtests, standalone unittest 27/27, local native 254/254, and clean-detached pinned-Hermes
-native 254/254. Ruff, mypy, Python compilation, shell parsing, four-file YAML parsing,
+subtests, standalone unittest 27/27, local native 264/264, and clean-detached pinned-Hermes
+native 264/264. Ruff, mypy, Python compilation, shell parsing, four-file YAML parsing,
 relative-link checks, working and full-base whitespace checks, and credential-shape checks
 also passed. The current lease-attempt commands are retained in the ignored hostile Task 2
 report; the earlier integration mutation results remain in the Task 8 report.

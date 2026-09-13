@@ -1133,7 +1133,46 @@ class MupotAdapter(BasePlatformAdapter):
         if ownership["kind"] == "legacy_non_attempt":
             await self._ack_expected(expected_id)
             return
+        ownership = await self._preflight_persisted_ownership(
+            ownership,
+            require_attempt=True,
+        )
         try:
+            payload = await self._call_consumer(
+                "inbox_lease_ack",
+                {"attempt_id": ownership["attempt_id"]},
+            )
+            receipt = validate_lease_attempt_ack(
+                payload,
+                ownership["attempt_id"],
+                ownership,
+            )
+            if receipt["state"] != "acked" or receipt["consumed"] is not True:
+                raise _protocol_error()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._lease_quarantined = True
+            self._set_fatal_error(
+                "mupot_inbox_attempt_ack_reconciliation_required",
+                "Mupot inbox attempt acknowledgement requires reconciliation",
+                retryable=False,
+            )
+            raise
+
+    async def _preflight_persisted_ownership(
+        self,
+        ownership_value: Any,
+        *,
+        require_attempt: bool = False,
+    ) -> dict[str, Any]:
+        """Validate replay ownership without sending, reconciling, or ACKing."""
+        try:
+            ownership = validate_ack_ownership(ownership_value)
+            if ownership["kind"] != "attempt":
+                if require_attempt:
+                    raise _protocol_error()
+                return ownership
             current_owner = _profile_owner_fingerprint(
                 self._secret_owner,
                 validate=True,
@@ -1164,24 +1203,14 @@ class MupotAdapter(BasePlatformAdapter):
                 )
             ):
                 raise _protocol_error()
-            payload = await self._call_consumer(
-                "inbox_lease_ack",
-                {"attempt_id": ownership["attempt_id"]},
-            )
-            receipt = validate_lease_attempt_ack(
-                payload,
-                ownership["attempt_id"],
-                ownership,
-            )
-            if receipt["state"] != "acked" or receipt["consumed"] is not True:
-                raise _protocol_error()
+            return ownership
         except asyncio.CancelledError:
             raise
         except Exception:
             self._lease_quarantined = True
             self._set_fatal_error(
-                "mupot_inbox_attempt_ack_reconciliation_required",
-                "Mupot inbox attempt acknowledgement requires reconciliation",
+                "mupot_inbox_replay_preflight_required",
+                "Mupot inbox replay ownership requires reconciliation",
                 retryable=False,
             )
             raise
@@ -1459,6 +1488,11 @@ class MupotAdapter(BasePlatformAdapter):
                     status="reconciliation_required",
                 )
                 raise _protocol_error()
+            if record["status"] == "prepared":
+                await self._preflight_persisted_ownership(
+                    record["ack_ownership"],
+                    require_attempt=True,
+                )
             await self._transmit_final_reply(record)
             if not self._reply_has_human_custody(source_id):
                 raise _protocol_error()

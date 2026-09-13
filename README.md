@@ -36,6 +36,9 @@ local commit and marker clearing. Terminal non-consumed or mismatched receipts r
 Before any source ACK, peer reply and Routine custody records also persist the originating
 attempt, strict scope, and profile owner. Restart replay revalidates those facts and remains
 on `inbox_lease_ack`; an expired attempt can never fall through and consume a newer lease.
+Before replaying a prepared outbound final, the adapter performs that owner and strict-scope
+preflight read-only and sends nothing on any mismatch or ambiguous status response. The
+successful order remains send receipt, durable human-notice custody, then exact attempt ACK.
 Only records durably identified as non-attempt work use `inbox_ack`; ambiguous older outbox
 records and older reconciliation markers stay fenced for manual recovery. The receiver also
 verifies the operator's expected agent/tenant, preserves

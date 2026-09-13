@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import copy
 from contextlib import contextmanager
 from pathlib import Path
@@ -127,21 +126,29 @@ class AttemptReplayClient(ProtocolClient):
         attempt_state: str,
         consumed: bool,
         status_scope: dict[str, Any] | None = None,
+        status_error: Exception | None = None,
+        before_attempt_ack: Any = None,
     ) -> None:
         super().__init__()
         self.attempt_state = attempt_state
         self.consumed = consumed
         self.status_scope = status_scope or STRICT_SCOPE
+        self.status_error = status_error
+        self.before_attempt_ack = before_attempt_ack
         self.attempts = {ATTEMPT_A: attempt_state, ATTEMPT_B: "leased"}
         self.message_read = {ATTEMPT_B: False}
 
     async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if tool == "inbox_consumer_status":
             self.calls.append((tool, copy.deepcopy(arguments)))
-            return {"strict_scope": True, **self.status_scope, "key_matches": True}
+            if self.status_error is not None:
+                raise self.status_error
+            return {"strict_scope": True, "key_matches": True, **self.status_scope}
         if tool == "inbox_lease_ack":
             self.calls.append((tool, copy.deepcopy(arguments)))
             assert arguments == {"attempt_id": ATTEMPT_A}
+            if self.before_attempt_ack is not None:
+                self.before_attempt_ack()
             return {
                 "tenant": "tenant-test",
                 "agent_id": "receiver",
@@ -236,6 +243,20 @@ def clear_lease_marker_for_replay(path: Path) -> None:
     StateStore(state_path).save(state)
 
 
+async def persist_prepared_attempt(
+    path: Path,
+    owner: ScopeOwner | None = None,
+) -> dict[str, Any]:
+    client = ProtocolClient()
+    client.crash_before_store_once = True
+    adapter = adapter_at(path, client, owner)
+    await bind_attempt_delivery(adapter)
+    with pytest.raises(SimulatedCrash):
+        await adapter.send("sender", "Prepared exact final.")
+    clear_lease_marker_for_replay(path)
+    return copy.deepcopy(StateStore(path / "state.json").load())
+
+
 @pytest.mark.asyncio
 async def test_progress_and_final_use_distinct_terminal_ack_keys_and_one_notice(
     tmp_path: Path,
@@ -306,19 +327,17 @@ async def test_restart_replays_prepared_final_without_another_model_turn(
     first_client.crash_before_store_once = True
     first = adapter_at(tmp_path, first_client)
     message = source_message()
-    first._state["pending"] = {"message": copy.deepcopy(message)}
-    first.store.save(first._state)
-    await bind_delivery(first, message)
+    await bind_attempt_delivery(first, message)
 
     with pytest.raises(SimulatedCrash):
         await first.send("sender", "Exact prepared final.")
     prepared = copy.deepcopy(StateStore(tmp_path / "state.json").load())
-    assert prepared["reply_outbox"]["source-1"]["ack_ownership"] == {
-        "version": 1,
-        "kind": "legacy_non_attempt",
-    }
+    assert prepared["reply_outbox"]["source-1"]["ack_ownership"]["attempt_id"] == (
+        ATTEMPT_A
+    )
+    clear_lease_marker_for_replay(tmp_path)
 
-    replay_client = ProtocolClient()
+    replay_client = AttemptReplayClient(attempt_state="acked", consumed=True)
     restarted = adapter_at(tmp_path, replay_client)
     model_turns: list[str] = []
 
@@ -327,15 +346,7 @@ async def test_restart_replays_prepared_final_without_another_model_turn(
         return "regenerated output"
 
     restarted.set_message_handler(model)
-    assert await restarted.connect()
-    try:
-        for _ in range(100):
-            if replay_client.acked_ids:
-                break
-            await asyncio.sleep(0.01)
-        assert replay_client.acked_ids == ["source-1"]
-    finally:
-        await restarted.disconnect()
+    await restarted._replay_reply_outbox()
 
     assert model_turns == []
     sent = [args for tool, args in replay_client.calls if tool == "send"]
@@ -370,6 +381,120 @@ async def test_preownership_pending_reply_outbox_stays_fenced_without_network(
     durable = StateStore(tmp_path / "state.json").load()
     assert durable["reply_outbox"]["source-1"] == record
     assert "source-1" not in durable.get("processed", [])
+
+
+@pytest.mark.asyncio
+async def test_prepared_explicit_legacy_reply_stays_fenced_without_send(
+    tmp_path: Path,
+) -> None:
+    first_client = ProtocolClient()
+    first_client.crash_before_store_once = True
+    first = adapter_at(tmp_path, first_client)
+    message = source_message()
+    first._state["pending"] = {"message": copy.deepcopy(message)}
+    first.store.save(first._state)
+    await bind_delivery(first, message)
+    with pytest.raises(SimulatedCrash):
+        await first.send("sender", "Prepared legacy final.")
+    before = copy.deepcopy(StateStore(tmp_path / "state.json").load())
+    assert before["reply_outbox"]["source-1"]["ack_ownership"] == {
+        "version": 1,
+        "kind": "legacy_non_attempt",
+    }
+
+    client = ProtocolClient()
+    restarted = adapter_at(tmp_path, client)
+    with pytest.raises(RuntimeError, match="Mupot MCP request failed"):
+        await restarted._replay_reply_outbox()
+
+    assert client.calls == []
+    assert restarted._lease_quarantined is True
+    assert StateStore(tmp_path / "state.json").load() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope_update", "status_error", "owner_fingerprint"),
+    [
+        ({"tenant": "other-tenant"}, None, None),
+        ({"agent_id": "other-agent"}, None, None),
+        ({"effective_inbox_seat": "other-seat"}, None, None),
+        ({"mode": "gateway"}, None, None),
+        ({"generation": 1}, None, None),
+        ({"key_matches": False}, None, None),
+        ({}, MupotTransportError("Mupot request failed"), None),
+        ({}, None, "b" * 64),
+    ],
+)
+async def test_prepared_attempt_replay_preflight_failure_sends_nothing_and_is_unchanged(
+    tmp_path: Path,
+    scope_update: dict[str, Any],
+    status_error: Exception | None,
+    owner_fingerprint: str | None,
+) -> None:
+    original_owner = ScopeOwner("a" * 64)
+    before = await persist_prepared_attempt(tmp_path, original_owner)
+    client = AttemptReplayClient(
+        attempt_state="acked",
+        consumed=True,
+        status_scope={**STRICT_SCOPE, **scope_update},
+        status_error=status_error,
+    )
+    current_owner = ScopeOwner(owner_fingerprint or original_owner.fingerprint)
+    restarted = adapter_at(tmp_path, client, current_owner)
+
+    with pytest.raises(RuntimeError):
+        await restarted._replay_reply_outbox()
+
+    assert not any(
+        tool in {"send", "inbox_lease_reconcile", "inbox_lease_ack", "inbox_ack"}
+        for tool, _arguments in client.calls
+    )
+    if owner_fingerprint is not None:
+        assert client.calls == []
+    else:
+        assert client.calls == [("inbox_consumer_status", {"strict_scope": True})]
+    assert restarted._lease_quarantined is True
+    assert restarted._fatal_error_code == "mupot_inbox_replay_preflight_required"
+    assert StateStore(tmp_path / "state.json").load() == before
+
+
+@pytest.mark.asyncio
+async def test_prepared_attempt_valid_preflight_sends_then_custodies_then_acks_once(
+    tmp_path: Path,
+) -> None:
+    before = await persist_prepared_attempt(tmp_path)
+    assert before["reply_outbox"]["source-1"]["status"] == "prepared"
+    ack_order: list[str] = []
+
+    def assert_custody_before_ack() -> None:
+        state = StateStore(tmp_path / "state.json").load()
+        assert state["reply_outbox"]["source-1"]["status"] == "custodied"
+        assert state["notification_outbox"]["source-1"]["custody_status"] == "durable"
+        ack_order.append("ack")
+
+    client = AttemptReplayClient(
+        attempt_state="acked",
+        consumed=True,
+        before_attempt_ack=assert_custody_before_ack,
+    )
+    restarted = adapter_at(tmp_path, client)
+
+    await restarted._replay_reply_outbox()
+    await restarted._replay_reply_outbox()
+
+    tools = [tool for tool, _arguments in client.calls]
+    assert tools == [
+        "inbox_consumer_status",
+        "send",
+        "inbox_consumer_status",
+        "inbox_lease_ack",
+    ]
+    state = StateStore(tmp_path / "state.json").load()
+    assert state["notification_outbox"]["source-1"]["custody_status"] == "durable"
+    assert ack_order == ["ack"]
+    assert state["processed"] == ["source-1"]
+    assert state["reply_outbox"]["source-1"]["status"] == "complete"
 
 
 @pytest.mark.asyncio

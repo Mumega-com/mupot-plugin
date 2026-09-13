@@ -68,7 +68,10 @@ operator reconciliation. Peer reply and Routine custody records persist the orig
 attempt, strict scope, and profile owner before ACK. Their restart replay revalidates that
 ownership and never substitutes generic `inbox_ack`; only explicitly identified legacy
 non-attempt records may use the generic path. Older pending records without ownership proof
-remain uncertain and fenced.
+remain uncertain and fenced. A prepared peer final is preflighted against the immutable
+profile owner and a fresh strict consumer-status read before any outbound send. Failure
+leaves its durable prepared bytes unchanged; success preserves send receipt, notice custody,
+then attempt ACK ordering.
 
 Use exactly one native Mupot receiver and one Telegram bot per Hermes profile. The same
 profile owns deterministic commands and return delivery; a second receiver or bot creates

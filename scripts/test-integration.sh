@@ -6,7 +6,7 @@ plugin_root="$(cd "$(dirname "$0")/.." && pwd)"
 : "${HERMES_SOURCE:?Set HERMES_SOURCE to the pinned Hermes source checkout}"
 : "${HERMES_PYTHON:?Set HERMES_PYTHON to the Python interpreter used for native tests}"
 
-expected_server_head="${MUPOT_SERVER_HEAD:-38be07b6f3dfc4408b977f530358886d8599d6c1}"
+readonly expected_server_head="38be07b6f3dfc4408b977f530358886d8599d6c1"
 actual_server_head="$(git -C "$MUPOT_SERVER_SOURCE" rev-parse HEAD)"
 if [ "$actual_server_head" != "$expected_server_head" ]; then
   printf 'Mupot server head mismatch: expected %s, got %s\n' \

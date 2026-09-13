@@ -15,21 +15,26 @@ or pilot completion.
 
 ## Cross-repository acceptance
 
-`scripts/test-integration.sh` refuses a moved or dirty Mupot server checkout. Its Vitest
-harness applies the server's migration chain through `makeReadyRoutineFixture`, creates a
+`scripts/test-integration.sh` hard-pins the Mupot server commit with no environment override
+and refuses a moved or dirty server checkout. Its Vitest harness applies the server's
+migration chain through `makeReadyRoutineFixture`, creates a
 real `ask_human` Routine wait, leases the stored `routine.human-wait/v1` envelope, and passes
-that exact envelope to the native Python plugin adapter.
+the leased envelope's JSON field values to the native Python plugin adapter. This test does
+not claim byte identity for an HTTP or MCP serialization that it does not observe.
 
 The plugin consumer proves durable Routine custody and notice custody, one exact-ID source
 ACK, one private-session activation acceptance, no peer model turn, and no outbound send to
 the synthetic Routine source. The harness then applies that exact ACK ID through the real
 server `ackAgentMessages` seam in the same database and reads back `agent_messages.read_at`.
 It separately proves the participant's squad capability reaches the intended project, the
-Routine's responsible squad matches that edge, the materialized run's `assigned_agent_id`
-equals the independently configured native profile `agent_id`, `/needs` exposes the pending
-question, and one exact `/answer` records the human decision.
+Routine's responsible squad matches that edge, and the materialized run's
+`assigned_agent_id` equals the `agent_id` obtained by discovering the plugin through a real
+temporary Hermes `config.yaml` and constructing the native adapter through its registered
+platform factory. A mismatched profile stops before plugin custody, source ACK, peer work,
+or activation and leaves the server message unread. The matched path also proves `/needs`
+exposes the pending question and one exact `/answer` records the human decision.
 
-Fresh verification passed the cross-repository test 1/1, standalone pytest 220 plus 12
+Fresh verification passed the two cross-repository tests 2/2, standalone pytest 220 plus 12
 subtests, standalone unittest 27/27, local native 181/181, and clean-detached pinned-Hermes
 native 181/181. Ruff, mypy, Python compilation, shell parsing, four-file YAML parsing,
 relative-link checks, working and full-base whitespace checks, and credential-shape checks

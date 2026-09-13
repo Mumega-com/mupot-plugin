@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -9,6 +9,37 @@ const pluginRoot = process.env.MUPOT_PLUGIN_SOURCE
 const serverRoot = process.env.MUPOT_SERVER_SOURCE
 const hermesSource = process.env.HERMES_SOURCE
 const hermesPython = process.env.HERMES_PYTHON
+
+function writeNativeProfile(stateDir: string, agentId: string): string {
+  const home = join(stateDir, 'hermes-home')
+  const pluginDir = join(home, 'plugins', 'mupot')
+  mkdirSync(join(home, 'plugins'), { recursive: true })
+  symlinkSync(pluginRoot!, pluginDir, 'dir')
+  mkdirSync(join(home, 'empty-bundled'))
+  writeFileSync(join(home, 'config.yaml'), JSON.stringify({
+    plugins: {
+      enabled: ['mupot'],
+      entries: {
+        mupot: {
+          allow_gateway_injection: true,
+          settings: {
+            mode: 'operator',
+            operator: {
+              base_url: 'https://pot.example.invalid',
+              expected_tenant: 'tenant-a',
+              squad_id: 'squad-1',
+              agent_id: agentId,
+              approval_owner: 'human-1',
+              native_gateway_enabled: true,
+              telegram_control_enabled: false,
+            },
+          },
+        },
+      },
+    },
+  }, null, 2))
+  return home
+}
 
 test('migration-backed Routine human wait crosses the native plugin and exact source ACK', async () => {
   expect(pluginRoot).toBeTruthy()
@@ -89,6 +120,7 @@ test('migration-backed Routine human wait crosses the native plugin and exact so
       member_id: 'human-1', scope_type: 'squad', scope_id: 'squad-1', capability: 'member',
     })
 
+    const profileHome = writeNativeProfile(stateDir, configuredProfileAgentId)
     const consumed = spawnSync(hermesPython!, [join(pluginRoot!, 'tests/integration/plugin_routine_consumer.py')], {
       cwd: hermesSource,
       env: {
@@ -99,12 +131,15 @@ test('migration-backed Routine human wait crosses the native plugin and exact so
         TZ: 'UTC',
         LANG: 'C.UTF-8',
         LC_ALL: 'C.UTF-8',
+        HERMES_HOME: profileHome,
+        HERMES_BUNDLED_PLUGINS: join(profileHome, 'empty-bundled'),
         HERMES_SOURCE: hermesSource,
-        MUPOT_PLUGIN_SOURCE: pluginRoot,
         MUPOT_PLUGIN_STATE_PATH: join(stateDir, 'state.json'),
-        MUPOT_PROFILE_AGENT_ID: configuredProfileAgentId,
       },
-      input: JSON.stringify(lease.messages[0]),
+      input: JSON.stringify({
+        envelope: lease.messages[0],
+        assigned_agent_id: run.assigned_agent_id,
+      }),
       encoding: 'utf8',
     })
     expect(consumed.status, consumed.stderr).toBe(0)
@@ -155,6 +190,85 @@ test('migration-backed Routine human wait crosses the native plugin and exact so
       status: 'succeeded',
       result_json: '{"answer":"Paid","answered_by":"human-1"}',
     })
+  } finally {
+    fixture.harness.close()
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
+
+test('mismatched native profile stops before custody ACK or activation', async () => {
+  expect(pluginRoot).toBeTruthy()
+  expect(serverRoot).toBeTruthy()
+  expect(hermesSource).toBeTruthy()
+  expect(hermesPython).toBeTruthy()
+
+  const serverModule = (path: string) => pathToFileURL(join(serverRoot!, path)).href
+  const [{ makeReadyRoutineFixture }, { submitRoutineProposal }, messages] = await Promise.all([
+    import(/* @vite-ignore */ serverModule('tests/helpers/routine-actions.ts')),
+    import(/* @vite-ignore */ serverModule('src/routines/actions.ts')),
+    import(/* @vite-ignore */ serverModule('src/agents/messages.ts')),
+  ])
+  const fixture = await makeReadyRoutineFixture()
+  const stateDir = mkdtempSync(join(tmpdir(), 'mupot-plugin-mismatch-'))
+  try {
+    const result = await submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
+      key: 'question-1',
+      kind: 'ask_human',
+      input: {
+        question: 'Which receipt is authoritative?',
+        choices: ['Booked', 'Paid'],
+        references: [],
+      },
+    }))
+    expect(result).toMatchObject({ ok: true, status: 'waiting', reason: 'answer' })
+    const lease = await messages.leaseAgentInbox(
+      fixture.env,
+      { agent: 'agent-1', limit: 1, leaseSeconds: 60 },
+      { now: () => '2026-09-13T12:00:00.000Z' },
+    )
+    if (!lease.ok || lease.messages.length !== 1) throw new Error('expected one leased Routine envelope')
+    const run = fixture.harness.sqlite.prepare(
+      "SELECT assigned_agent_id FROM routine_runs WHERE id = 'run-1'",
+    ).get() as { assigned_agent_id: string }
+    expect(run).toEqual({ assigned_agent_id: 'agent-1' })
+
+    const profileHome = writeNativeProfile(stateDir, 'agent-other')
+    const statePath = join(stateDir, 'state.json')
+    const consumed = spawnSync(hermesPython!, [join(pluginRoot!, 'tests/integration/plugin_routine_consumer.py')], {
+      cwd: hermesSource,
+      env: {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        PYTHONHASHSEED: '0',
+        PYTHONUTF8: '1',
+        TZ: 'UTC',
+        LANG: 'C.UTF-8',
+        LC_ALL: 'C.UTF-8',
+        HERMES_HOME: profileHome,
+        HERMES_BUNDLED_PLUGINS: join(profileHome, 'empty-bundled'),
+        HERMES_SOURCE: hermesSource,
+        MUPOT_PLUGIN_STATE_PATH: statePath,
+      },
+      input: JSON.stringify({
+        envelope: lease.messages[0],
+        assigned_agent_id: run.assigned_agent_id,
+      }),
+      encoding: 'utf8',
+    })
+    expect(consumed.status, consumed.stderr).toBe(0)
+    expect(JSON.parse(consumed.stdout)).toEqual({
+      ack_ids: [],
+      activation_count: 0,
+      custody_recorded: false,
+      outcome: 'assignment_mismatch',
+      peer_turn_count: 0,
+      profile_agent_id: 'agent-other',
+      source_id: lease.messages[0].id,
+    })
+    expect(existsSync(statePath)).toBe(false)
+    expect(fixture.harness.sqlite.prepare(
+      'SELECT read_at FROM agent_messages WHERE id = ?',
+    ).get(lease.messages[0].id)).toEqual({ read_at: null })
   } finally {
     fixture.harness.close()
     rmSync(stateDir, { recursive: true, force: true })

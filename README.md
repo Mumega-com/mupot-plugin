@@ -43,6 +43,60 @@ replayed. This integration does not grant the agent human decision authority.
 For the broader project-onboarding and human-control scope, see
 [`docs/human-project-control.md`](docs/human-project-control.md).
 
+## Telegram project onboarding
+
+The optional deterministic Telegram control surface relays exactly `/start`, `/needs`,
+`/answer`, `/approve`, and `/reject` from a private, unforwarded chat to Mupot. These
+commands do not start an LLM turn: Mupot resolves the immutable Telegram identity,
+project visibility, role, pending decision, conflicts, and current authorization. Ordinary
+Telegram text remains owned by Hermes.
+
+Use one native Mupot receiver and one Telegram bot per Hermes profile. Do not install the
+legacy split Mupot platform beside this plugin, register a second receiver, or attach a
+second bot to the same profile. The production profile settings are:
+
+```yaml
+plugins:
+  enabled: [mupot]
+  disabled: [platforms/mupot, mupot-platform]
+  entries:
+    mupot:
+      allow_gateway_injection: true
+      settings:
+        mode: operator
+        operator:
+          native_gateway_enabled: true
+          inbox_watch_enabled: false
+          base_url: https://mupot.mumega.com
+          telegram_control_enabled: true
+          telegram_control_webhook_secret_env: IM_WEBHOOK_SECRET
+```
+
+Keep `IM_WEBHOOK_SECRET`, the Telegram bot token, and `MUPOT_AGENT_TOKEN` in the
+profile's protected environment; never put values in YAML. Enabling Telegram control is a
+local relay configuration, not a capability grant.
+
+The participant receives a one-time pairing code through an approved out-of-band channel,
+sends `/start <pairing-code>` in the approved bot's private chat, confirms the returned
+project and role, and uses `/needs` to see only currently authorized attention. They then
+submit one exact `/answer <run-id> <choice>` or, only when independently authorized by the
+existing gate, `/approve <task-id>` or `/reject <task-id> <reason>`. Mupot records the
+decision, continues the Routine, and the native receiver returns the resulting update to
+the same private conversation automatically.
+
+Duplicate transport updates replay the stored response without a second effect. Stale or
+terminal decisions, invalid choices, unauthorized actions, and conflicting reuse of an
+update ID are refused without creating a new decision. Suspension and capability
+revocation are rechecked on every later command. Restart or timeout is an uncertain state:
+reconcile the Mupot receipt/domain state before issuing another decision; do not bypass the
+durable fence with a new command or delete receipt state.
+
+Onboarding grants no merge, deploy, publish, spending, organization-admin, token, or
+independent gate authority. See the [Telegram onboarding runbook](docs/telegram-onboarding-runbook.md)
+for setup, verification, retry, revocation, and rollback steps. A live pilot remains gated
+on independent review, exact deployment proof, migration readback, and protected webhook
+configuration.
+
 ### Testing with Hermes
 
 `./scripts/test.sh` runs the standalone operator/provisioner and legacy stream tests.

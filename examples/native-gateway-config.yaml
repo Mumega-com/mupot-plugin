@@ -11,7 +11,10 @@ plugins:
         operator:
           native_gateway_enabled: true
           inbox_watch_enabled: false
-          base_url: https://<YOUR_MUPOT_HOST>
+          # Hosted production Mupot. Keep this credential-free HTTPS origin exact.
+          base_url: https://mupot.mumega.com
+          telegram_control_enabled: true
+          telegram_control_webhook_secret_env: IM_WEBHOOK_SECRET
           expected_tenant: <TENANT_SLUG>
           squad_id: <SQUAD_ID>
           agent_id: <HERMES_AGENT_ID>
@@ -21,7 +24,7 @@ plugins:
 
 mcp_servers:
   mupot:
-    url: https://<YOUR_MUPOT_HOST>/mcp
+    url: https://mupot.mumega.com/mcp
     headers:
       Authorization: Bearer ${MUPOT_AGENT_TOKEN}
 
@@ -36,6 +39,9 @@ mupot:
     telegram: '<IMMUTABLE_TELEGRAM_USER_ID>'
   notification_activate: true
 
-# Configure the Telegram bot and its human allowlist in this same profile.
+# Configure exactly one Telegram bot in this profile. This one Mupot plugin owns
+# the one native receiver and the deterministic Telegram handlers; do not install
+# a second Mupot receiver or attach another Telegram bot to the same profile.
+# Configure the bot's human allowlist in this same profile.
 # Start a private conversation once so Hermes has an authenticated session origin.
 # Group destinations and unlinked users are not selected by this notification route.

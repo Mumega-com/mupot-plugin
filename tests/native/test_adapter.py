@@ -551,6 +551,7 @@ async def test_timed_out_thread_callback_cannot_send_with_next_delivery_context(
             {
                 "to": "kasra",
                 "body": "B final",
+                "kind": "ack",
                 "project_id": "project-b",
                 "request_id": "resp-source-b",
                 "in_reply_to": "source-b",
@@ -653,6 +654,7 @@ async def test_adapter_leases_then_acks_only_after_success(tmp_path: Path) -> No
             {
                 "to": "hadi-codex",
                 "body": "{ack_for:req-7} accepted",
+                "kind": "ack",
                 "project_id": "project-1",
                 "request_id": "resp-m-1",
                 "in_reply_to": "m-1",

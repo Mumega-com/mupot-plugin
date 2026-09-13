@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import httpx
 import json
 import logging
 import math
 import os
+import re
 import time
 from collections import deque
 from contextvars import ContextVar
@@ -39,6 +41,28 @@ _GENERIC_MCP_PROTOCOL_ERROR = "Mupot MCP request failed"
 _GENERIC_MCP_TRANSPORT_ERROR = "Mupot request failed"
 _GENERIC_DELIVERY_CONTEXT_ERROR = "Mupot delivery context unavailable"
 _DELIVERY_CONTEXT_METADATA_KEY = "_mupot_delivery_context"
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_REPLY_OUTBOX_VERSION = 1
+_IMMUTABLE_REPLY_SOURCE_FIELDS = (
+    "id",
+    "seq",
+    "tenant",
+    "to_agent",
+    "target_seat",
+    "from_agent",
+    "from_member",
+    "kind",
+    "body",
+    "request_id",
+    "in_reply_to",
+    "created_at",
+    "project_id",
+    "fenced_delivery_id",
+    "body_length",
+    "checksum_sha256",
+    "expects_reply",
+    "reply_basis",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +336,30 @@ def is_terminal_ack(message: dict[str, Any]) -> bool:
     )
 
 
+def _reply_source_fingerprint(source: Mapping[str, Any]) -> str:
+    stable = {name: source.get(name) for name in _IMMUTABLE_REPLY_SOURCE_FIELDS}
+    payload = json.dumps(
+        stable,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _final_request_id(source_id: str) -> str:
+    candidate = f"resp-{source_id}"
+    if _REQUEST_ID_RE.fullmatch(candidate):
+        return candidate
+    digest = hashlib.sha256(source_id.encode("utf-8")).hexdigest()
+    return f"resp-{digest}"
+
+
+def _progress_request_id(source_id: str, body: str) -> str:
+    digest = hashlib.sha256((source_id + body).encode("utf-8")).hexdigest()
+    return f"prog-{digest}"
+
+
 def _platform_for_mupot() -> Platform:
     try:
         return Platform("mupot")
@@ -549,14 +597,26 @@ class MupotAdapter(BasePlatformAdapter):
         self.notification_activate = extra.get("notification_activate") is True
         self.message_injector = message_injector
         self._state: dict[str, Any] = copy.deepcopy(loaded) if state_valid else {}
+        loaded_reply_outbox = loaded.get("reply_outbox")
+        reply_outbox_valid = loaded_reply_outbox is None or isinstance(
+            loaded_reply_outbox, dict
+        )
+        pending = copy.deepcopy(loaded.get("pending"))
         self._state.update({
             # Mupot owns retry timing through visibility leases. Never replay
-            # a stale local in-flight record immediately after a crash.
-            "pending": None,
+            # a stale local in-flight record by rerunning the model after a
+            # crash. Preserve it so a prepared terminal envelope can finish,
+            # or so ambiguous legacy work can remain visibly fenced.
+            "pending": pending,
             "processed": list(loaded.get("processed") or [])[-1000:],
             "dlq": list(loaded.get("dlq") or [])[-100:],
             "terminal_receipts": list(loaded.get("terminal_receipts") or [])[-100:],
             "notification_outbox": dict(loaded.get("notification_outbox") or {}),
+            "reply_outbox": (
+                copy.deepcopy(loaded_reply_outbox)
+                if isinstance(loaded_reply_outbox, dict)
+                else {}
+            ),
             "lease_reconciliation": (
                 loaded.get("lease_reconciliation")
                 if state_valid
@@ -573,6 +633,33 @@ class MupotAdapter(BasePlatformAdapter):
         self._live_generations: dict[int, _LiveDelivery] = {}
         self._consumer_fence: Optional[dict[str, Any]] = None
         self._lease_quarantined = self._state["lease_reconciliation"] is not None
+        self._reply_state_invalid = not state_valid or not reply_outbox_valid
+        pending_message = pending.get("message") if isinstance(pending, dict) else None
+        pending_id = (
+            str(pending_message.get("id") or "").strip()
+            if isinstance(pending_message, dict)
+            else ""
+        )
+        self._legacy_pending_ambiguous = pending is not None and (
+            not pending_id or pending_id not in self._state["reply_outbox"]
+        )
+        self._reply_reconciliation_required = any(
+            not isinstance(record, dict)
+            or record.get("status") == "reconciliation_required"
+            for record in self._state["reply_outbox"].values()
+        )
+        for source_id, record in self._state["reply_outbox"].items():
+            try:
+                validated = self._validated_reply_record(source_id, record)
+                if (
+                    pending_id == source_id
+                    and isinstance(pending_message, dict)
+                    and validated["source_fingerprint"]
+                    != _reply_source_fingerprint(pending_message)
+                ):
+                    self._reply_state_invalid = True
+            except MupotProtocolError:
+                self._reply_state_invalid = True
 
     def set_message_handler(
         self,
@@ -712,7 +799,281 @@ class MupotAdapter(BasePlatformAdapter):
                 runtime.context.session_key,
             )
 
+    def _persist_reply_record(
+        self,
+        source_id: str,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        durable, valid = self.store.load_checked()
+        if not valid:
+            raise _protocol_error()
+        candidate = copy.deepcopy(durable if self.store.path.exists() else self._state)
+        outbox = candidate.setdefault("reply_outbox", {})
+        if not isinstance(outbox, dict):
+            raise _protocol_error()
+        outbox[source_id] = copy.deepcopy(record)
+        self.store.save(candidate)
+        readback, readback_valid = self.store.load_checked()
+        durable_outbox = readback.get("reply_outbox")
+        if (
+            not readback_valid
+            or not isinstance(durable_outbox, dict)
+            or durable_outbox.get(source_id) != record
+        ):
+            raise _protocol_error()
+        self._state = readback
+        return copy.deepcopy(record)
+
+    def _validated_reply_record(
+        self,
+        source_id: str,
+        record: Any,
+        source: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        if not isinstance(record, dict):
+            raise _protocol_error()
+        arguments = record.get("arguments")
+        receipt = record.get("receipt")
+        if (
+            record.get("version") != _REPLY_OUTBOX_VERSION
+            or record.get("source_id") != source_id
+            or not isinstance(record.get("source"), dict)
+            or not isinstance(record.get("source_fingerprint"), str)
+            or not isinstance(arguments, dict)
+            or not {
+                "to",
+                "body",
+                "kind",
+                "request_id",
+                "in_reply_to",
+            }.issubset(arguments)
+            or set(arguments) - {
+                "to",
+                "body",
+                "kind",
+                "project_id",
+                "request_id",
+                "in_reply_to",
+            }
+            or arguments.get("kind") != "ack"
+            or not isinstance(arguments.get("to"), str)
+            or not arguments["to"].strip()
+            or not str(arguments.get("body") or "").strip()
+            or not isinstance(arguments.get("request_id"), str)
+            or _REQUEST_ID_RE.fullmatch(arguments["request_id"]) is None
+            or arguments["request_id"] != _final_request_id(source_id)
+            or arguments.get("in_reply_to") != source_id
+            or (
+                "project_id" in arguments
+                and (
+                    not isinstance(arguments["project_id"], str)
+                    or not arguments["project_id"].strip()
+                )
+            )
+            or record.get("status")
+            not in {
+                "prepared",
+                "sent",
+                "custodied",
+                "complete",
+                "reconciliation_required",
+            }
+            or (receipt is not None and not isinstance(receipt, dict))
+        ):
+            raise _protocol_error()
+        persisted_source = record["source"]
+        if record["source_fingerprint"] != _reply_source_fingerprint(persisted_source):
+            raise _protocol_error()
+        if source is not None and record["source_fingerprint"] != _reply_source_fingerprint(
+            source
+        ):
+            raise _protocol_error()
+        status = record["status"]
+        if status == "prepared" and receipt is not None:
+            raise _protocol_error()
+        if status in {"sent", "custodied", "complete"}:
+            validate_send_receipt(
+                receipt,
+                arguments["to"],
+                arguments.get("project_id"),
+            )
+        return copy.deepcopy(record)
+
+    def _prepare_final_reply(
+        self,
+        runtime: _LiveDelivery,
+        recipient: str,
+        content: str,
+    ) -> dict[str, Any]:
+        source_id = runtime.context.source_id
+        durable, valid = self.store.load_checked()
+        if not valid:
+            raise _protocol_error()
+        outbox = durable.get("reply_outbox")
+        if outbox is not None and not isinstance(outbox, dict):
+            raise _protocol_error()
+        existing = (outbox or {}).get(source_id)
+        if existing is not None:
+            return self._validated_reply_record(source_id, existing, runtime.source)
+        if not content.strip():
+            raise _protocol_error()
+        arguments: dict[str, Any] = {
+            "to": recipient,
+            "body": content,
+            "kind": "ack",
+            "request_id": _final_request_id(source_id),
+            "in_reply_to": source_id,
+        }
+        if runtime.context.project:
+            arguments["project_id"] = runtime.context.project
+        source = copy.deepcopy(dict(runtime.source))
+        record = {
+            "version": _REPLY_OUTBOX_VERSION,
+            "source_id": source_id,
+            "source": source,
+            "source_fingerprint": _reply_source_fingerprint(source),
+            "arguments": arguments,
+            "status": "prepared",
+            "receipt": None,
+        }
+        return self._persist_reply_record(source_id, record)
+
+    def _update_reply_record(
+        self,
+        source_id: str,
+        record: dict[str, Any],
+        *,
+        status: str,
+        receipt: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        updated = copy.deepcopy(record)
+        updated["status"] = status
+        if receipt is not None:
+            updated["receipt"] = copy.deepcopy(receipt)
+        persisted = self._persist_reply_record(source_id, updated)
+        self._reply_reconciliation_required = status == "reconciliation_required" or any(
+            isinstance(value, dict)
+            and value.get("status") == "reconciliation_required"
+            for key, value in self._state.get("reply_outbox", {}).items()
+            if key != source_id
+        )
+        return persisted
+
+    async def _transmit_final_reply(
+        self,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        source_id = record["source_id"]
+        record = self._validated_reply_record(source_id, record)
+        if record["status"] == "reconciliation_required":
+            raise _protocol_error()
+        if record["status"] == "prepared":
+            try:
+                result = await asyncio.wait_for(
+                    self._send_client.call("send", copy.deepcopy(record["arguments"])),
+                    timeout=self.rpc_timeout,
+                )
+                receipt = validate_send_receipt(
+                    result,
+                    record["arguments"]["to"],
+                    record["arguments"].get("project_id"),
+                )
+            except MupotProtocolError:
+                self._update_reply_record(
+                    source_id,
+                    record,
+                    status="reconciliation_required",
+                )
+                raise
+            record = self._update_reply_record(
+                source_id,
+                record,
+                status="sent",
+                receipt=receipt,
+            )
+        if record["status"] == "sent":
+            from .notifications import enqueue
+
+            enqueue(
+                self._state,
+                self.store,
+                record["source"],
+                record["arguments"]["body"],
+            )
+            # enqueue performs its own durable readback. Persisting this status
+            # after it means source consumption can require both custody proofs.
+            durable_record = self._state.get("reply_outbox", {}).get(source_id)
+            record = self._validated_reply_record(source_id, durable_record)
+            record = self._update_reply_record(
+                source_id,
+                record,
+                status="custodied",
+            )
+        final_receipt = record.get("receipt")
+        if not isinstance(final_receipt, dict):
+            raise _protocol_error()
+        return final_receipt
+
+    def _reply_has_human_custody(self, source_id: str) -> bool:
+        record = self._state.get("reply_outbox", {}).get(source_id)
+        notice = self._state.get("notification_outbox", {}).get(source_id)
+        return bool(
+            isinstance(record, dict)
+            and record.get("status") in {"custodied", "complete"}
+            and isinstance(record.get("receipt"), dict)
+            and isinstance(notice, dict)
+            and notice.get("custody_status") == "durable"
+        )
+
+    def _mark_reply_complete(self, source_id: str) -> None:
+        record = self._state.get("reply_outbox", {}).get(source_id)
+        validated = self._validated_reply_record(source_id, record)
+        if validated["status"] != "complete":
+            self._update_reply_record(source_id, validated, status="complete")
+
+    async def _replay_reply_outbox(self) -> None:
+        outbox = self._state.get("reply_outbox")
+        if not isinstance(outbox, dict):
+            raise _protocol_error()
+        for source_id in list(outbox):
+            record = self._validated_reply_record(source_id, outbox[source_id])
+            if record["status"] == "complete":
+                continue
+            if record["status"] == "reconciliation_required":
+                self._reply_reconciliation_required = True
+                raise _protocol_error()
+            if source_id in self._state.get("processed", []):
+                self._mark_reply_complete(source_id)
+                continue
+            pending = self._state.get("pending")
+            pending_message = pending.get("message") if isinstance(pending, dict) else None
+            if (
+                not isinstance(pending_message, dict)
+                or str(pending_message.get("id") or "").strip() != source_id
+                or _reply_source_fingerprint(pending_message)
+                != record["source_fingerprint"]
+            ):
+                self._update_reply_record(
+                    source_id,
+                    record,
+                    status="reconciliation_required",
+                )
+                raise _protocol_error()
+            await self._transmit_final_reply(record)
+            if not self._reply_has_human_custody(source_id):
+                raise _protocol_error()
+            await self._ack_expected(source_id)
+            self._commit(source_id)
+            self._mark_reply_complete(source_id)
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        if (
+            self._reply_state_invalid
+            or self._legacy_pending_ambiguous
+            or self._reply_reconciliation_required
+        ):
+            logger.error("[mupot] connect blocked; reply reconciliation required")
+            return False
         if self._lease_quarantined:
             logger.error("[mupot] connect blocked; inbox reconciliation required")
             return False
@@ -914,6 +1275,25 @@ class MupotAdapter(BasePlatformAdapter):
     async def _poll_loop(self) -> None:
         while self._running:
             try:
+                await self._replay_reply_outbox()
+            except asyncio.CancelledError:
+                raise
+            except MupotProtocolError:
+                self._reply_reconciliation_required = True
+                self._set_fatal_error(
+                    "mupot_reply_reconciliation_required",
+                    "Mupot reply reconciliation is required",
+                    retryable=False,
+                )
+                logger.error("[mupot] reply replay requires reconciliation")
+                return
+            except Exception as exc:
+                # The exact immutable envelope remains durable. Do not lease
+                # new work while its terminal response is unresolved.
+                logger.warning("[mupot] reply replay deferred: %s", exc)
+                await asyncio.sleep(self.poll_interval)
+                continue
+            try:
                 await self._flush_notifications()
             except asyncio.CancelledError:
                 raise
@@ -1035,8 +1415,15 @@ class MupotAdapter(BasePlatformAdapter):
             runtime.outcome or ProcessingOutcome.FAILURE,
         )
         if runtime.outcome == ProcessingOutcome.SUCCESS:
+            if not self._reply_has_human_custody(message_id):
+                # Hermes treats an empty response as a successful no-op. A
+                # peer request is not consumable until a terminal ACK has a
+                # concrete Mupot receipt and its human notice has custody.
+                self.store.save(self._state)
+                return
             await self._ack_expected(message_id)
             self._commit(message_id)
+            self._mark_reply_complete(message_id)
             return
         # Do not acknowledge failure and do not immediately replay locally.
         # The server-side visibility lease expires, retries safely, and moves
@@ -1152,35 +1539,35 @@ class MupotAdapter(BasePlatformAdapter):
                 retryable=False,
                 error_kind="unknown",
             )
-        arguments: dict[str, Any] = {
-            "to": recipient,
-            "body": str(content),
-        }
         assert runtime is not None
         assert context is not None
-        request_id = context.request_id
         inbound_id = context.source_id
-        if context.project:
-            arguments["project_id"] = context.project
-        if context.source_id:
-            arguments["in_reply_to"] = context.source_id
-            # Distinct sender idempotency key per inbound turn redelivery:
-            arguments["request_id"] = f"resp-{context.source_id}"
-        elif request_id:
-            arguments["request_id"] = f"resp-{request_id}"
+        interim = metadata.get("_interim_send") is True
+        arguments: dict[str, Any] = {}
         try:
-            result = await asyncio.wait_for(
-                self._send_client.call("send", arguments),
-                timeout=self.rpc_timeout,
-            )
-            receipt = validate_send_receipt(
-                result,
-                arguments["to"],
-                arguments.get("project_id"),
-            )
-            if self.notification_recipients and inbound_id and not metadata.get("_interim_send"):
-                from .notifications import enqueue
-                enqueue(self._state, self.store, dict(runtime.source), str(content))
+            if interim:
+                arguments = {
+                    "to": recipient,
+                    "body": str(content),
+                    "kind": "ack",
+                    "request_id": _progress_request_id(inbound_id, str(content)),
+                    "in_reply_to": inbound_id,
+                }
+                if context.project:
+                    arguments["project_id"] = context.project
+                result = await asyncio.wait_for(
+                    self._send_client.call("send", arguments),
+                    timeout=self.rpc_timeout,
+                )
+                receipt = validate_send_receipt(
+                    result,
+                    arguments["to"],
+                    arguments.get("project_id"),
+                )
+            else:
+                record = self._prepare_final_reply(runtime, recipient, str(content))
+                arguments = record["arguments"]
+                receipt = await self._transmit_final_reply(record)
             return SendResult(
                 success=True,
                 message_id=receipt["id"],

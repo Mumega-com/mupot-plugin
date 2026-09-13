@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 from gateway.config import PlatformConfig
+from gateway.platforms.base import ProcessingOutcome
 
 from plugin.mupot_gateway.adapter import MupotAdapter, StateStore
 from plugin.mupot_gateway.routine_events import (
@@ -587,6 +588,81 @@ async def test_disabled_config_keeps_routine_path_absent_and_never_expands_peer_
     )
     assert state["processed"] == ["routine-message-1"]
     assert model_turns == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "version",
+    ["routine.human-wait/v1", r"routine\u002ehuman-wait/v1"],
+)
+async def test_oversized_routine_marker_from_allowlisted_peer_is_quarantined_not_delivered(
+    tmp_path: Path,
+    version: str,
+) -> None:
+    client = RoutineClient()
+    adapter = adapter_at(tmp_path, client)
+    peer_turns: list[str] = []
+
+    async def peer_handler(event) -> None:
+        peer_turns.append(event.text)
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    adapter.set_message_handler(peer_handler)
+    oversized = routine_message(
+        from_agent="kasra",
+        from_member="member-kasra",
+        request_id="request-other",
+        lease_expires_at="2099-09-13T10:05:00.000Z",
+        body='{"version":"' + version + '","pad":"' + ("x" * 8001) + '"}',
+    )
+
+    await adapter._process_leased_message(oversized)
+    state = StateStore(tmp_path / "state.json").load()
+    assert peer_turns == []
+    assert (
+        state["routine_event_quarantine"]["routine-message-1"]["reason"]
+        == "invalid_routine_event"
+    )
+    assert state["processed"] == ["routine-message-1"]
+    assert client.calls == [("inbox_ack", {"ids": ["routine-message-1"]})]
+    assert "routine-message-1" not in state.get("notification_outbox", {})
+
+
+@pytest.mark.asyncio
+async def test_disabled_restart_with_prior_custody_makes_no_network_or_state_change(
+    tmp_path: Path,
+) -> None:
+    class AckFailureClient(RoutineClient):
+        async def call(self, tool: str, arguments: dict) -> dict:
+            if tool == "inbox_ack":
+                self.calls.append((tool, copy.deepcopy(arguments)))
+                raise OSError("crash before source ACK result")
+            return await super().call(tool, arguments)
+
+    first_client = AckFailureClient()
+    first = adapter_at(tmp_path, first_client)
+    with pytest.raises(OSError, match="crash before source ACK result"):
+        await first._handle_routine_event(routine_message())
+    before = copy.deepcopy(StateStore(tmp_path / "state.json").load())
+    assert before["routine_event_receipts"]["routine-message-1"]["status"] == "custody"
+    assert before.get("processed", []) == []
+
+    activations: list[str] = []
+    restarted_client = RoutineClient(already_read=True)
+    restarted = adapter_at(
+        tmp_path,
+        restarted_client,
+        enabled=False,
+        injector=lambda content, **_kwargs: activations.append(content) or True,
+    )
+    assert await restarted.connect() is False
+    await restarted._replay_routine_events()
+    await restarted._flush_notifications()
+
+    assert restarted_client.connect_calls == 0
+    assert restarted_client.calls == []
+    assert activations == []
+    assert StateStore(tmp_path / "state.json").load() == before
 
 
 def test_config_requires_real_boolean_and_example_explicitly_enables_routines(

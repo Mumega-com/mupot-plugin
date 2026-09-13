@@ -212,7 +212,7 @@ def is_routine_event_candidate(message: Mapping[str, Any]) -> bool:
     if isinstance(request_id, str) and request_id.startswith("routine-human:"):
         return True
     body = message.get("body")
-    if not isinstance(body, str) or len(body) > _BODY_LIMIT:
+    if not isinstance(body, str):
         return False
     if '"routine.human-wait/v1"' in body or '"routine_human_wait"' in body:
         return True

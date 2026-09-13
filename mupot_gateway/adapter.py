@@ -654,13 +654,17 @@ class MupotAdapter(BasePlatformAdapter):
         self._lease_quarantined = self._state["lease_reconciliation"] is not None
         self._reply_state_invalid = not state_valid or not reply_outbox_valid
         self._routine_state_invalid = not state_valid or not routine_state_valid
+        pending_routine_records: list[dict[str, Any]] = []
         if not self._routine_state_invalid:
             try:
                 from .routine_events import pending_routine_receipts
 
-                pending_routine_receipts(self._state)
+                pending_routine_records = pending_routine_receipts(self._state)
             except Exception:
                 self._routine_state_invalid = True
+        self._routine_reconciliation_required = bool(
+            pending_routine_records
+        ) and not self.routine_events_enabled
         pending_message = pending.get("message") if isinstance(pending, dict) else None
         pending_id = (
             str(pending_message.get("id") or "").strip()
@@ -1104,6 +1108,11 @@ class MupotAdapter(BasePlatformAdapter):
         if self._routine_state_invalid:
             logger.error("[mupot] connect blocked; Routine event reconciliation required")
             return False
+        if self._routine_reconciliation_required:
+            logger.error(
+                "[mupot] connect blocked; Routine events are disabled with pending custody"
+            )
+            return False
         if self._lease_quarantined:
             logger.error("[mupot] connect blocked; inbox reconciliation required")
             return False
@@ -1424,6 +1433,8 @@ class MupotAdapter(BasePlatformAdapter):
             validate_routine_event,
         )
 
+        if not self.routine_events_enabled:
+            raise RuntimeError("Mupot Routine events are disabled")
         message_id = str(message.get("id") or "")
         try:
             event = validate_routine_event(message)
@@ -1449,6 +1460,8 @@ class MupotAdapter(BasePlatformAdapter):
 
     async def _replay_routine_events(self) -> None:
         """Close crash windows by retrying the exact source ACK before activation."""
+        if not self.routine_events_enabled:
+            return
         from .notifications import enqueue
         from .routine_events import (
             mark_routine_processed,

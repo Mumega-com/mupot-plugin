@@ -77,6 +77,11 @@ plugins:
           base_url: https://mupot.mumega.com
           telegram_control_enabled: true
           telegram_control_webhook_secret_env: IM_WEBHOOK_SECRET
+
+mupot:
+  enabled: true
+  routine_events_enabled: true
+  allowed_agents: [<ALLOWED_PEER_AGENT_ID>]
 ```
 
 Set the Mupot MCP URL to `https://mupot.mumega.com/mcp`. Replace only the documented
@@ -95,8 +100,9 @@ Before restart or participant invitation:
 
 1. Verify the profile contains exactly one enabled `mupot` plugin, one configured Telegram
    bot, and no legacy Mupot platform copy.
-2. Verify `native_gateway_enabled: true` and `inbox_watch_enabled: false`; the plugin rejects
-   simultaneous native and legacy receivers.
+2. Verify `native_gateway_enabled: true`, `inbox_watch_enabled: false`, and
+   `mupot.routine_events_enabled: true`; the plugin rejects simultaneous native and legacy
+   receivers. Keep `mupot-routines` out of the peer `allowed_agents` list.
 3. Verify the credential-free HTTPS origin is exactly `https://mupot.mumega.com`, with no
    user info, query, or fragment.
 4. Verify the configured tenant and welded agent ID against authenticated Mupot readback.

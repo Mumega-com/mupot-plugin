@@ -26,6 +26,12 @@ the operator's expected agent/tenant before receiving, preserves message correla
 and consumes a source only after successful handling. Terminal ACKs are preserved
 without generating another peer reply. It does not start an SOS connection.
 
+Enable `mupot.routine_events_enabled: true` for the dedicated authenticated
+`routine.human-wait/v1` receive path. This opt-in does not add `mupot-routines` to
+`allowed_agents`: Routine events never start a peer model turn or send to their synthetic
+source. Their human notice becomes eligible for private-session activation only after
+durable custody, exact source ACK, and the local processed marker.
+
 For human updates, configure `mupot.notification_recipients` with the immutable user
 ID for each linked platform. Only matching active private conversations are eligible.
 With `mupot.notification_activate: true` and
@@ -70,6 +76,11 @@ plugins:
           base_url: https://mupot.mumega.com
           telegram_control_enabled: true
           telegram_control_webhook_secret_env: IM_WEBHOOK_SECRET
+
+mupot:
+  enabled: true
+  routine_events_enabled: true
+  allowed_agents: [<ALLOWED_PEER_AGENT_ID>]
 ```
 
 Keep `IM_WEBHOOK_SECRET`, the Telegram bot token, and `MUPOT_AGENT_TOKEN` in the

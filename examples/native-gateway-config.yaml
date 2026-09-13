@@ -31,6 +31,8 @@ mcp_servers:
 mupot:
   enabled: true
   mcp_server: mupot
+  # Dedicated synthetic Routine human-wait receiver; this does not widen allowed_agents.
+  routine_events_enabled: true
   # During migration, use the exact existing path; do not start a new empty ledger.
   # Fresh installations may omit this and use the profile-aware default.
   state_path: <ABSOLUTE_PATH_TO_EXISTING_MUPOT_STATE_JSON>

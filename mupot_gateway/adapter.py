@@ -595,11 +595,24 @@ class MupotAdapter(BasePlatformAdapter):
         loaded, state_valid = self.store.load_checked()
         self.notification_recipients = dict(extra.get("notification_recipients") or {})
         self.notification_activate = extra.get("notification_activate") is True
+        routine_events_enabled = extra.get("routine_events_enabled", False)
+        if not isinstance(routine_events_enabled, bool):
+            raise ValueError("routine_events_enabled must be a boolean")
+        self.routine_events_enabled = routine_events_enabled
         self.message_injector = message_injector
         self._state: dict[str, Any] = copy.deepcopy(loaded) if state_valid else {}
         loaded_reply_outbox = loaded.get("reply_outbox")
         reply_outbox_valid = loaded_reply_outbox is None or isinstance(
             loaded_reply_outbox, dict
+        )
+        loaded_routine_receipts = loaded.get("routine_event_receipts")
+        loaded_routine_quarantine = loaded.get("routine_event_quarantine")
+        routine_state_valid = (
+            (loaded_routine_receipts is None or isinstance(loaded_routine_receipts, dict))
+            and (
+                loaded_routine_quarantine is None
+                or isinstance(loaded_routine_quarantine, dict)
+            )
         )
         pending = copy.deepcopy(loaded.get("pending"))
         self._state.update({
@@ -612,6 +625,12 @@ class MupotAdapter(BasePlatformAdapter):
             "dlq": list(loaded.get("dlq") or [])[-100:],
             "terminal_receipts": list(loaded.get("terminal_receipts") or [])[-100:],
             "notification_outbox": dict(loaded.get("notification_outbox") or {}),
+            "routine_event_receipts": copy.deepcopy(loaded_routine_receipts)
+            if isinstance(loaded_routine_receipts, dict)
+            else {},
+            "routine_event_quarantine": copy.deepcopy(loaded_routine_quarantine)
+            if isinstance(loaded_routine_quarantine, dict)
+            else {},
             "reply_outbox": (
                 copy.deepcopy(loaded_reply_outbox)
                 if isinstance(loaded_reply_outbox, dict)
@@ -634,6 +653,14 @@ class MupotAdapter(BasePlatformAdapter):
         self._consumer_fence: Optional[dict[str, Any]] = None
         self._lease_quarantined = self._state["lease_reconciliation"] is not None
         self._reply_state_invalid = not state_valid or not reply_outbox_valid
+        self._routine_state_invalid = not state_valid or not routine_state_valid
+        if not self._routine_state_invalid:
+            try:
+                from .routine_events import pending_routine_receipts
+
+                pending_routine_receipts(self._state)
+            except Exception:
+                self._routine_state_invalid = True
         pending_message = pending.get("message") if isinstance(pending, dict) else None
         pending_id = (
             str(pending_message.get("id") or "").strip()
@@ -1074,6 +1101,9 @@ class MupotAdapter(BasePlatformAdapter):
         ):
             logger.error("[mupot] connect blocked; reply reconciliation required")
             return False
+        if self._routine_state_invalid:
+            logger.error("[mupot] connect blocked; Routine event reconciliation required")
+            return False
         if self._lease_quarantined:
             logger.error("[mupot] connect blocked; inbox reconciliation required")
             return False
@@ -1275,6 +1305,18 @@ class MupotAdapter(BasePlatformAdapter):
     async def _poll_loop(self) -> None:
         while self._running:
             try:
+                await self._replay_routine_events()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._set_fatal_error(
+                    "mupot_routine_event_reconciliation_required",
+                    "Mupot Routine event reconciliation is required",
+                    retryable=False,
+                )
+                logger.error("[mupot] Routine event replay requires reconciliation: %s", exc)
+                return
+            try:
                 await self._replay_reply_outbox()
             except asyncio.CancelledError:
                 raise
@@ -1331,21 +1373,7 @@ class MupotAdapter(BasePlatformAdapter):
                         message.get("delivery_attempts"),
                         message.get("request_id"),
                     )
-                    if message_id in self._state["processed"]:
-                        await self._ack_expected(message_id)
-                    elif is_ack_envelope(message) and should_accept_message(
-                        message, self.allowed_agents
-                    ):
-                        await self._handle_ack_envelope(message)
-                    elif should_accept_message(message, self.allowed_agents):
-                        await self._deliver(message)
-                    else:
-                        self._state["dlq"].append(
-                            {"message": message, "reason": "sender_policy"}
-                        )
-                        self._state["dlq"] = self._state["dlq"][-100:]
-                        self.store.save(self._state)
-                        await self._ack_expected(message_id)
+                    await self._process_leased_message(message)
                 self._clear_lease_fence()
             except asyncio.CancelledError:
                 raise
@@ -1353,6 +1381,94 @@ class MupotAdapter(BasePlatformAdapter):
                 self._quarantine_inbox_polling()
                 return
             await asyncio.sleep(self.poll_interval)
+
+    async def _process_leased_message(self, message: dict[str, Any]) -> None:
+        """Route one authenticated leased row without widening peer authority."""
+        from .routine_events import is_routine_event_candidate, quarantine_routine_event
+
+        message_id = str(message.get("id") or "")
+        if is_routine_event_candidate(message):
+            if self.routine_events_enabled:
+                await self._handle_routine_event(message)
+            else:
+                quarantine_routine_event(
+                    self._state, self.store, message, "routine_events_disabled"
+                )
+                await self._ack_expected(message_id)
+                self._commit(message_id)
+            return
+        if message_id in self._state["processed"]:
+            await self._ack_expected(message_id)
+            return
+        if is_ack_envelope(message) and should_accept_message(
+            message, self.allowed_agents
+        ):
+            await self._handle_ack_envelope(message)
+            return
+        if should_accept_message(message, self.allowed_agents):
+            await self._deliver(message)
+            return
+        self._state["dlq"].append({"message": message, "reason": "sender_policy"})
+        self._state["dlq"] = self._state["dlq"][-100:]
+        self.store.save(self._state)
+        await self._ack_expected(message_id)
+
+    async def _handle_routine_event(self, message: dict[str, Any]) -> None:
+        """Take custody, ACK exactly one source, then durably mark it processed."""
+        from .notifications import enqueue
+        from .routine_events import (
+            RoutineEventValidationError,
+            mark_routine_processed,
+            persist_routine_receipt,
+            quarantine_routine_event,
+            validate_routine_event,
+        )
+
+        message_id = str(message.get("id") or "")
+        try:
+            event = validate_routine_event(message)
+        except RoutineEventValidationError:
+            quarantine_routine_event(
+                self._state, self.store, message, "invalid_routine_event"
+            )
+            await self._ack_expected(message_id)
+            self._commit(message_id)
+            return
+
+        persist_routine_receipt(self._state, self.store, message, event)
+        enqueue(
+            self._state,
+            self.store,
+            message,
+            event.notice,
+            activation_required=True,
+            activation_after_processed=True,
+        )
+        await self._ack_expected(event.source_id)
+        mark_routine_processed(self._state, self.store, event.source_id)
+
+    async def _replay_routine_events(self) -> None:
+        """Close crash windows by retrying the exact source ACK before activation."""
+        from .notifications import enqueue
+        from .routine_events import (
+            mark_routine_processed,
+            pending_routine_receipts,
+            validate_routine_event,
+        )
+
+        for record in pending_routine_receipts(self._state):
+            source = record["source"]
+            event = validate_routine_event(source)
+            enqueue(
+                self._state,
+                self.store,
+                source,
+                event.notice,
+                activation_required=True,
+                activation_after_processed=True,
+            )
+            await self._ack_expected(event.source_id)
+            mark_routine_processed(self._state, self.store, event.source_id)
 
     async def _handle_ack_envelope(self, message: dict[str, Any]) -> None:
         """Quarantine incomplete ACKs; persist complete receipts before ACKing."""
@@ -1498,10 +1614,21 @@ class MupotAdapter(BasePlatformAdapter):
 
     async def _flush_notifications(self) -> None:
         from .notifications import flush
-        if self.notification_activate and self.message_injector is None:
+        if (
+            self.notification_activate or self.routine_events_enabled
+        ) and self.message_injector is None:
             raise RuntimeError("Mupot notification activation has no native plugin injector")
-        await flush(self._state, self.store, self.notification_recipients,
-                    activate=self.message_injector if self.notification_activate else None)
+        await flush(
+            self._state,
+            self.store,
+            self.notification_recipients,
+            activate=(
+                self.message_injector
+                if self.notification_activate or self.routine_events_enabled
+                else None
+            ),
+            activation_default=self.notification_activate,
+        )
 
     async def send(
         self,

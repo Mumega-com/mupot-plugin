@@ -165,7 +165,15 @@ def _persist_notice(state, store, candidate, source_id, expected):
     state.update(durable)
 
 
-def enqueue(state, store, source, text):
+def enqueue(
+    state,
+    store,
+    source,
+    text,
+    *,
+    activation_required=False,
+    activation_after_processed=False,
+):
     source_id = str(source.get("id") or "")
     if not source_id or not text.strip():
         raise NotificationCustodyError("Notification custody input is invalid")
@@ -193,6 +201,10 @@ def enqueue(state, store, source, text):
         existing_fingerprint = existing.get("source_fingerprint")
         if existing.get("text") != notice_text or (
             existing_fingerprint != fingerprint
+        ) or bool(existing.get("activation_required")) != bool(
+            activation_required
+        ) or bool(existing.get("activation_after_processed")) != bool(
+            activation_after_processed
         ):
             raise NotificationConflict("Notification source conflict")
         candidate = copy.deepcopy(durable)
@@ -249,15 +261,24 @@ def enqueue(state, store, source, text):
         "source_fingerprint": fingerprint,
         "text": notice_text,
     }
+    if activation_required:
+        expected["activation_required"] = True
+    if activation_after_processed:
+        expected["activation_after_processed"] = True
     outbox[source_id] = expected
     _persist_notice(state, store, candidate, source_id, expected)
 
 
-async def flush(state, store, recipients, *, activate=None):
+async def flush(state, store, recipients, *, activate=None, activation_default=False):
     if not recipients:
         return
     for source_id, notice in list(state["notification_outbox"].items()):
         if notice.get("status") in {"delivered", "transport_unknown", "activation_queued", "activation_unknown"} or notice.get("retry_at", 0) > time.time():
+            continue
+        if (
+            notice.get("activation_after_processed") is True
+            and source_id not in state.get("processed", [])
+        ):
             continue
         if notice.get("status") == "activating":
             notice.update(status="activation_unknown", activation_status="unknown",
@@ -282,7 +303,12 @@ async def flush(state, store, recipients, *, activate=None):
                 store.save(state)
             if recipients.get(target["platform"]) != target["user_id"]:
                 raise RuntimeError("Notification recipient is no longer configured")
-            if activate is not None:
+            should_activate = notice.get("activation_required") is True or (
+                activation_default and activate is not None
+            )
+            if should_activate:
+                if activate is None:
+                    raise RuntimeError("Human activation is unavailable")
                 if not target.get("session_key"):
                     raise RuntimeError("Human activation requires an existing gateway session key")
                 event = ("[Automated Mupot event " + source_id + "]\n"

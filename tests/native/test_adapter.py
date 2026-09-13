@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
+from contextvars import Context
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import ProcessingOutcome
 
 from plugin.mupot_gateway.adapter import (  # noqa: E402
     MupotProtocolError,
@@ -157,6 +161,42 @@ class ReconciliationClient(FakeMupotClient):
         raise AssertionError(f"unexpected reconciliation tool: {tool} {arguments}")
 
 
+class GenerationClient(FakeMupotClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.acked_ids: list[str] = []
+
+    async def call(self, tool: str, arguments: dict) -> dict:
+        if tool == "inbox_ack":
+            message_id = arguments["ids"][0]
+            self.acked_ids.append(message_id)
+            return {"acked": [message_id], "already_read": [], "refused": []}
+        return await super().call(tool, arguments)
+
+
+def delivery_message(
+    message_id: str,
+    *,
+    sender: str = "hadi-codex",
+    project: str = "project-1",
+    body: str = "run this turn",
+    lease_expires_at: str | None = None,
+) -> dict:
+    message = {
+        "id": message_id,
+        "seq": 7,
+        "from_agent": sender,
+        "body": body,
+        "project_id": project,
+        "request_id": f"request-{message_id}",
+        "in_reply_to": None,
+        "kind": "message",
+    }
+    if lease_expires_at is not None:
+        message["lease_expires_at"] = lease_expires_at
+    return message
+
+
 async def persist_ambiguous_lease_quarantine(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -233,6 +273,354 @@ def test_terminal_ack_requires_no_explicit_reply_expectation() -> None:
     assert not is_terminal_ack({"kind": "message", "expects_reply": False})
     assert is_ack_envelope({"kind": "ack", "body": "spoof"})
     assert not is_ack_envelope({"kind": "message", "expects_reply": False, "body": "{ack_for:x}"})
+
+
+@pytest.mark.asyncio
+async def test_send_without_delivery_context_fails_closed(tmp_path: Path) -> None:
+    client = GenerationClient()
+    adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "state.json")}),
+        client_factory=lambda *_: client,
+    )
+    adapter._begin_delivery(delivery_message("live-but-unbound"))
+
+    result = await Context().run(
+        lambda: asyncio.create_task(adapter.send("hadi-codex", "must not escape"))
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert client.sent == []
+
+
+@pytest.mark.asyncio
+async def test_wrong_recipient_and_inconsistent_callback_fail_closed(tmp_path: Path) -> None:
+    client = GenerationClient()
+    adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "state.json")}),
+        client_factory=lambda *_: client,
+    )
+    event, runtime = adapter._begin_delivery(delivery_message("source-context"))
+    await adapter.on_processing_start(event)
+
+    result = await adapter.send("other-agent", "misdirected")
+    event.raw_message = {**event.raw_message, "request_id": "other-request"}
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert result.success is False
+    assert client.sent == []
+    assert runtime.completion_event.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_callback_without_context_cannot_complete_live_generation(
+    tmp_path: Path,
+) -> None:
+    adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "state.json")}),
+        client_factory=lambda *_: GenerationClient(),
+    )
+    event, runtime = adapter._begin_delivery(delivery_message("source-no-context"))
+
+    task = Context().run(
+        lambda: asyncio.create_task(
+            adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        )
+    )
+    await task
+
+    assert runtime.completion_event.is_set() is False
+    assert runtime.outcome is None
+
+
+@pytest.mark.asyncio
+async def test_expired_leased_event_never_starts_model_work(tmp_path: Path) -> None:
+    client = GenerationClient()
+    adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "state.json")}),
+        client_factory=lambda *_: client,
+    )
+    handled: list[str] = []
+
+    async def handler(event):
+        handled.append(event.message_id)
+        return "unexpected"
+
+    adapter.set_message_handler(handler)
+    expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+
+    await adapter._deliver(delivery_message("expired", lease_expires_at=expired))
+
+    assert handled == []
+    assert client.sent == []
+    assert client.acked_ids == []
+
+
+@pytest.mark.asyncio
+async def test_queued_event_expiry_cancels_session_before_model_start(tmp_path: Path) -> None:
+    client = GenerationClient()
+    adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "state.json")}),
+        client_factory=lambda *_: client,
+    )
+    adapter.turn_timeout = 0.05
+    handled: list[str] = []
+
+    async def handler(event):
+        handled.append(event.message_id)
+        return "unexpected"
+
+    adapter.set_message_handler(handler)
+    message = delivery_message("queued-expiry")
+    preview = build_mupot_event(message, adapter.platform)
+    session_key = adapter._event_session_key(preview)
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._session_tasks[session_key] = blocker
+    adapter._background_tasks.add(blocker)
+    try:
+        await adapter._deliver(message)
+        assert handled == []
+        assert session_key not in adapter._pending_messages
+        assert blocker.cancelled()
+        assert client.sent == []
+    finally:
+        blocker.cancel()
+        await asyncio.gather(blocker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_timeout_invalidates_generation_before_bounded_cancellation(
+    tmp_path: Path,
+) -> None:
+    adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "state.json")}),
+        client_factory=lambda *_: GenerationClient(),
+    )
+    adapter.turn_timeout = 0.02
+    adapter.cancel_timeout = 0.02
+    cancellation_started = asyncio.Event()
+    registry_snapshots = []
+
+    async def handler(_event):
+        await asyncio.Event().wait()
+
+    async def stuck_cancel(session_key):
+        registry_snapshots.append((session_key, dict(adapter._live_generations)))
+        cancellation_started.set()
+        await asyncio.Event().wait()
+
+    adapter.set_message_handler(handler)
+    adapter.cancel_session_processing = stuck_cancel
+    started = time.monotonic()
+    await adapter._deliver(delivery_message("bounded-timeout"))
+    elapsed = time.monotonic() - started
+
+    assert cancellation_started.is_set()
+    assert registry_snapshots[0][1] == {}
+    assert elapsed < 0.2
+    pending = StateStore(tmp_path / "state.json").load()["pending"]
+    assert pending["message"]["id"] == "bounded-timeout"
+    await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_invalidates_generation_before_surviving_callback(
+    tmp_path: Path,
+) -> None:
+    client = GenerationClient()
+    adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "state.json")}),
+        client_factory=lambda *_: client,
+    )
+    adapter.turn_timeout = 1.0
+    started = asyncio.Event()
+    late_release = asyncio.Event()
+    late_done = asyncio.Event()
+    late_results = []
+    cancellation_snapshots = []
+    original_cancel = adapter.cancel_session_processing
+
+    async def checking_cancel(session_key):
+        cancellation_snapshots.append((session_key, dict(adapter._live_generations)))
+        await original_cancel(session_key)
+
+    adapter.cancel_session_processing = checking_cancel
+
+    async def handler(event):
+        async def finish_after_disconnect() -> None:
+            await late_release.wait()
+            late_results.append(await adapter.send(event.source.chat_id, "late output"))
+            late_done.set()
+
+        asyncio.create_task(finish_after_disconnect())
+        started.set()
+        await asyncio.Event().wait()
+
+    adapter.set_message_handler(handler)
+    delivery = asyncio.create_task(adapter._deliver(delivery_message("disconnect-source")))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        await adapter.disconnect()
+        await asyncio.wait_for(delivery, 1)
+        assert adapter._live_generations == {}
+        assert cancellation_snapshots[0][1] == {}
+
+        late_release.set()
+        await asyncio.wait_for(late_done.wait(), 1)
+        assert len(late_results) == 1
+        assert late_results[0].success is False
+        assert client.sent == []
+        pending = StateStore(tmp_path / "state.json").load()["pending"]
+        assert pending["message"]["id"] == "disconnect-source"
+    finally:
+        late_release.set()
+        await asyncio.gather(delivery, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_timed_out_thread_callback_cannot_send_with_next_delivery_context(
+    tmp_path: Path,
+) -> None:
+    client = GenerationClient()
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "state_path": str(tmp_path / "state.json"),
+                "notification_recipients": {"telegram": "owner"},
+            },
+        ),
+        client_factory=lambda *_: client,
+    )
+    adapter.turn_timeout = 0.05
+    thread_ready = threading.Event()
+    release_thread = threading.Event()
+    thread_done = threading.Event()
+    late_results = []
+    b_started = asyncio.Event()
+    release_b = asyncio.Event()
+    late_event = None
+
+    async def handler(event):
+        nonlocal late_event
+        if event.message_id == "source-a":
+            late_event = event
+            loop = asyncio.get_running_loop()
+
+            def late_thread_callback() -> None:
+                thread_ready.set()
+                release_thread.wait(2)
+                future = asyncio.run_coroutine_threadsafe(
+                    adapter.send(event.source.chat_id, "late A final"), loop
+                )
+                late_results.append(future.result(2))
+                completion = asyncio.run_coroutine_threadsafe(
+                    adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS), loop
+                )
+                completion.result(2)
+                thread_done.set()
+
+            await asyncio.to_thread(late_thread_callback)
+            return "late A handler return"
+        b_started.set()
+        await release_b.wait()
+        return "B final"
+
+    adapter.set_message_handler(handler)
+    a = delivery_message("source-a", sender="hadi-codex", project="project-a")
+    b = delivery_message("source-b", sender="kasra", project="project-b")
+    try:
+        await adapter._deliver(a)
+        assert thread_ready.wait(1)
+        adapter.turn_timeout = 1.0
+        b_delivery = asyncio.create_task(adapter._deliver(b))
+        await asyncio.wait_for(b_started.wait(), 1)
+        release_thread.set()
+        await asyncio.wait_for(asyncio.to_thread(thread_done.wait, 2), 3)
+
+        assert len(late_results) == 1
+        assert late_results[0].success is False
+        assert b_delivery.done() is False
+        assert client.sent == []
+        assert StateStore(tmp_path / "state.json").load().get("notification_outbox") == {}
+
+        release_b.set()
+        await asyncio.wait_for(b_delivery, 1)
+        assert client.sent == [
+            {
+                "to": "kasra",
+                "body": "B final",
+                "project_id": "project-b",
+                "request_id": "resp-source-b",
+                "in_reply_to": "source-b",
+            }
+        ]
+        notices = StateStore(tmp_path / "state.json").load()["notification_outbox"]
+        assert list(notices) == ["source-b"]
+        assert client.acked_ids == ["source-b"]
+    finally:
+        release_thread.set()
+        release_b.set()
+        await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_late_same_source_redelivery_cannot_complete_new_generation(
+    tmp_path: Path,
+) -> None:
+    client = GenerationClient()
+    adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "state.json")}),
+        client_factory=lambda *_: client,
+    )
+    adapter.turn_timeout = 0.05
+    late_release = asyncio.Event()
+    late_done = asyncio.Event()
+    b_started = asyncio.Event()
+    release_b = asyncio.Event()
+    handler_calls = 0
+
+    async def handler(event):
+        nonlocal handler_calls
+        handler_calls += 1
+        if handler_calls == 1:
+            async def finish_late() -> None:
+                await late_release.wait()
+                await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+                late_done.set()
+
+            asyncio.create_task(finish_late())
+            await asyncio.Event().wait()
+        b_started.set()
+        await release_b.wait()
+        return "redelivery final"
+
+    adapter.set_message_handler(handler)
+    message = delivery_message(
+        "same-source",
+        sender="hadi-codex",
+        project="same-project",
+        body="same body",
+    )
+    try:
+        await adapter._deliver(message)
+        adapter.turn_timeout = 1.0
+        b_delivery = asyncio.create_task(adapter._deliver(dict(message)))
+        await asyncio.wait_for(b_started.wait(), 1)
+        late_release.set()
+        await asyncio.wait_for(late_done.wait(), 1)
+        await asyncio.sleep(0)
+        assert b_delivery.done() is False
+        assert client.acked_ids == []
+
+        release_b.set()
+        await asyncio.wait_for(b_delivery, 1)
+        assert client.acked_ids == ["same-source"]
+    finally:
+        late_release.set()
+        release_b.set()
+        await adapter.cancel_background_tasks()
 
 
 @pytest.mark.asyncio

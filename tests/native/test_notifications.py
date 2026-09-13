@@ -45,6 +45,17 @@ def source(source_id="source-1", **updates):
     return value
 
 
+async def bind_delivery(adapter, source_message):
+    message = {
+        "body": "source request",
+        "kind": "message",
+        **source_message,
+    }
+    event, runtime = adapter._begin_delivery(message)
+    await adapter.on_processing_start(event)
+    return runtime
+
+
 def leased_source(source_id="source-fingerprint", **updates):
     value = {
         "seq": 41,
@@ -360,8 +371,11 @@ def test_adapter_preserves_legacy_root_and_pending_uncertain_notices(tmp_path):
     })
 
     adapter = adapter_at(tmp_path)
-    adapter._current_message = source("new-source")
-    result = asyncio.run(adapter.send("kasra", "New human notice."))
+    async def send_notice():
+        await bind_delivery(adapter, source("new-source"))
+        return await adapter.send("kasra", "New human notice.")
+
+    result = asyncio.run(send_notice())
 
     assert result.success is True
     persisted = StateStore(state_path).load()
@@ -466,7 +480,7 @@ async def test_crash_after_source_ack_before_processed_marker_retains_notice(tmp
 async def test_native_reply_enqueues_one_notification_and_skips_interim(tmp_path):
     """A successful Mupot response must persist a human notice before source completion."""
     adapter = adapter_at(tmp_path)
-    adapter._current_message = {"id": "source-1", "from_agent": "kasra", "request_id": "req-1"}
+    await bind_delivery(adapter, {"id": "source-1", "from_agent": "kasra", "request_id": "req-1"})
     assert (await adapter.send("kasra", "still working", metadata={"_interim_send": True})).success
     assert not StateStore(tmp_path / "inbox.json").load().get("notification_outbox")
     assert (await adapter.send("kasra", "Please review the deployment plan.")).success
@@ -504,7 +518,7 @@ async def test_persisted_notice_retries_independently_and_cannot_follow_other_us
     monkeypatch.setattr(notifications, "deliver_text", deliver)
     monkeypatch.setattr(notifications, "mirror_text", lambda target, text: mirror.append((target["session_id"], text)))
     adapter = adapter_at(tmp_path)
-    adapter._current_message = {"id": "source-1", "from_agent": "kasra", "request_id": "req-1"}
+    await bind_delivery(adapter, {"id": "source-1", "from_agent": "kasra", "request_id": "req-1"})
     assert (await adapter.send("kasra", "Ready for your review.")).success
     await adapter._flush_notifications()
     assert adapter._state["notification_outbox"]["source-1"]["status"] == "pending"
@@ -558,7 +572,7 @@ async def test_native_delivery_is_visible_in_real_human_conversation(tmp_path, m
             return None, Transport()
         monkeypatch.setattr(send_message_senders, "_live_adapter", connected)
         adapter = adapter_at(tmp_path)
-        adapter._current_message = {"id": "source-native", "from_agent": "kasra"}
+        await bind_delivery(adapter, {"id": "source-native", "from_agent": "kasra"})
         await adapter.send("kasra", "The requested work is ready to review.")
         await adapter._flush_notifications()
         assert len(delivered) == 1
@@ -598,7 +612,7 @@ async def test_mirror_retry_does_not_resend_to_human(tmp_path, monkeypatch):
         raise OSError("mirror unavailable")
     monkeypatch.setattr(notifications, "mirror_text", unavailable)
     adapter = adapter_at(tmp_path)
-    adapter._current_message = {"id": "source-mirror", "from_agent": "kasra"}
+    await bind_delivery(adapter, {"id": "source-mirror", "from_agent": "kasra"})
     await adapter.send("kasra", "Progress update.")
     await adapter._flush_notifications()
     restarted = adapter_at(tmp_path)
@@ -627,7 +641,7 @@ async def test_uncertain_delivery_never_resends_after_restart(tmp_path, monkeypa
             return SendResult(success=False, retryable=False, error="timed out")
     monkeypatch.setattr(send_message_senders, "_live_adapter", lambda _: (None, Transport()))
     adapter = adapter_at(tmp_path)
-    adapter._current_message = {"id": "uncertain-source", "from_agent": "kasra"}
+    await bind_delivery(adapter, {"id": "uncertain-source", "from_agent": "kasra"})
     await adapter.send("kasra", "One notification.")
     if failure == "crash":
         with pytest.raises(asyncio.CancelledError):
@@ -673,7 +687,7 @@ async def test_activation_queues_existing_human_conversation_instead_of_passive_
     adapter = adapter_at(tmp_path)
     adapter.notification_activate = True
     adapter.message_injector = lambda content, **kw: calls.append((content, kw)) or True
-    adapter._current_message = {"id": "activate-1", "from_agent": "kasra"}
+    await bind_delivery(adapter, {"id": "activate-1", "from_agent": "kasra"})
     await adapter.send("kasra", "The project needs your direction.")
     await adapter._flush_notifications()
     assert len(calls) == 1
@@ -766,7 +780,7 @@ async def test_registered_plugin_activates_native_gateway_and_preserves_control_
     monkeypatch.setattr(notifications, "active_sessions", lambda: [{
         "id": entry.session_id, "session_key": entry.session_key, "source": "telegram",
         "user_id": "owner", "chat_id": "123", "chat_type": "dm", "last_active": 1}])
-    adapter._current_message = {"id": "native-activation", "from_agent": "kasra"}
+    await bind_delivery(adapter, {"id": "native-activation", "from_agent": "kasra"})
     try:
         await adapter.send("kasra", "Status ready.")
         await adapter._flush_notifications()

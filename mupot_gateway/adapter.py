@@ -9,9 +9,12 @@ import math
 import os
 import time
 from collections import deque
-from dataclasses import replace
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from types import MappingProxyType
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -34,6 +37,37 @@ _SENSITIVE_MCP_RESPONSE_LIMIT = 64 * 1024
 _SENSITIVE_MCP_TOOLS = frozenset({"send", "inbox_ack", "inbox_consumer_status"})
 _GENERIC_MCP_PROTOCOL_ERROR = "Mupot MCP request failed"
 _GENERIC_MCP_TRANSPORT_ERROR = "Mupot request failed"
+_GENERIC_DELIVERY_CONTEXT_ERROR = "Mupot delivery context unavailable"
+_DELIVERY_CONTEXT_METADATA_KEY = "_mupot_delivery_context"
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryContext:
+    """Immutable authority for one leased message processing generation."""
+
+    source_id: str
+    generation: int
+    sender: str
+    project: Optional[str]
+    request_id: Optional[str]
+    session_key: str
+
+
+@dataclass(slots=True)
+class _LiveDelivery:
+    context: DeliveryContext
+    expires_at: float
+    source: Mapping[str, Any]
+    completion_event: asyncio.Event = field(default_factory=asyncio.Event)
+    outcome: Optional[ProcessingOutcome] = None
+    invalidated: bool = False
+    cancellation_started: bool = False
+
+
+_delivery_context: ContextVar[Optional[DeliveryContext]] = ContextVar(
+    "mupot_delivery_context",
+    default=None,
+)
 
 
 class MupotProtocolError(RuntimeError):
@@ -505,6 +539,7 @@ class MupotAdapter(BasePlatformAdapter):
         self.poll_interval = max(0.01, float(extra.get("poll_interval") or 2.0))
         self.rpc_timeout = max(5.0, float(extra.get("rpc_timeout") or 20.0))
         self.turn_timeout = max(10.0, float(extra.get("turn_timeout") or 300.0))
+        self.cancel_timeout = max(0.01, float(extra.get("cancel_timeout") or 6.0))
         requested_lease = float(extra.get("lease_seconds") or (self.turn_timeout + 60.0))
         self.lease_seconds = max(1, min(3600, int(requested_lease)))
         state_path = extra.get("state_path") or str(get_hermes_home() / "platforms" / "mupot" / "state.json")
@@ -534,11 +569,148 @@ class MupotAdapter(BasePlatformAdapter):
         self._client = client_factory(self.server_name)
         self._send_client = client_factory(self.server_name)
         self._poll_task: Optional[asyncio.Task] = None
-        self._completion_event = asyncio.Event()
-        self._completion_outcome: Optional[ProcessingOutcome] = None
-        self._current_message: Optional[dict[str, Any]] = None
+        self._delivery_generation = 0
+        self._live_generations: dict[int, _LiveDelivery] = {}
         self._consumer_fence: Optional[dict[str, Any]] = None
         self._lease_quarantined = self._state["lease_reconciliation"] is not None
+
+    def set_message_handler(
+        self,
+        handler: Callable[[MessageEvent], Awaitable[Any]],
+    ) -> None:
+        async def context_bound_handler(event: MessageEvent) -> Any:
+            runtime = self._runtime_for_event(event)
+            if runtime is None or self._expire_if_needed(runtime):
+                return None
+            _delivery_context.set(runtime.context)
+            return await handler(event)
+
+        super().set_message_handler(context_bound_handler)
+
+    @staticmethod
+    def _optional_text(value: Any) -> Optional[str]:
+        text = str(value or "").strip()
+        return text or None
+
+    def _delivery_deadline(self, message: dict[str, Any]) -> float:
+        deadline = time.time() + self.turn_timeout
+        raw_expiry = message.get("lease_expires_at")
+        if raw_expiry is None:
+            return deadline
+        if not isinstance(raw_expiry, str) or not raw_expiry.strip():
+            raise _protocol_error()
+        try:
+            parsed = datetime.fromisoformat(raw_expiry.strip().replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("timezone required")
+            lease_deadline = parsed.timestamp()
+        except (OverflowError, TypeError, ValueError):
+            raise _protocol_error() from None
+        if not math.isfinite(lease_deadline):
+            raise _protocol_error()
+        return min(deadline, lease_deadline)
+
+    def _begin_delivery(
+        self,
+        message: dict[str, Any],
+    ) -> tuple[MessageEvent, _LiveDelivery]:
+        event = build_mupot_event(message, self.platform)
+        source_id = str(message.get("id") or "").strip()
+        sender = normalize_agent(message.get("from_agent"))
+        session_key = str(self._event_session_key(event) or "").strip()
+        if not source_id or not sender or not session_key:
+            raise _protocol_error()
+        self._delivery_generation += 1
+        context = DeliveryContext(
+            source_id=source_id,
+            generation=self._delivery_generation,
+            sender=sender,
+            project=self._optional_text(message.get("project_id")),
+            request_id=self._optional_text(message.get("request_id")),
+            session_key=session_key,
+        )
+        runtime = _LiveDelivery(
+            context=context,
+            expires_at=self._delivery_deadline(message),
+            source=MappingProxyType(copy.deepcopy(message)),
+        )
+        metadata = dict(event.metadata or {})
+        metadata[_DELIVERY_CONTEXT_METADATA_KEY] = context
+        event.metadata = metadata
+        self._live_generations[context.generation] = runtime
+        return event, runtime
+
+    def _runtime_for_event(self, event: MessageEvent) -> Optional[_LiveDelivery]:
+        metadata = event.metadata or {}
+        marker = metadata.get(_DELIVERY_CONTEXT_METADATA_KEY)
+        if not isinstance(marker, DeliveryContext):
+            return None
+        runtime = self._live_generations.get(marker.generation)
+        if runtime is None or runtime.context is not marker or runtime.invalidated:
+            return None
+        raw_message = event.raw_message
+        if not isinstance(raw_message, dict):
+            return None
+        if (
+            str(event.message_id or "").strip() != marker.source_id
+            or str(raw_message.get("id") or "").strip() != marker.source_id
+            or normalize_agent(event.source.chat_id) != marker.sender
+            or normalize_agent(raw_message.get("from_agent")) != marker.sender
+            or self._optional_text(metadata.get("project_id")) != marker.project
+            or self._optional_text(raw_message.get("project_id")) != marker.project
+            or self._optional_text(metadata.get("request_id")) != marker.request_id
+            or self._optional_text(raw_message.get("request_id")) != marker.request_id
+            or str(self._event_session_key(event) or "").strip() != marker.session_key
+        ):
+            return None
+        return runtime
+
+    def _runtime_for_current_context(self) -> Optional[_LiveDelivery]:
+        context = _delivery_context.get()
+        if context is None:
+            return None
+        runtime = self._live_generations.get(context.generation)
+        if runtime is None or runtime.context is not context or runtime.invalidated:
+            return None
+        if self._expire_if_needed(runtime):
+            return None
+        return runtime
+
+    def _invalidate_delivery(
+        self,
+        runtime: _LiveDelivery,
+        outcome: ProcessingOutcome = ProcessingOutcome.FAILURE,
+    ) -> None:
+        current = self._live_generations.get(runtime.context.generation)
+        if current is runtime:
+            self._live_generations.pop(runtime.context.generation, None)
+        runtime.invalidated = True
+        if runtime.outcome is None:
+            runtime.outcome = outcome
+        runtime.completion_event.set()
+
+    def _expire_if_needed(self, runtime: _LiveDelivery) -> bool:
+        if runtime.invalidated or time.time() >= runtime.expires_at:
+            self._invalidate_delivery(runtime)
+            return True
+        return False
+
+    async def _cancel_delivery_processing(self, runtime: _LiveDelivery) -> None:
+        if runtime.cancellation_started:
+            return
+        runtime.cancellation_started = True
+        try:
+            await asyncio.wait_for(
+                self.cancel_session_processing(runtime.context.session_key),
+                timeout=self.cancel_timeout,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "[mupot] bounded session cancellation did not complete session=%s",
+                runtime.context.session_key,
+            )
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if self._lease_quarantined:
@@ -590,6 +762,13 @@ class MupotAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._running = False
+        live = list(self._live_generations.values())
+        for runtime in live:
+            self._invalidate_delivery(runtime)
+        await asyncio.gather(
+            *(self._cancel_delivery_processing(runtime) for runtime in live),
+            return_exceptions=True,
+        )
         task, self._poll_task = self._poll_task, None
         if task is not None:
             task.cancel()
@@ -780,8 +959,6 @@ class MupotAdapter(BasePlatformAdapter):
                         await self._handle_ack_envelope(message)
                     elif should_accept_message(message, self.allowed_agents):
                         await self._deliver(message)
-                        if message_id not in self._state["processed"]:
-                            raise _protocol_error()
                     else:
                         self._state["dlq"].append(
                             {"message": message, "reason": "sender_policy"}
@@ -826,26 +1003,52 @@ class MupotAdapter(BasePlatformAdapter):
         message_id = str(message.get("id") or "")
         self._state["pending"] = {"message": message}
         self.store.save(self._state)
-        self._current_message = message
-        self._completion_event.clear()
-        self._completion_outcome = None
-        await self.handle_message(build_mupot_event(message, self.platform))
+        event, runtime = self._begin_delivery(message)
+        if self._expire_if_needed(runtime):
+            logger.warning("[mupot] refusing expired leased message=%s", message_id)
+            self.store.save(self._state)
+            return
+        token = _delivery_context.set(runtime.context)
         try:
-            await asyncio.wait_for(self._completion_event.wait(), self.turn_timeout)
+            await self.handle_message(event)
+        finally:
+            _delivery_context.reset(token)
+        timed_out = False
+        try:
+            remaining = max(0.0, runtime.expires_at - time.time())
+            await asyncio.wait_for(runtime.completion_event.wait(), remaining)
         except asyncio.TimeoutError:
-            self._completion_outcome = ProcessingOutcome.FAILURE
+            timed_out = True
+            self._invalidate_delivery(runtime)
             logger.error("[mupot] turn timeout message=%s", message_id)
-        if self._completion_outcome == ProcessingOutcome.SUCCESS:
+        except asyncio.CancelledError:
+            self._invalidate_delivery(runtime, ProcessingOutcome.CANCELLED)
+            await self._cancel_delivery_processing(runtime)
+            self.store.save(self._state)
+            raise
+        if timed_out or runtime.invalidated and runtime.outcome != ProcessingOutcome.SUCCESS:
+            await self._cancel_delivery_processing(runtime)
+            self.store.save(self._state)
+            return
+        self._invalidate_delivery(
+            runtime,
+            runtime.outcome or ProcessingOutcome.FAILURE,
+        )
+        if runtime.outcome == ProcessingOutcome.SUCCESS:
             await self._ack_expected(message_id)
             self._commit(message_id)
-            self._current_message = None
             return
         # Do not acknowledge failure and do not immediately replay locally.
         # The server-side visibility lease expires, retries safely, and moves
         # poison messages to Mupot's durable dead-letter state.
-        self._state["pending"] = None
         self.store.save(self._state)
-        self._current_message = None
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        runtime = self._runtime_for_event(event)
+        if runtime is None or self._expire_if_needed(runtime):
+            _delivery_context.set(None)
+            return
+        _delivery_context.set(runtime.context)
 
     async def _ack_expected(self, expected_id: str) -> None:
         payload = await self._call_consumer(
@@ -884,23 +1087,27 @@ class MupotAdapter(BasePlatformAdapter):
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
-        event_id = str(event.message_id or "")
-        current_id = str((self._current_message or {}).get("id") or "")
-        if not current_id or event_id != current_id:
+        runtime = self._runtime_for_event(event)
+        current = _delivery_context.get()
+        if (
+            runtime is None
+            or current is None
+            or runtime.context is not current
+            or self._expire_if_needed(runtime)
+        ):
             logger.debug(
-                "[mupot] ignoring lifecycle completion event=%s current=%s outcome=%s",
-                event_id,
-                current_id,
+                "[mupot] ignoring unbound lifecycle completion event=%s outcome=%s",
+                event.message_id,
                 outcome,
             )
             return
         logger.info(
             "[mupot] lifecycle complete message=%s outcome=%s",
-            current_id,
+            runtime.context.source_id,
             outcome,
         )
-        self._completion_outcome = outcome
-        self._completion_event.set()
+        runtime.outcome = outcome
+        runtime.completion_event.set()
 
     async def _flush_notifications(self) -> None:
         from .notifications import flush
@@ -916,20 +1123,49 @@ class MupotAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
-        message = self._current_message or {}
+        runtime = self._runtime_for_current_context()
+        context = runtime.context if runtime is not None else None
+        recipient = normalize_agent(chat_id)
+        metadata = metadata or {}
+        context_consistent = (
+            context is not None
+            and recipient == context.sender
+            and (reply_to is None or str(reply_to) == context.source_id)
+            and (
+                "project_id" not in metadata
+                or self._optional_text(metadata.get("project_id")) == context.project
+            )
+            and (
+                "request_id" not in metadata
+                or self._optional_text(metadata.get("request_id")) == context.request_id
+            )
+            and (
+                "mupot_message_id" not in metadata
+                or str(metadata.get("mupot_message_id") or "") == context.source_id
+            )
+        )
+        if not context_consistent:
+            logger.warning("[mupot] response send refused without live delivery context")
+            return SendResult(
+                success=False,
+                error=_GENERIC_DELIVERY_CONTEXT_ERROR,
+                retryable=False,
+                error_kind="unknown",
+            )
         arguments: dict[str, Any] = {
-            "to": normalize_agent(chat_id),
+            "to": recipient,
             "body": str(content),
         }
-        project_id = message.get("project_id")
-        request_id = message.get("request_id")
-        inbound_id = message.get("id")
-        if project_id:
-            arguments["project_id"] = project_id
-        if inbound_id:
-            arguments["in_reply_to"] = inbound_id
+        assert runtime is not None
+        assert context is not None
+        request_id = context.request_id
+        inbound_id = context.source_id
+        if context.project:
+            arguments["project_id"] = context.project
+        if context.source_id:
+            arguments["in_reply_to"] = context.source_id
             # Distinct sender idempotency key per inbound turn redelivery:
-            arguments["request_id"] = f"resp-{inbound_id}"
+            arguments["request_id"] = f"resp-{context.source_id}"
         elif request_id:
             arguments["request_id"] = f"resp-{request_id}"
         try:
@@ -942,9 +1178,9 @@ class MupotAdapter(BasePlatformAdapter):
                 arguments["to"],
                 arguments.get("project_id"),
             )
-            if self.notification_recipients and inbound_id and not (metadata or {}).get("_interim_send"):
+            if self.notification_recipients and inbound_id and not metadata.get("_interim_send"):
                 from .notifications import enqueue
-                enqueue(self._state, self.store, message, str(content))
+                enqueue(self._state, self.store, dict(runtime.source), str(content))
             return SendResult(
                 success=True,
                 message_id=receipt["id"],

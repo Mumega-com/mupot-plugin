@@ -436,7 +436,7 @@ def concrete_receipt() -> dict[str, Any]:
     }
 
 
-def adapter_for_receipt(tmp_path: Path, receipt: Any) -> MupotAdapter:
+async def adapter_for_receipt(tmp_path: Path, receipt: Any) -> MupotAdapter:
     client = ReceiptClient(receipt)
     adapter = MupotAdapter(
         PlatformConfig(
@@ -445,18 +445,22 @@ def adapter_for_receipt(tmp_path: Path, receipt: Any) -> MupotAdapter:
         ),
         client_factory=lambda _server: client,
     )
-    adapter._current_message = {
+    event, _runtime = adapter._begin_delivery({
         "id": "source-1",
+        "from_agent": "agent-target",
+        "body": "request",
         "request_id": "request-1",
         "project_id": "project-1",
-    }
+    })
+    await adapter.on_processing_start(event)
     return adapter
 
 
 @pytest.mark.asyncio
 async def test_send_accepts_concrete_matching_server_receipt(tmp_path: Path) -> None:
     receipt = concrete_receipt()
-    result = await adapter_for_receipt(tmp_path, receipt).send("agent-target", "answer")
+    adapter = await adapter_for_receipt(tmp_path, receipt)
+    result = await adapter.send("agent-target", "answer")
 
     assert result.success is True
     assert result.message_id == "delivery-1"
@@ -483,7 +487,8 @@ async def test_send_rejects_missing_invalid_or_misattributed_receipt_permanently
     tmp_path: Path,
     receipt: dict[str, Any],
 ) -> None:
-    result = await adapter_for_receipt(tmp_path, receipt).send("agent-target", "answer")
+    adapter = await adapter_for_receipt(tmp_path, receipt)
+    result = await adapter.send("agent-target", "answer")
 
     assert result.success is False
     assert result.message_id is None

@@ -26,23 +26,168 @@ from ..profile_scope import read_profile_secret, require_supported_profile_runti
 logger = logging.getLogger(__name__)
 
 
-def unwrap_tool_payload(value: Any) -> Any:
-    current = value
-    for _ in range(6):
-        if isinstance(current, str):
-            try:
-                current = json.loads(current)
-            except json.JSONDecodeError:
-                return current
-            continue
-        if isinstance(current, dict) and set(current) == {"result"}:
-            current = current["result"]
-            continue
-        if isinstance(current, dict) and current.get("ok") is True and "result" in current:
-            current = current["result"]
-            continue
-        break
-    return current
+_ABSOLUTE_MCP_RESPONSE_LIMIT = 1024 * 1024
+_SENSITIVE_MCP_RESPONSE_LIMIT = 64 * 1024
+_SENSITIVE_MCP_TOOLS = frozenset({"send", "inbox_ack", "inbox_consumer_status"})
+_GENERIC_MCP_PROTOCOL_ERROR = "Mupot MCP request failed"
+_GENERIC_MCP_TRANSPORT_ERROR = "Mupot request failed"
+
+
+class MupotProtocolError(RuntimeError):
+    """A permanent, detail-free refusal of an invalid MCP response."""
+
+
+class MupotTransportError(RuntimeError):
+    """A detail-free transport failure whose server outcome may be unknown."""
+
+
+def _protocol_error() -> MupotProtocolError:
+    return MupotProtocolError(_GENERIC_MCP_PROTOCOL_ERROR)
+
+
+def _decode_text_wrapper(value: Any, tool: str) -> Any:
+    if not isinstance(value, str):
+        raise _protocol_error()
+    try:
+        wrapper = json.loads(value)
+    except (json.JSONDecodeError, UnicodeError, TypeError):
+        raise _protocol_error() from None
+    if (
+        not isinstance(wrapper, dict)
+        or set(wrapper) != {"ok", "tool", "result"}
+        or wrapper.get("ok") is not True
+        or wrapper.get("tool") != tool
+    ):
+        raise _protocol_error()
+    return wrapper["result"]
+
+
+def decode_mcp_result(payload: Any, request_id: int, tool: str) -> dict[str, Any]:
+    """Validate one correlated JSON-RPC tools/call result and unwrap its data."""
+    if (
+        not isinstance(payload, dict)
+        or payload.get("jsonrpc") != "2.0"
+        or type(payload.get("id")) is not int
+        or payload.get("id") != request_id
+    ):
+        raise _protocol_error()
+
+    has_result = "result" in payload
+    has_error = "error" in payload
+    if has_result == has_error or has_error:
+        raise _protocol_error()
+
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise _protocol_error()
+    if "isError" in result and result.get("isError") is not False:
+        raise _protocol_error()
+
+    has_content = "content" in result
+    has_structured = "structuredContent" in result
+    if not has_content and not has_structured:
+        raise _protocol_error()
+
+    text_value: Any = None
+    if has_content:
+        content = result.get("content")
+        if not isinstance(content, list):
+            raise _protocol_error()
+        if len(content) == 0:
+            if not has_structured:
+                raise _protocol_error()
+        elif len(content) == 1:
+            item = content[0]
+            if not isinstance(item, dict) or item.get("type") != "text":
+                raise _protocol_error()
+            text_value = _decode_text_wrapper(item.get("text"), tool)
+        else:
+            raise _protocol_error()
+
+    structured_value = result.get("structuredContent") if has_structured else None
+    if has_structured and not isinstance(structured_value, dict):
+        raise _protocol_error()
+    if text_value is not None and not isinstance(text_value, dict):
+        raise _protocol_error()
+    if text_value is not None and has_structured and text_value != structured_value:
+        raise _protocol_error()
+
+    value = structured_value if has_structured else text_value
+    if not isinstance(value, dict):
+        raise _protocol_error()
+    return value
+
+
+def validate_send_receipt(
+    result: Any,
+    to: str,
+    project_id: Optional[str],
+) -> dict[str, Any]:
+    """Require proof that Mupot durably accepted the exact outbound message."""
+    if not isinstance(result, dict):
+        raise _protocol_error()
+    delivery_id = result.get("id")
+    sequence = result.get("seq")
+    if not isinstance(delivery_id, str) or not delivery_id.strip():
+        raise _protocol_error()
+    if type(sequence) is not int or sequence <= 0:
+        raise _protocol_error()
+    if type(result.get("duplicate")) is not bool:
+        raise _protocol_error()
+    if result.get("to") != to:
+        raise _protocol_error()
+    if "project_id" not in result or result.get("project_id") != project_id:
+        raise _protocol_error()
+    return result
+
+
+def _response_limit(tool: str) -> int:
+    if tool in _SENSITIVE_MCP_TOOLS:
+        return _SENSITIVE_MCP_RESPONSE_LIMIT
+    return _ABSOLUTE_MCP_RESPONSE_LIMIT
+
+
+async def _read_mcp_response(response: httpx.Response, tool: str) -> Any:
+    limit = _response_limit(tool)
+    content_type = str(response.headers.get("content-type") or "")
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    if not (
+        media_type == "application/json"
+        or (media_type.startswith("application/") and media_type.endswith("+json"))
+    ):
+        raise _protocol_error()
+
+    encoding = str(response.headers.get("content-encoding") or "").strip().lower()
+    if encoding and any(value.strip() != "identity" for value in encoding.split(",")):
+        raise _protocol_error()
+
+    declared: Optional[int] = None
+    raw_length = response.headers.get("content-length")
+    if raw_length is not None:
+        text_length = str(raw_length).strip()
+        if not text_length.isascii() or not text_length.isdigit():
+            raise _protocol_error()
+        declared = int(text_length)
+        if declared > limit:
+            raise _protocol_error()
+
+    if response.status_code < 200 or response.status_code >= 300:
+        raise _protocol_error()
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_raw():
+        total += len(chunk)
+        if total > limit:
+            raise _protocol_error()
+        chunks.append(chunk)
+    if declared is not None and total != declared:
+        raise _protocol_error()
+
+    try:
+        return json.loads(b"".join(chunks).decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeError):
+        raise _protocol_error() from None
 
 
 def normalize_agent(value: Any) -> str:
@@ -198,66 +343,41 @@ class HermesMCPClient:
 
     async def call(self, tool: str, arguments: dict[str, Any]) -> Any:
         async with self._lock:
-            for attempt in range(2):
-                await self._ensure_client_locked()
-                self._request_id += 1
-                req_id = self._request_id
-                body = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "method": "tools/call",
-                    "params": {
-                        "name": tool,
-                        "arguments": arguments,
-                    },
-                }
+            await self._ensure_client_locked()
+            self._request_id += 1
+            req_id = self._request_id
+            body = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {
+                    "name": tool,
+                    "arguments": arguments,
+                },
+            }
+            token = read_profile_secret("MUPOT_AGENT_TOKEN")
+            headers = {**self._headers, "Authorization": f"Bearer {token}"}
+            client = self._client
+            url = self._url
+            if client is None or url is None:
+                raise MupotTransportError(_GENERIC_MCP_TRANSPORT_ERROR)
+            try:
+                async with client.stream(
+                    "POST", url, json=body, headers=headers
+                ) as response:
+                    payload = await _read_mcp_response(response, tool)
+            except MupotProtocolError:
+                raise
+            except Exception:
+                logger.warning("[mupot] MCP request failed; resetting client")
                 try:
-                    token = read_profile_secret("MUPOT_AGENT_TOKEN")
-                    headers = {**self._headers, "Authorization": f"Bearer {token}"}
-                    client = self._client
-                    url = self._url
-                    if client is None or url is None:
-                        raise RuntimeError("Mupot request client is unavailable")
-                    response = await client.post(url, json=body, headers=headers)
-                    data = response.json()
-                    break
+                    await client.aclose()
                 except Exception:
-                    if attempt == 0:
-                        logger.warning(
-                            "[mupot] MCP request failed; resetting client"
-                        )
-                        if self._client is not None:
-                            try:
-                                await self._client.aclose()
-                            except Exception:
-                                pass
-                            self._client = None
-                    else:
-                        raise RuntimeError("Mupot request failed") from None
+                    pass
+                self._client = None
+                raise MupotTransportError(_GENERIC_MCP_TRANSPORT_ERROR) from None
 
-        if not isinstance(data, dict):
-            raise RuntimeError("Mupot MCP request failed")
-        if "error" in data:
-            raise RuntimeError("Mupot MCP request failed")
-
-        result = data.get("result", {})
-        if not isinstance(result, dict):
-            raise RuntimeError("Mupot MCP request failed")
-        if bool(result.get("isError", False)):
-            raise RuntimeError("Mupot MCP request failed")
-
-        content = result.get("content", [])
-        texts = [
-            item.get("text")
-            for item in content
-            if isinstance(item, dict) and item.get("text")
-        ]
-        if texts:
-            return unwrap_tool_payload(texts[0])
-        structured = result.get("structuredContent")
-        if structured is not None:
-            return unwrap_tool_payload(structured)
-        return unwrap_tool_payload(result)
+        return decode_mcp_result(payload, req_id, tool)
 
     async def close(self) -> None:
         async with self._lock:
@@ -344,12 +464,15 @@ class MupotAdapter(BasePlatformAdapter):
                 self._client.call("inbox_consumer_status", {}),
                 timeout=self.rpc_timeout,
             )
-            if not isinstance(fence, dict) or fence.get("key_matches") is False:
-                raise RuntimeError("Mupot inbox consumer fence does not match")
-            if fence.get("mode") not in {"bearer_only", "gateway"}:
-                raise RuntimeError(
-                    f"unsupported Mupot inbox consumer mode: {fence.get('mode')}"
-                )
+            generation = fence.get("generation") if isinstance(fence, dict) else None
+            if (
+                not isinstance(fence, dict)
+                or fence.get("key_matches") is not True
+                or fence.get("mode") not in {"bearer_only", "gateway"}
+                or type(generation) is not int
+                or generation < 0
+            ):
+                raise _protocol_error()
             self._mark_connected()
             self._poll_task = asyncio.create_task(
                 self._poll_loop(), name="hermes-mupot-inbox-poller"
@@ -486,16 +609,23 @@ class MupotAdapter(BasePlatformAdapter):
             timeout=self.rpc_timeout,
         )
         if not isinstance(payload, dict):
-            raise RuntimeError("Mupot inbox_ack returned an invalid payload")
-        acked = {str(value) for value in payload.get("acked", [])}
-        already_read = {str(value) for value in payload.get("already_read", [])}
-        refused = {str(value) for value in payload.get("refused", [])}
-        if expected_id in refused or expected_id not in acked | already_read:
-            raise RuntimeError(
-                f"Mupot ack mismatch: expected {expected_id}, "
-                f"acked={sorted(acked)}, already_read={sorted(already_read)}, "
-                f"refused={sorted(refused)}"
-            )
+            raise _protocol_error()
+        categories: list[set[str]] = []
+        for name in ("acked", "already_read", "refused"):
+            values = payload.get(name)
+            if (
+                not isinstance(values, list)
+                or any(not isinstance(value, str) or not value.strip() for value in values)
+            ):
+                raise _protocol_error()
+            category = set(values)
+            if category - {expected_id}:
+                raise _protocol_error()
+            categories.append(category)
+        acked, already_read, refused = categories
+        matched = sum(expected_id in category for category in categories)
+        if expected_id in refused or matched != 1:
+            raise _protocol_error()
         state = "acked" if expected_id in acked else "already_read"
         logger.info("[mupot] inbox_ack message=%s state=%s", expected_id, state)
 
@@ -563,14 +693,21 @@ class MupotAdapter(BasePlatformAdapter):
                 self._send_client.call("send", arguments),
                 timeout=self.rpc_timeout,
             )
-            message_id = None
-            if isinstance(result, dict):
-                message_id = str(result.get("id") or result.get("message_id") or "") or None
+            receipt = validate_send_receipt(
+                result,
+                arguments["to"],
+                arguments.get("project_id"),
+            )
             if self.notification_recipients and inbound_id and not (metadata or {}).get("_interim_send"):
                 from .notifications import enqueue
                 enqueue(self._state, self.store, message, str(content))
-            return SendResult(success=True, message_id=message_id, raw_response=result)
+            return SendResult(
+                success=True,
+                message_id=receipt["id"],
+                raw_response=receipt,
+            )
         except Exception as exc:
+            permanent = isinstance(exc, MupotProtocolError)
             logger.warning(
                 "[mupot] response send failed message=%s request_id=%s error=%s",
                 inbound_id,
@@ -580,8 +717,8 @@ class MupotAdapter(BasePlatformAdapter):
             return SendResult(
                 success=False,
                 error=str(exc),
-                retryable=True,
-                error_kind="transient",
+                retryable=not permanent,
+                error_kind="unknown" if permanent else "transient",
             )
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:

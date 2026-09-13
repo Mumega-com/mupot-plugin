@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 from pathlib import Path
 
 import pytest
@@ -54,7 +53,14 @@ class FakeMupotClient:
             return {"acked": ["m-1"], "already_read": [], "refused": []}
         if tool == "send":
             self.sent.append(arguments)
-            return {"id": "m-2", "seq": 8}
+            return {
+                "id": "m-2",
+                "seq": 8,
+                "duplicate": False,
+                "to": arguments["to"],
+                "project_id": arguments.get("project_id"),
+                "target_seat": None,
+            }
         if tool == "inbox_consumer_status":
             return {"mode": "bearer_only", "generation": 0, "key_matches": True}
         raise AssertionError(f"unexpected tool: {tool} {arguments}")

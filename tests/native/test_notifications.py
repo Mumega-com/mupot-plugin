@@ -12,7 +12,14 @@ from gateway.config import PlatformConfig
 class Client:
     async def call(self, tool, arguments):
         assert tool == "send"
-        return {"id": "reply-1", "seq": 8, "duplicate": False}
+        return {
+            "id": "reply-1",
+            "seq": 8,
+            "duplicate": False,
+            "to": arguments["to"],
+            "project_id": arguments.get("project_id"),
+            "target_seat": None,
+        }
 
 
 def adapter_at(tmp_path):

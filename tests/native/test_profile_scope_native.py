@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, AsyncIterator
+
+import json
 
 import pytest
 
@@ -116,9 +118,25 @@ class JsonRpcResponse:
             "id": 1,
             "result": {"structuredContent": {"ok": True}},
         }
+        self.headers = {"content-type": "application/json"}
+        self.status_code = 200
 
     def json(self) -> Any:
         return self.payload
+
+    async def aiter_raw(self) -> AsyncIterator[bytes]:
+        yield json.dumps(self.payload).encode("utf-8")
+
+
+class StreamContext:
+    def __init__(self, response: JsonRpcResponse) -> None:
+        self.response = response
+
+    async def __aenter__(self) -> JsonRpcResponse:
+        return self.response
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
 
 
 class HttpClient:
@@ -139,6 +157,21 @@ class HttpClient:
             {"url": url, "json": json, "headers": headers or self.headers}
         )
         return JsonRpcResponse()
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, Any],
+        headers: dict[str, str] | None = None,
+    ) -> StreamContext:
+        self.calls.append(
+            {"method": method, "url": url, "json": json, "headers": headers or self.headers}
+        )
+        response = JsonRpcResponse()
+        response.payload["id"] = json["id"]
+        return StreamContext(response)
 
     async def aclose(self) -> None:
         self.is_closed = True
@@ -212,17 +245,18 @@ async def test_mupot_client_never_propagates_server_controlled_error_detail(
     install_mcp_config(monkeypatch)
 
     class ErrorHttpClient(HttpClient):
-        async def post(
+        def stream(
             self,
+            method: str,
             url: str,
             *,
             json: dict[str, Any],
             headers: dict[str, str] | None = None,
-        ) -> JsonRpcResponse:
+        ) -> StreamContext:
             self.calls.append(
-                {"url": url, "json": json, "headers": headers or self.headers}
+                {"method": method, "url": url, "json": json, "headers": headers or self.headers}
             )
-            return JsonRpcResponse(payload)
+            return StreamContext(JsonRpcResponse(payload))
 
     monkeypatch.setattr(adapter_module.httpx, "AsyncClient", ErrorHttpClient)
     token = set_secret_scope({"MUPOT_AGENT_TOKEN": "profile-agent-token"})

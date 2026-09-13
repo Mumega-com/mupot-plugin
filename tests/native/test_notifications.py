@@ -45,6 +45,138 @@ def source(source_id="source-1", **updates):
     return value
 
 
+def leased_source(source_id="source-fingerprint", **updates):
+    value = {
+        "seq": 41,
+        "id": source_id,
+        "tenant": "tenant-mumega",
+        "to_agent": "agent-hermes",
+        "target_seat": "kayhermes",
+        "from_agent": "kasra",
+        "from_member": "member-kasra",
+        "kind": "ack",
+        "body": "Original source envelope body.",
+        "request_id": "request-fingerprint",
+        "in_reply_to": "request-parent",
+        "created_at": "2026-09-13T10:00:00.000Z",
+        "project_id": "project-one",
+        "fenced_delivery_id": "delivery-one",
+        "body_length": 30,
+        "checksum_sha256": "a" * 64,
+        "expects_reply": False,
+        "reply_basis": "request_id_field",
+        "delivery_attempts": 1,
+        "lease_expires_at": "2026-09-13T10:05:00.000Z",
+    }
+    value.update(updates)
+    return value
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("seq", 42),
+        ("tenant", "tenant-other"),
+        ("to_agent", "agent-other"),
+        ("target_seat", "other-seat"),
+        ("from_agent", "other-agent"),
+        ("from_member", "member-other"),
+        ("kind", "request"),
+        ("body", "Conflicting source envelope body."),
+        ("request_id", "request-other"),
+        ("in_reply_to", "request-other-parent"),
+        ("created_at", "2026-09-13T10:00:01.000Z"),
+        ("project_id", "project-other"),
+        ("fenced_delivery_id", "delivery-other"),
+        ("body_length", 31),
+        ("checksum_sha256", "b" * 64),
+        ("expects_reply", True),
+        ("reply_basis", "body_token"),
+    ],
+)
+def test_source_fingerprint_conflicts_on_each_immutable_envelope_field(
+    tmp_path, field, replacement
+):
+    """Changing any immutable source fact under one ID must preserve the first notice."""
+    from plugin.mupot_gateway.notifications import enqueue
+
+    state = {"notification_outbox": {}}
+    store = StateStore(tmp_path / "inbox.json")
+    original_source = leased_source()
+    enqueue(state, store, original_source, "Exact human notice.")
+    original_state = copy.deepcopy(store.load())
+    conflicting_source = {**original_source, field: replacement}
+
+    with pytest.raises(RuntimeError, match="conflict"):
+        enqueue(state, store, conflicting_source, "Exact human notice.")
+    assert store.load() == original_state
+    assert state == original_state
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [("from_member", "member-other"), ("target_seat", "other-seat")],
+)
+@pytest.mark.asyncio
+async def test_restart_redelivery_identity_or_seat_conflict_never_reaches_source_ack(
+    tmp_path, field, replacement
+):
+    """Restart must not turn changed principal or seat routing into a duplicate success."""
+    class CrashBeforeAck:
+        async def call(self, tool, args):
+            raise OSError("crash before source ACK")
+
+    original_source = leased_source("terminal-routing")
+    first = adapter_at(tmp_path)
+    first._client = CrashBeforeAck()
+    with pytest.raises(OSError, match="crash before source ACK"):
+        await first._handle_ack_envelope(original_source)
+    original_state = copy.deepcopy(StateStore(tmp_path / "inbox.json").load())
+
+    ack_calls = []
+
+    class AckClient:
+        async def call(self, tool, args):
+            ack_calls.append((tool, args))
+            return {"acked": ["terminal-routing"], "already_read": [], "refused": []}
+
+    restarted = adapter_at(tmp_path)
+    restarted._client = AckClient()
+    conflicting_source = {**original_source, field: replacement}
+    with pytest.raises(RuntimeError, match="conflict"):
+        await restarted._handle_ack_envelope(conflicting_source)
+    assert ack_calls == []
+    assert StateStore(tmp_path / "inbox.json").load() == original_state
+
+
+def test_source_fingerprint_excludes_mutable_lease_retry_metadata(tmp_path):
+    """Normal redelivery may change lease counters/deadlines without changing source custody."""
+    from plugin.mupot_gateway.notifications import enqueue
+
+    state = {"notification_outbox": {}}
+    store = StateStore(tmp_path / "inbox.json")
+    enqueue(state, store, leased_source(), "Exact human notice.")
+    original_state = copy.deepcopy(store.load())
+    original_fingerprint = original_state["notification_outbox"][
+        "source-fingerprint"
+    ]["source_fingerprint"]
+
+    restarted_state = store.load()
+    enqueue(
+        restarted_state,
+        store,
+        leased_source(
+            delivery_attempts=5,
+            lease_expires_at="2026-09-13T10:30:00.000Z",
+        ),
+        "Exact human notice.",
+    )
+    assert restarted_state == original_state
+    assert restarted_state["notification_outbox"]["source-fingerprint"][
+        "source_fingerprint"
+    ] == original_fingerprint
+
+
 def test_enqueue_failed_save_is_copy_on_write_and_retry_establishes_custody(tmp_path, monkeypatch):
     """Mutating live dedupe state before persistence can make every retry a false success."""
     from plugin.mupot_gateway.notifications import enqueue
@@ -72,6 +204,7 @@ def test_enqueue_failed_save_is_copy_on_write_and_retry_establishes_custody(tmp_
     assert state == persisted
     notice = persisted["notification_outbox"]["source-1"]
     assert notice["custody_status"] == "durable"
+    assert notice["source_fingerprint_version"] == 2
     assert notice["activation_status"] == "not_started"
     assert notice["delivery_status"] == "pending"
     assert len(notice["source_fingerprint"]) == 64
@@ -134,8 +267,8 @@ def test_conflicting_source_content_preserves_original_notice(tmp_path):
     assert store.load() == original
 
 
-def test_matching_legacy_duplicate_keeps_completed_delivery_and_destination(tmp_path):
-    """Adding custody metadata must not regress a completed legacy notice to pending."""
+def test_unbound_legacy_duplicate_fails_closed_and_preserves_completed_record(tmp_path):
+    """Missing principal/seat proof cannot be upgraded from the retrying envelope."""
     from plugin.mupot_gateway.notifications import enqueue
 
     legacy = {
@@ -151,12 +284,10 @@ def test_matching_legacy_duplicate_keeps_completed_delivery_and_destination(tmp_
     store = StateStore(tmp_path / "inbox.json")
     store.save(state)
 
-    enqueue(state, store, source(), "Exact human notice.")
-    notice = store.load()["notification_outbox"]["source-1"]
-    assert notice["status"] == "delivered"
-    assert notice["delivery_status"] == "delivered"
-    assert notice["activation_status"] == "not_started"
-    assert notice["target"] == legacy["target"]
+    with pytest.raises(RuntimeError, match="conflict"):
+        enqueue(state, store, source(), "Exact human notice.")
+    assert store.load()["notification_outbox"]["source-1"] == legacy
+    assert state["notification_outbox"]["source-1"] == legacy
 
 
 def test_enqueue_prunes_only_oldest_completed_notices(tmp_path):

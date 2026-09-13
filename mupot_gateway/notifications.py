@@ -10,6 +10,28 @@ import time
 
 logger = logging.getLogger(__name__)
 
+_SOURCE_FINGERPRINT_VERSION = 2
+_IMMUTABLE_SOURCE_FINGERPRINT_FIELDS = (
+    "id",
+    "seq",
+    "tenant",
+    "to_agent",
+    "target_seat",
+    "from_agent",
+    "from_member",
+    "kind",
+    "body",
+    "request_id",
+    "in_reply_to",
+    "created_at",
+    "project_id",
+    "fenced_delivery_id",
+    "body_length",
+    "checksum_sha256",
+    "expects_reply",
+    "reply_basis",
+)
+
 
 class DeliveryUnknown(RuntimeError):
     """A send may have reached the human; automatic replay is unsafe."""
@@ -116,16 +138,10 @@ def _notice_text(source, text):
 def _source_fingerprint(source, notice_text):
     stable_source = {
         name: source.get(name)
-        for name in (
-            "id",
-            "from_agent",
-            "request_id",
-            "in_reply_to",
-            "project_id",
-            "kind",
-            "expects_reply",
-        )
+        for name in _IMMUTABLE_SOURCE_FINGERPRINT_FIELDS
     }
+    # delivery_attempts and lease_expires_at are intentionally absent: they
+    # change during normal redelivery and cannot define source identity.
     payload = json.dumps(
         {"notice": notice_text, "source": stable_source},
         ensure_ascii=False,
@@ -169,9 +185,14 @@ def enqueue(state, store, source, text):
     if existing is not None:
         if not isinstance(existing, dict):
             raise NotificationConflict("Notification source conflict")
+        if existing.get("source_fingerprint_version") != _SOURCE_FINGERPRINT_VERSION:
+            # An older record cannot prove that its fingerprint bound the
+            # authenticated principal and exact seat. Never infer those facts
+            # from a retrying envelope and silently upgrade its custody proof.
+            raise NotificationConflict("Notification source conflict")
         existing_fingerprint = existing.get("source_fingerprint")
         if existing.get("text") != notice_text or (
-            existing_fingerprint is not None and existing_fingerprint != fingerprint
+            existing_fingerprint != fingerprint
         ):
             raise NotificationConflict("Notification source conflict")
         candidate = copy.deepcopy(durable)
@@ -224,6 +245,7 @@ def enqueue(state, store, source, text):
         "custody_status": "durable",
         "activation_status": "not_started",
         "delivery_status": "pending",
+        "source_fingerprint_version": _SOURCE_FINGERPRINT_VERSION,
         "source_fingerprint": fingerprint,
         "text": notice_text,
     }

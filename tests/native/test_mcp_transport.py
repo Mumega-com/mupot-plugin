@@ -19,6 +19,11 @@ from plugin.mupot_gateway.adapter import HermesMCPClient, MupotAdapter
 GENERIC_PROTOCOL_ERROR = "Mupot MCP request failed"
 SENSITIVE_RESPONSE_LIMIT = 64 * 1024
 ABSOLUTE_RESPONSE_LIMIT = 1024 * 1024
+ATTEMPT_SCOPE = {
+    "tenant": "tenant-test",
+    "agent_id": "agent-test",
+    "effective_inbox_seat": "seat-test",
+}
 
 
 def tool_result(
@@ -459,6 +464,7 @@ async def test_real_httpx_wire_forces_identity_over_configured_compression(
     "result",
     [
         {
+            **ATTEMPT_SCOPE,
             "attempt_id": "other-attempt-id-1234",
             "state": "empty",
             "lease_expires_at": None,
@@ -466,6 +472,7 @@ async def test_real_httpx_wire_forces_identity_over_configured_compression(
             "consumed": False,
         },
         {
+            **ATTEMPT_SCOPE,
             "attempt_id": "attempt-id-12345678",
             "state": "unknown",
             "lease_expires_at": None,
@@ -473,6 +480,7 @@ async def test_real_httpx_wire_forces_identity_over_configured_compression(
             "consumed": False,
         },
         {
+            **ATTEMPT_SCOPE,
             "attempt_id": "attempt-id-12345678",
             "state": "cancelled",
             "lease_expires_at": None,
@@ -495,6 +503,67 @@ async def test_native_client_rejects_invalid_attempt_tool_result(
             monkeypatch,
             StreamingResponse(payload),
             tool="inbox_lease_reconcile",
+            arguments={"attempt_id": "attempt-id-12345678"},
+        )
+
+    assert str(failure.value) == GENERIC_PROTOCOL_ERROR
+
+
+@pytest.mark.asyncio
+async def test_native_client_accepts_exact_scope_bound_attempt_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt_id = "attempt-id-12345678"
+    receipt = {
+        **ATTEMPT_SCOPE,
+        "attempt_id": attempt_id,
+        "state": "acked",
+        "consumed": True,
+    }
+    result, _calls = await call_native(
+        monkeypatch,
+        StreamingResponse(tool_result(receipt, tool="inbox_lease_ack")),
+        tool="inbox_lease_ack",
+        arguments={"attempt_id": attempt_id},
+    )
+
+    assert result == receipt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        {
+            **ATTEMPT_SCOPE,
+            "attempt_id": "other-attempt-id-1234",
+            "state": "acked",
+            "consumed": True,
+        },
+        {
+            **ATTEMPT_SCOPE,
+            "attempt_id": "attempt-id-12345678",
+            "state": "unknown",
+            "consumed": False,
+        },
+        {
+            **ATTEMPT_SCOPE,
+            "attempt_id": "attempt-id-12345678",
+            "state": "acked",
+            "consumed": 1,
+        },
+        {"attempt_id": "attempt-id-12345678", "state": "acked", "consumed": True},
+    ],
+)
+async def test_native_client_rejects_malformed_attempt_ack(
+    monkeypatch: pytest.MonkeyPatch,
+    receipt: dict[str, Any],
+) -> None:
+    with pytest.raises(RuntimeError) as failure:
+        await call_native(
+            monkeypatch,
+            StreamingResponse(tool_result(receipt, tool="inbox_lease_ack")),
+            tool="inbox_lease_ack",
             arguments={"attempt_id": "attempt-id-12345678"},
         )
 

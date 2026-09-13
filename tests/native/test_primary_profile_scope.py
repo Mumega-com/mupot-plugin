@@ -155,7 +155,10 @@ class NativeHttpClient:
             }
         elif tool == "inbox_consumer_status":
             value = {
+                "strict_scope": True,
+                "tenant": "tenant-test",
                 "agent_id": "agent-test",
+                "effective_inbox_seat": None,
                 "mode": "bearer_only",
                 "generation": 0,
                 "key_matches": True,

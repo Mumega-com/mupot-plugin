@@ -19,17 +19,34 @@ def _load_runtime() -> None:
 
 
 class CaptureClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        consumer_status: dict[str, object],
+        attempt_result: dict[str, object],
+        attempt_ack: dict[str, object],
+    ) -> None:
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.consumer_status = consumer_status
+        self.attempt_result = attempt_result
+        self.attempt_ack = attempt_ack
+
+    async def connect(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
 
     async def call(self, tool: str, arguments: dict[str, object]) -> dict[str, object]:
         self.calls.append((tool, arguments.copy()))
-        if tool != "inbox_ack":
-            raise AssertionError(f"Routine consumer called unexpected tool {tool}")
-        ids = arguments.get("ids")
-        if not isinstance(ids, list) or len(ids) != 1 or not isinstance(ids[0], str):
-            raise AssertionError("Routine consumer emitted an invalid source ACK")
-        return {"acked": ids, "already_read": [], "refused": []}
+        if tool == "inbox_consumer_status":
+            if arguments != {"strict_scope": True}:
+                raise AssertionError("Routine consumer did not request strict scope")
+            return self.consumer_status
+        if tool == "inbox_lease_reconcile":
+            return self.attempt_result
+        if tool == "inbox_lease_ack":
+            return self.attempt_ack
+        raise AssertionError(f"Routine consumer called unexpected tool {tool}")
 
 
 async def _main() -> None:
@@ -43,7 +60,18 @@ async def _main() -> None:
         raise RuntimeError("integration input is invalid")
     envelope = payload.get("envelope")
     assigned_agent_id = payload.get("assigned_agent_id")
-    if not isinstance(envelope, dict) or not isinstance(assigned_agent_id, str):
+    attempt_id = payload.get("attempt_id")
+    consumer_status = payload.get("consumer_status")
+    attempt_result = payload.get("attempt_result")
+    attempt_ack = payload.get("attempt_ack")
+    if (
+        not isinstance(envelope, dict)
+        or not isinstance(assigned_agent_id, str)
+        or not isinstance(attempt_id, str)
+        or not isinstance(consumer_status, dict)
+        or not isinstance(attempt_result, dict)
+        or not isinstance(attempt_ack, dict)
+    ):
         raise RuntimeError("integration input is invalid")
     source_id = envelope.get("id")
     if not isinstance(source_id, str):
@@ -51,7 +79,7 @@ async def _main() -> None:
 
     home = Path(os.environ["HERMES_HOME"]).resolve()
     state_path = Path(os.environ["MUPOT_PLUGIN_STATE_PATH"])
-    client = CaptureClient()
+    client = CaptureClient(consumer_status, attempt_result, attempt_ack)
     activations: list[tuple[str, dict[str, object]]] = []
     peer_turns: list[str] = []
 
@@ -92,7 +120,7 @@ async def _main() -> None:
     if profile_agent_id != assigned_agent_id:
         manager.unload("mupot")
         print(json.dumps({
-            "ack_ids": [],
+            "ack_attempt_ids": [],
             "activation_count": 0,
             "custody_recorded": False,
             "outcome": "assignment_mismatch",
@@ -102,6 +130,35 @@ async def _main() -> None:
         }, separators=(",", ":"), sort_keys=True))
         return
 
+    adapter_module = importlib.import_module(
+        f"{loaded.module.__name__}.mupot_gateway.adapter"
+    )
+    adapter_module.StateStore(state_path).save({
+        "lease_reconciliation": {
+            "version": 3,
+            "required": True,
+            "tenant": consumer_status["tenant"],
+            "agent_id": consumer_status["agent_id"],
+            "effective_inbox_seat": consumer_status["effective_inbox_seat"],
+            "mode": consumer_status["mode"],
+            "generation": consumer_status["generation"],
+            "attempt_id": attempt_id,
+        }
+    })
+    adapter = platform_registry.create_adapter(
+        "mupot",
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "allowed_agents": "kasra",
+                "routine_events_enabled": True,
+                "state_path": str(state_path),
+                "notification_recipients": {"telegram": "owner"},
+            },
+        ),
+    )
+    if adapter is None:
+        raise RuntimeError("native Mupot adapter could not be reconstructed")
     adapter._client = client
     adapter._send_client = client
     notifications = importlib.import_module(
@@ -123,22 +180,21 @@ async def _main() -> None:
         peer_turns.append(str(event))
 
     adapter.set_message_handler(peer_handler)
-    await adapter._process_leased_message(envelope)
+    if not await adapter.reconcile_inbox_polling():
+        raise RuntimeError("native Mupot attempt reconciliation failed")
     await adapter._flush_notifications()
     await adapter._flush_notifications()
 
     state = adapter.store.load()
     notice = state["notification_outbox"][source_id]
-    ack_ids: list[str] = []
+    ack_attempt_ids: list[str] = []
     for tool, arguments in client.calls:
-        ids = arguments.get("ids")
-        if tool == "inbox_ack" and isinstance(ids, list) and ids:
-            first_id = ids[0]
-            if isinstance(first_id, str):
-                ack_ids.append(first_id)
+        acknowledged_attempt = arguments.get("attempt_id")
+        if tool == "inbox_lease_ack" and isinstance(acknowledged_attempt, str):
+            ack_attempt_ids.append(acknowledged_attempt)
     manager.unload("mupot")
     print(json.dumps({
-        "ack_ids": ack_ids,
+        "ack_attempt_ids": ack_attempt_ids,
         "activation_count": len(activations),
         "activation_status": notice["activation_status"],
         "delivery_status": notice["delivery_status"],

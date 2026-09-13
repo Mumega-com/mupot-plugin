@@ -150,7 +150,7 @@ receive, and the same retained state path. Do not invite a participant during th
 The receipts are deliberately non-substitutable:
 
 1. Routine custody proves the server stored the human wait.
-2. Exact source ACK proves the plugin consumed that leased envelope.
+2. Exact scope-bound attempt ACK proves the plugin consumed that reconciled leased envelope.
 3. `activation_queued` proves Hermes accepted private-session scheduling.
 4. A transport receipt plus conversation-mirror readback proves channel delivery.
 5. A Telegram webhook receipt plus Routine answer or task verdict proves the human decision.
@@ -234,8 +234,8 @@ a stop signal, not permission to widen a predicate or edit around the invariant.
       receipts.
 - [ ] The materialized Routine run's `assigned_agent_id` exactly equals the configured
       native profile `agent_id`; receiver configuration alone was not treated as proof.
-- [ ] Routine custody, source ACK, activation scheduling, channel delivery, human decision,
-      and domain completion each have separate receipts.
+- [ ] Routine custody, scope-bound attempt ACK, activation scheduling, channel delivery,
+      human decision, and domain completion each have separate receipts.
 - [ ] Identical replay, conflict, stale/terminal, wrong-project, and unauthorized cases have
       no duplicate effect.
 - [ ] Suspension, exact capability revocation, and post-revocation denial are proven.

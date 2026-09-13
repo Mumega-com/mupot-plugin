@@ -25,6 +25,11 @@ from plugin.mupot_gateway.adapter import (  # noqa: E402
 
 
 FAKE_LEASE_EXPIRY = "2099-01-01T00:00:00.000Z"
+FAKE_SCOPE = {
+    "tenant": "tenant-a",
+    "agent_id": "agent-consumer",
+    "effective_inbox_seat": None,
+}
 
 
 def fake_attempt_result(
@@ -33,6 +38,7 @@ def fake_attempt_result(
     messages: list[dict] | None = None,
 ) -> dict:
     return {
+        **FAKE_SCOPE,
         "attempt_id": attempt_id,
         "state": state,
         "lease_expires_at": FAKE_LEASE_EXPIRY if state == "leased" else None,
@@ -91,6 +97,14 @@ class FakeMupotClient:
             assert arguments == {"ids": ["m-1"]}
             self.acked = True
             return {"acked": ["m-1"], "already_read": [], "refused": []}
+        if tool == "inbox_lease_ack":
+            self.acked = True
+            return {
+                **FAKE_SCOPE,
+                "attempt_id": arguments["attempt_id"],
+                "state": "acked",
+                "consumed": True,
+            }
         if tool == "send":
             self.sent.append(arguments)
             return {
@@ -103,7 +117,8 @@ class FakeMupotClient:
             }
         if tool == "inbox_consumer_status":
             return {
-                "agent_id": "agent-consumer",
+                "strict_scope": True,
+                **FAKE_SCOPE,
                 "mode": "bearer_only",
                 "generation": 0,
                 "key_matches": True,
@@ -138,7 +153,7 @@ class AckMupotClient(FakeMupotClient):
         self.ack_calls = 0
 
     async def call(self, tool: str, arguments: dict) -> dict:
-        if tool == "inbox_ack":
+        if tool in {"inbox_ack", "inbox_lease_ack"}:
             self.ack_calls += 1
             if self.safe_ack_once and self.ack_calls == 1:
                 from plugin.mupot_gateway import adapter as adapter_module
@@ -146,8 +161,22 @@ class AckMupotClient(FakeMupotClient):
                 safe_error = getattr(adapter_module, "MupotSafeRetryError", RuntimeError)
                 raise safe_error("Mupot request failed")
             if self.fail_ack_once and self.ack_calls == 1:
+                if tool == "inbox_lease_ack":
+                    return {
+                        **FAKE_SCOPE,
+                        "attempt_id": arguments["attempt_id"],
+                        "state": "expired",
+                        "consumed": False,
+                    }
                 return {"acked": [], "already_read": [], "refused": ["ack-1"]}
             self.acked = True
+            if tool == "inbox_lease_ack":
+                return {
+                    **FAKE_SCOPE,
+                    "attempt_id": arguments["attempt_id"],
+                    "state": "acked",
+                    "consumed": True,
+                }
             return {"acked": ["ack-1"], "already_read": [], "refused": []}
         return await super().call(tool, arguments)
 
@@ -207,7 +236,11 @@ class TimedLeaseFailureClient(FakeMupotClient):
 class ReconciliationClient(FakeMupotClient):
     def __init__(self, status: object, reconcile_outcome: object = None) -> None:
         super().__init__()
-        self.status = status
+        self.status = (
+            {"strict_scope": True, **FAKE_SCOPE, **status}
+            if isinstance(status, dict)
+            else status
+        )
         self.reconcile_outcome = reconcile_outcome
         self.tools: list[str] = []
 
@@ -931,7 +964,7 @@ async def test_reconstructed_adapter_stays_fenced_without_network(
     marker = StateStore(state_path).load().get("lease_reconciliation")
     assert isinstance(marker, dict)
     assert marker["required"] is True
-    assert marker["version"] in {1, 2}
+    assert marker["version"] == 3
     monkeypatch.setattr(time, "time", lambda: 200.0)
 
     client = ReconciliationClient(
@@ -1182,7 +1215,9 @@ async def test_gateway_verifies_operator_identity_before_reading_mail(tmp_path, 
                 return {"tenant": tenant, "bound_agent_id": agent, "channel": "workspace",
                         "role": "member", "capabilities": []}
             if tool == "inbox_consumer_status":
-                return {"agent_id": agent, "mode": "bearer_only", "generation": 0,
+                return {"strict_scope": True, "tenant": tenant,
+                        "agent_id": agent, "effective_inbox_seat": None,
+                        "mode": "bearer_only", "generation": 0,
                         "key_matches": True}
             return await super().call(tool, arguments)
     client = BoundClient()

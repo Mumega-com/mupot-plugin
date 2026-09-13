@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 import re
 import time
@@ -24,6 +25,11 @@ from plugin.mupot_gateway.adapter import (
 
 ATTEMPT_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 LEASE_EXPIRY = "2099-01-01T00:00:00.000Z"
+SCOPE = {
+    "tenant": "tenant-a",
+    "agent_id": "agent-consumer",
+    "effective_inbox_seat": "seat-a",
+}
 
 
 def attempt_result(
@@ -34,11 +40,27 @@ def attempt_result(
     lease_expires_at: str | None = None,
 ) -> dict[str, Any]:
     return {
+        **SCOPE,
         "attempt_id": attempt_id,
         "state": state,
         "lease_expires_at": lease_expires_at,
         "messages": messages or [],
         "consumed": False,
+    }
+
+
+def ack_result(
+    attempt_id: str,
+    *,
+    state: str = "acked",
+    consumed: bool = True,
+    scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        **(scope or SCOPE),
+        "attempt_id": attempt_id,
+        "state": state,
+        "consumed": consumed,
     }
 
 
@@ -66,12 +88,15 @@ class AttemptClient:
         *,
         lease_outcomes: list[Any] | None = None,
         reconcile_outcome: Any = None,
-        status: dict[str, Any] | None = None,
+        ack_outcome: Any = None,
+        status: Any = None,
     ) -> None:
         self.lease_outcomes = list(lease_outcomes or [])
         self.reconcile_outcome = reconcile_outcome
-        self.status = status or {
-            "agent_id": "agent-consumer",
+        self.ack_outcome = ack_outcome
+        self.status = status if status is not None else {
+            "strict_scope": True,
+            **SCOPE,
             "mode": "bearer_only",
             "generation": 7,
             "key_matches": True,
@@ -90,6 +115,8 @@ class AttemptClient:
     async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((tool, dict(arguments)))
         if tool == "inbox_consumer_status":
+            if isinstance(self.status, Exception):
+                raise self.status
             return dict(self.status)
         if tool == "inbox_lease":
             self.first_lease.set()
@@ -106,6 +133,13 @@ class AttemptClient:
             if callable(outcome):
                 return outcome(arguments)
             return outcome
+        if tool == "inbox_lease_ack":
+            outcome = self.ack_outcome
+            if isinstance(outcome, Exception):
+                raise outcome
+            if callable(outcome):
+                return outcome(arguments)
+            return outcome or ack_result(arguments["attempt_id"])
         if tool == "inbox_ack":
             message_id = arguments["ids"][0]
             self.acked_ids.append(message_id)
@@ -141,6 +175,13 @@ class ScopeOwner:
             yield
         finally:
             self.active = False
+
+
+class RejectingScopeOwner:
+    @contextmanager
+    def activate(self):
+        raise RuntimeError("profile scope unavailable")
+        yield
 
 
 class ScopedAttemptClient(AttemptClient):
@@ -193,14 +234,15 @@ async def test_ambiguous_attempt_is_random_bounded_durable_and_reconciled_immedi
     attempt_id, first = await persist_v2_ambiguous(state_path)
     marker = StateStore(state_path).load()["lease_reconciliation"]
     assert marker == {
-        "version": 2,
+        "version": 3,
         "required": True,
-        "agent_id": "agent-consumer",
+        **SCOPE,
         "mode": "bearer_only",
         "generation": 7,
         "attempt_id": attempt_id,
     }
     assert ATTEMPT_RE.fullmatch(attempt_id)
+    assert first.calls[0] == ("inbox_consumer_status", {"strict_scope": True})
     assert first.calls[-1] == (
         "inbox_lease",
         {"limit": 1, "lease_seconds": 30, "attempt_id": attempt_id},
@@ -213,7 +255,7 @@ async def test_ambiguous_attempt_is_random_bounded_durable_and_reconciled_immedi
     adapter = make_adapter(state_path, recovered)
     assert await adapter.reconcile_inbox_polling() is True
     assert recovered.calls == [
-        ("inbox_consumer_status", {}),
+        ("inbox_consumer_status", {"strict_scope": True}),
         ("inbox_lease_reconcile", {"attempt_id": attempt_id}),
     ]
     assert StateStore(state_path).load().get("lease_reconciliation") is None
@@ -286,6 +328,7 @@ async def test_terminal_attempt_tombstone_clears_without_processing_or_ack(
     assert await adapter.reconcile_inbox_polling() is True
     assert handled == []
     assert client.acked_ids == []
+    assert not any(tool in {"inbox_ack", "inbox_lease_ack"} for tool, _ in client.calls)
     assert StateStore(state_path).load().get("lease_reconciliation") is None
 
 
@@ -307,7 +350,9 @@ async def test_exact_leased_attempt_is_processed_and_acked_before_clear(
     adapter = make_adapter(state_path, client)
 
     assert await adapter.reconcile_inbox_polling() is True
-    assert client.acked_ids == [message["id"]]
+    assert client.acked_ids == []
+    assert ("inbox_lease_ack", {"attempt_id": attempt_id}) in client.calls
+    assert not any(tool == "inbox_ack" for tool, _ in client.calls)
     state = StateStore(state_path).load()
     assert message["id"] in state["processed"]
     assert state["terminal_receipts"] == [message]
@@ -327,12 +372,21 @@ async def test_exact_leased_attempt_is_processed_and_acked_before_clear(
         ),
         lambda attempt, message: attempt_result(attempt, "cancelled", [message]),
         lambda attempt, _message: {
+            **SCOPE,
             "attempt_id": attempt,
             "state": "unknown",
             "lease_expires_at": None,
             "messages": [],
             "consumed": False,
         },
+        lambda attempt, _message: attempt_result(
+            attempt,
+            "empty",
+        ) | {"tenant": "tenant-b"},
+        lambda attempt, _message: attempt_result(
+            attempt,
+            "empty",
+        ) | {"effective_inbox_seat": "seat-b"},
     ],
 )
 async def test_reconcile_mismatch_or_malformed_response_remains_fenced(
@@ -350,6 +404,142 @@ async def test_reconcile_mismatch_or_malformed_response_remains_fenced(
     assert await adapter.reconcile_inbox_polling() is False
     assert client.acked_ids == []
     assert StateStore(state_path).load()["lease_reconciliation"]["attempt_id"] == attempt_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ack_outcome",
+    [
+        ack_result("other-attempt-id-1234"),
+        ack_result("placeholder", state="expired", consumed=False),
+        ack_result("placeholder") | {"tenant": "tenant-b"},
+        {"state": "acked", "consumed": True},
+    ],
+)
+async def test_attempt_ack_malformed_nonconsumed_or_scope_mismatch_stays_fenced(
+    tmp_path: Path,
+    ack_outcome: dict[str, Any],
+) -> None:
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    message = leased_ack()
+    if ack_outcome.get("attempt_id") == "placeholder":
+        ack_outcome = {**ack_outcome, "attempt_id": attempt_id}
+    client = AttemptClient(
+        reconcile_outcome=attempt_result(
+            attempt_id,
+            "leased",
+            [message],
+            lease_expires_at=LEASE_EXPIRY,
+        ),
+        ack_outcome=ack_outcome,
+    )
+    adapter = make_adapter(state_path, client)
+
+    assert await adapter.reconcile_inbox_polling() is False
+    assert message["id"] not in StateStore(state_path).load().get("processed", [])
+    assert StateStore(state_path).load()["lease_reconciliation"]["attempt_id"] == attempt_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [
+        {**SCOPE, "strict_scope": True, "mode": "bearer_only", "generation": 8, "key_matches": True},
+        {**SCOPE, "strict_scope": True, "mode": "bearer_only", "generation": 7, "key_matches": True, "tenant": "tenant-b"},
+        {**SCOPE, "strict_scope": True, "mode": "bearer_only", "generation": 7, "key_matches": True, "agent_id": "agent-b"},
+        {**SCOPE, "strict_scope": True, "mode": "bearer_only", "generation": 7, "key_matches": True, "effective_inbox_seat": "seat-b"},
+    ],
+)
+async def test_profile_or_scope_swap_makes_zero_reconcile_or_ack_calls(
+    tmp_path: Path,
+    status: dict[str, Any],
+) -> None:
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    client = AttemptClient(status=status, reconcile_outcome=attempt_result(attempt_id, "empty"))
+    adapter = make_adapter(state_path, client)
+
+    assert await adapter.reconcile_inbox_polling() is False
+    assert client.calls == [("inbox_consumer_status", {"strict_scope": True})]
+    assert StateStore(state_path).load()["lease_reconciliation"]["attempt_id"] == attempt_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [
+        MupotTransportError("Mupot request failed"),
+        {},
+        {**SCOPE, "strict_scope": False, "mode": "bearer_only", "generation": 7, "key_matches": True},
+        {**SCOPE, "strict_scope": True, "mode": "bearer_only", "generation": 7, "key_matches": False},
+    ],
+)
+async def test_strict_scope_lookup_failure_stays_fenced_without_reconcile_or_ack(
+    tmp_path: Path,
+    status: Any,
+) -> None:
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    client = AttemptClient(status=status)
+    adapter = make_adapter(state_path, client)
+
+    assert await adapter.reconcile_inbox_polling() is False
+    assert not any(
+        tool in {"inbox_lease_reconcile", "inbox_lease_ack", "inbox_ack"}
+        for tool, _ in client.calls
+    )
+    assert StateStore(state_path).load()["lease_reconciliation"]["attempt_id"] == attempt_id
+
+
+@pytest.mark.asyncio
+async def test_profile_scope_failure_stays_fenced_without_network(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    client = AttemptClient()
+    adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
+        client_factory=lambda *_: client,
+        secret_owner=RejectingScopeOwner(),  # type: ignore[arg-type]
+    )
+
+    assert await adapter.reconcile_inbox_polling() is False
+    assert client.connect_calls == 0
+    assert client.calls == []
+    assert StateStore(state_path).load()["lease_reconciliation"]["attempt_id"] == attempt_id
+
+
+@pytest.mark.asyncio
+async def test_nonattempt_legacy_ack_uses_generic_exact_id(
+    tmp_path: Path,
+) -> None:
+    client = AttemptClient()
+    adapter = make_adapter(tmp_path / "state.json", client)
+
+    await adapter._ack_expected("legacy-message-id")
+
+    assert client.calls == [("inbox_ack", {"ids": ["legacy-message-id"]})]
+
+
+def test_delivery_context_carries_attempt_id_for_attempt_originated_work(
+    tmp_path: Path,
+) -> None:
+    client = AttemptClient()
+    adapter = make_adapter(tmp_path / "state.json", client)
+    assert "attempt_id" in inspect.signature(adapter._begin_delivery).parameters
+    message = {
+        **leased_ack("request-recovered"),
+        "kind": "request",
+        "expects_reply": True,
+        "body": "perform exact recovered work",
+    }
+    _event, runtime = adapter._begin_delivery(
+        message,
+        attempt_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    )
+    assert runtime.context.attempt_id == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 
 @pytest.mark.asyncio

@@ -22,11 +22,13 @@ with `inbox_watch_enabled`; enabling both is rejected before registration. Exist
 CLI/SSE-stream configurations remain opt-in and unchanged when native mode is off.
 
 The native receiver uses Mupot's server-authoritative `inbox_lease` attempt receipts and
-`inbox_ack` interface. It durably records one random attempt ID before leasing, reuses that
-ID for the single proven-safe transport retry, and resolves an ambiguous or restarted
-attempt through `inbox_lease_reconcile` before admitting new work. Only the exact `leased`
-tuple is processed and ACKed; terminal `empty`, `cancelled`, `expired`, and `acked` receipts
-clear without processing. Legacy local-clock reconciliation markers remain fenced for
+attempt-bound `inbox_lease_ack`. It first reads the strict tenant/agent/effective-seat
+consumer scope, durably records that scope with one random attempt ID, and reuses the ID for
+the single proven-safe transport retry. An ambiguous or restarted attempt is resolved
+through `inbox_lease_reconcile` before admitting new work. Only an exact scope-matching
+`leased` tuple is processed, and only an exact `acked`/`consumed:true` attempt receipt permits
+local commit and marker clearing. Terminal non-consumed or mismatched receipts remain fenced.
+Legacy non-attempt paths alone use `inbox_ack`; older reconciliation markers stay fenced for
 manual recovery. The receiver also verifies the operator's expected agent/tenant, preserves
 message correlation, and consumes a source only after successful handling. Terminal ACKs
 are preserved without generating another peer reply. It does not start an SOS connection.
@@ -35,7 +37,7 @@ Enable `mupot.routine_events_enabled: true` for the dedicated authenticated
 `routine.human-wait/v1` receive path. This opt-in does not add `mupot-routines` to
 `allowed_agents`: Routine events never start a peer model turn or send to their synthetic
 source. Their human notice becomes eligible for private-session activation only after
-durable custody, exact source ACK, and the local processed marker.
+durable custody, an exact scope-bound attempt ACK, and the local processed marker.
 
 For human updates, configure `mupot.notification_recipients` with the immutable user
 ID for each linked platform. Only matching active private conversations are eligible.
@@ -47,7 +49,8 @@ The previous split deployment verified Telegram; other platforms require their o
 identity binding and end-to-end verification.
 
 Keep each receipt at its own boundary: server Routine custody proves the human wait exists;
-source ACK proves only that the leased envelope was consumed; `activation_queued` proves
+the scope-bound attempt ACK proves only that the reconciled leased envelope was consumed;
+`activation_queued` proves
 only that Hermes accepted private-session scheduling; a channel receipt plus conversation
 mirror readback proves channel delivery; a Telegram webhook receipt plus Routine answer or
 task verdict proves the human decision; and terminal Routine/task evidence proves domain

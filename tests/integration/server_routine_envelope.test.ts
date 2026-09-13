@@ -9,6 +9,8 @@ const pluginRoot = process.env.MUPOT_PLUGIN_SOURCE
 const serverRoot = process.env.MUPOT_SERVER_SOURCE
 const hermesSource = process.env.HERMES_SOURCE
 const hermesPython = process.env.HERMES_PYTHON
+const ATTEMPT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const MISMATCH_ATTEMPT = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 
 function writeNativeProfile(stateDir: string, agentId: string): string {
   const home = join(stateDir, 'hermes-home')
@@ -38,10 +40,11 @@ function writeNativeProfile(stateDir: string, agentId: string): string {
       },
     },
   }, null, 2))
+  writeFileSync(join(home, '.env'), 'MUPOT_AGENT_TOKEN=integration-agent-token\n')
   return home
 }
 
-test('migration-backed Routine human wait crosses the native plugin and exact source ACK', async () => {
+test('migration-backed Routine human wait crosses the plugin with scope-bound attempt ACK', async () => {
   expect(pluginRoot).toBeTruthy()
   expect(serverRoot).toBeTruthy()
   expect(hermesSource).toBeTruthy()
@@ -84,12 +87,13 @@ test('migration-backed Routine human wait crosses the native plugin and exact so
 
     const lease = await messages.leaseAgentInbox(
       fixture.env,
-      { agent: 'agent-1', limit: 1, leaseSeconds: 60 },
+      { agent: 'agent-1', limit: 1, leaseSeconds: 60, attemptId: ATTEMPT },
       { now: () => '2026-09-13T12:00:00.000Z' },
     )
     expect(lease).toMatchObject({
       ok: true,
-      complete: true,
+      attempt_id: ATTEMPT,
+      state: 'leased',
       messages: [{
         from_agent: 'mupot-routines',
         from_member: 'system:routines',
@@ -101,6 +105,13 @@ test('migration-backed Routine human wait crosses the native plugin and exact so
       }],
     })
     if (!lease.ok || lease.messages.length !== 1) throw new Error('expected one leased Routine envelope')
+    const reconciled = await messages.reconcileAgentInboxLeaseAttempt(
+      fixture.env,
+      { agent: 'agent-1', attemptId: ATTEMPT },
+      { now: () => '2026-09-13T12:00:00.500Z' },
+    )
+    if (!reconciled.ok || reconciled.state !== 'leased') throw new Error('expected reconciled lease attempt')
+    const { ok: _reconcileOk, ...mcpReconciled } = reconciled
 
     const run = fixture.harness.sqlite.prepare(
       "SELECT assigned_agent_id, json_extract(policy_json, '$.responsible_squad_id') AS responsible_squad_id FROM routine_runs WHERE id = 'run-1'",
@@ -139,12 +150,31 @@ test('migration-backed Routine human wait crosses the native plugin and exact so
       input: JSON.stringify({
         envelope: lease.messages[0],
         assigned_agent_id: run.assigned_agent_id,
+        attempt_id: ATTEMPT,
+        consumer_status: {
+          strict_scope: true,
+          tenant: reconciled.tenant,
+          agent_id: reconciled.agent_id,
+          effective_inbox_seat: reconciled.effective_inbox_seat,
+          mode: 'bearer_only',
+          generation: 0,
+          key_matches: true,
+        },
+        attempt_result: mcpReconciled,
+        attempt_ack: {
+          tenant: reconciled.tenant,
+          agent_id: reconciled.agent_id,
+          effective_inbox_seat: reconciled.effective_inbox_seat,
+          attempt_id: ATTEMPT,
+          state: 'acked',
+          consumed: true,
+        },
       }),
       encoding: 'utf8',
     })
     expect(consumed.status, consumed.stderr).toBe(0)
     const pluginReceipt = JSON.parse(consumed.stdout) as {
-      ack_ids: string[]
+      ack_attempt_ids: string[]
       activation_count: number
       activation_status: string
       delivery_status: string
@@ -155,7 +185,7 @@ test('migration-backed Routine human wait crosses the native plugin and exact so
       source_id: string
     }
     expect(pluginReceipt).toEqual({
-      ack_ids: [lease.messages[0].id],
+      ack_attempt_ids: [ATTEMPT],
       activation_count: 1,
       activation_status: 'queued',
       delivery_status: 'pending',
@@ -166,12 +196,12 @@ test('migration-backed Routine human wait crosses the native plugin and exact so
       source_id: lease.messages[0].id,
     })
 
-    const ack = await messages.ackAgentMessages(
+    const ack = await messages.ackAgentInboxLeaseAttempt(
       fixture.env,
-      { agent: run.assigned_agent_id, ids: pluginReceipt.ack_ids },
+      { agent: run.assigned_agent_id, attemptId: pluginReceipt.ack_attempt_ids[0] },
       { now: () => '2026-09-13T12:00:01.000Z' },
     )
-    expect(ack).toEqual({ acked: pluginReceipt.ack_ids, already_read: [], refused: [], ok: true })
+    expect(ack).toMatchObject({ ok: true, attempt_id: ATTEMPT, state: 'acked', consumed: true })
     expect(fixture.harness.sqlite.prepare(
       'SELECT id, read_at FROM agent_messages WHERE id = ?',
     ).get(pluginReceipt.source_id)).toEqual({
@@ -223,10 +253,17 @@ test('mismatched native profile stops before custody ACK or activation', async (
     expect(result).toMatchObject({ ok: true, status: 'waiting', reason: 'answer' })
     const lease = await messages.leaseAgentInbox(
       fixture.env,
-      { agent: 'agent-1', limit: 1, leaseSeconds: 60 },
+      { agent: 'agent-1', limit: 1, leaseSeconds: 60, attemptId: MISMATCH_ATTEMPT },
       { now: () => '2026-09-13T12:00:00.000Z' },
     )
     if (!lease.ok || lease.messages.length !== 1) throw new Error('expected one leased Routine envelope')
+    const reconciled = await messages.reconcileAgentInboxLeaseAttempt(
+      fixture.env,
+      { agent: 'agent-1', attemptId: MISMATCH_ATTEMPT },
+      { now: () => '2026-09-13T12:00:00.500Z' },
+    )
+    if (!reconciled.ok || reconciled.state !== 'leased') throw new Error('expected reconciled lease attempt')
+    const { ok: _mismatchReconcileOk, ...mismatchMcpReconciled } = reconciled
     const run = fixture.harness.sqlite.prepare(
       "SELECT assigned_agent_id FROM routine_runs WHERE id = 'run-1'",
     ).get() as { assigned_agent_id: string }
@@ -252,12 +289,31 @@ test('mismatched native profile stops before custody ACK or activation', async (
       input: JSON.stringify({
         envelope: lease.messages[0],
         assigned_agent_id: run.assigned_agent_id,
+        attempt_id: MISMATCH_ATTEMPT,
+        consumer_status: {
+          strict_scope: true,
+          tenant: reconciled.tenant,
+          agent_id: reconciled.agent_id,
+          effective_inbox_seat: reconciled.effective_inbox_seat,
+          mode: 'bearer_only',
+          generation: 0,
+          key_matches: true,
+        },
+        attempt_result: mismatchMcpReconciled,
+        attempt_ack: {
+          tenant: reconciled.tenant,
+          agent_id: reconciled.agent_id,
+          effective_inbox_seat: reconciled.effective_inbox_seat,
+          attempt_id: MISMATCH_ATTEMPT,
+          state: 'acked',
+          consumed: true,
+        },
       }),
       encoding: 'utf8',
     })
     expect(consumed.status, consumed.stderr).toBe(0)
     expect(JSON.parse(consumed.stdout)).toEqual({
-      ack_ids: [],
+      ack_attempt_ids: [],
       activation_count: 0,
       custody_recorded: false,
       outcome: 'assignment_mismatch',

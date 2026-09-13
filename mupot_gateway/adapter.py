@@ -49,7 +49,7 @@ _GENERIC_DELIVERY_CONTEXT_ERROR = "Mupot delivery context unavailable"
 _DELIVERY_CONTEXT_METADATA_KEY = "_mupot_delivery_context"
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _REPLY_OUTBOX_VERSION = 1
-_LEASE_ATTEMPT_MARKER_VERSION = 2
+_LEASE_ATTEMPT_MARKER_VERSION = 3
 _LEASE_ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _LEASE_ATTEMPT_STATES = frozenset(
     {"leased", "empty", "cancelled", "expired", "acked"}
@@ -86,6 +86,7 @@ class DeliveryContext:
     project: Optional[str]
     request_id: Optional[str]
     session_key: str
+    attempt_id: Optional[str]
 
 
 @dataclass(slots=True)
@@ -201,6 +202,11 @@ def decode_mcp_result(
         if not isinstance(attempt_id, str):
             raise _protocol_error()
         return validate_lease_attempt_result(value, attempt_id)
+    if tool == "inbox_lease_ack":
+        attempt_id = (arguments or {}).get("attempt_id")
+        if not isinstance(attempt_id, str):
+            raise _protocol_error()
+        return validate_lease_attempt_ack(value, attempt_id)
     return value
 
 
@@ -230,11 +236,15 @@ def validate_send_receipt(
 def validate_lease_attempt_result(
     result: Any,
     attempt_id: str,
+    expected_scope: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """Validate the server-authoritative outcome for one exact lease attempt."""
     if (
         not isinstance(result, dict)
         or set(result) != {
+            "tenant",
+            "agent_id",
+            "effective_inbox_seat",
             "attempt_id",
             "state",
             "lease_expires_at",
@@ -246,6 +256,12 @@ def validate_lease_attempt_result(
         or result.get("state") not in _LEASE_ATTEMPT_STATES
         or result.get("consumed") is not False
         or not isinstance(result.get("messages"), list)
+    ):
+        raise _protocol_error()
+    scope = _attempt_scope_echo(result)
+    if scope is None or expected_scope is not None and any(
+        scope[field] != expected_scope.get(field)
+        for field in ("tenant", "agent_id", "effective_inbox_seat")
     ):
         raise _protocol_error()
     state = result["state"]
@@ -284,9 +300,68 @@ def validate_lease_attempt_result(
     return result
 
 
+def validate_lease_attempt_ack(
+    result: Any,
+    attempt_id: str,
+    expected_scope: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    if (
+        not isinstance(result, dict)
+        or set(result) != {
+            "tenant",
+            "agent_id",
+            "effective_inbox_seat",
+            "attempt_id",
+            "state",
+            "consumed",
+        }
+        or result.get("attempt_id") != attempt_id
+        or not _LEASE_ATTEMPT_ID_RE.fullmatch(attempt_id)
+        or result.get("state") not in _LEASE_ATTEMPT_STATES
+        or type(result.get("consumed")) is not bool
+    ):
+        raise _protocol_error()
+    scope = _attempt_scope_echo(result)
+    if scope is None or expected_scope is not None and any(
+        scope[field] != expected_scope.get(field)
+        for field in ("tenant", "agent_id", "effective_inbox_seat")
+    ):
+        raise _protocol_error()
+    return result
+
+
+def _attempt_scope_echo(value: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    tenant = value.get("tenant")
+    agent_id = value.get("agent_id")
+    seat = value.get("effective_inbox_seat")
+    if (
+        not isinstance(tenant, str)
+        or not tenant.strip()
+        or tenant != tenant.strip()
+        or not isinstance(agent_id, str)
+        or not agent_id.strip()
+        or agent_id != agent_id.strip()
+        or not (
+            seat is None
+            or isinstance(seat, str) and bool(seat.strip()) and seat == seat.strip()
+        )
+    ):
+        return None
+    return {
+        "tenant": tenant,
+        "agent_id": agent_id,
+        "effective_inbox_seat": seat,
+    }
+
+
 def _consumer_fence_proof(
     value: Any,
     expected_agent_id: Optional[str] = None,
+    expected_tenant: Optional[str] = None,
+    *,
+    strict_scope: bool = False,
 ) -> Optional[dict[str, Any]]:
     if not isinstance(value, dict):
         return None
@@ -304,7 +379,18 @@ def _consumer_fence_proof(
         or value.get("key_matches") is not True
     ):
         return None
-    return {"agent_id": agent_id, "mode": mode, "generation": generation}
+    proof = {"agent_id": agent_id, "mode": mode, "generation": generation}
+    if not strict_scope:
+        return proof
+    scope = _attempt_scope_echo(value)
+    if (
+        value.get("strict_scope") is not True
+        or scope is None
+        or expected_tenant is not None
+        and scope["tenant"] != expected_tenant
+    ):
+        return None
+    return {**scope, "mode": mode, "generation": generation}
 
 
 def _lease_reconciliation_proof(value: Any) -> Optional[dict[str, Any]]:
@@ -321,8 +407,15 @@ def _lease_reconciliation_proof(value: Any) -> Optional[dict[str, Any]]:
     if version == 1:
         if set(value) != common | {"reconcile_after"}:
             return None
-    elif version == _LEASE_ATTEMPT_MARKER_VERSION:
+    elif version == 2:
         if set(value) != common | {"attempt_id"}:
+            return None
+    elif version == _LEASE_ATTEMPT_MARKER_VERSION:
+        if set(value) != common | {
+            "tenant",
+            "effective_inbox_seat",
+            "attempt_id",
+        }:
             return None
     else:
         return None
@@ -336,13 +429,19 @@ def _lease_reconciliation_proof(value: Any) -> Optional[dict[str, Any]]:
     )
     if value.get("required") is not True or fence is None:
         return None
-    if version == _LEASE_ATTEMPT_MARKER_VERSION:
+    if version in {2, _LEASE_ATTEMPT_MARKER_VERSION}:
         attempt_id = value.get("attempt_id")
         if not isinstance(attempt_id, str) or not _LEASE_ATTEMPT_ID_RE.fullmatch(
             attempt_id
         ):
             return None
-        return {"version": version, **fence, "attempt_id": attempt_id}
+        if version == 2:
+            return {"version": version, **fence, "attempt_id": attempt_id}
+        scope = _attempt_scope_echo(value)
+        if scope is None:
+            return None
+        return {"version": version, **scope, "mode": fence["mode"],
+                "generation": fence["generation"], "attempt_id": attempt_id}
 
     deadline = value.get("reconcile_after")
     if (
@@ -847,6 +946,7 @@ class MupotAdapter(BasePlatformAdapter):
     def _begin_delivery(
         self,
         message: dict[str, Any],
+        attempt_id: Optional[str] = None,
     ) -> tuple[MessageEvent, _LiveDelivery]:
         event = build_mupot_event(message, self.platform)
         source_id = str(message.get("id") or "").strip()
@@ -862,6 +962,7 @@ class MupotAdapter(BasePlatformAdapter):
             project=self._optional_text(message.get("project_id")),
             request_id=self._optional_text(message.get("request_id")),
             session_key=session_key,
+            attempt_id=attempt_id,
         )
         runtime = _LiveDelivery(
             context=context,
@@ -1259,10 +1360,15 @@ class MupotAdapter(BasePlatformAdapter):
                         or boot.get("channel") != "workspace"):
                     raise RuntimeError("Mupot native gateway identity or tenant mismatch")
             fence = await asyncio.wait_for(
-                self._client.call("inbox_consumer_status", {}),
+                self._client.call("inbox_consumer_status", {"strict_scope": True}),
                 timeout=self.rpc_timeout,
             )
-            proof = _consumer_fence_proof(fence, self.expected_agent_id)
+            proof = _consumer_fence_proof(
+                fence,
+                self.expected_agent_id,
+                self.expected_tenant,
+                strict_scope=True,
+            )
             if proof is None:
                 raise _protocol_error()
             self._consumer_fence = proof
@@ -1384,7 +1490,9 @@ class MupotAdapter(BasePlatformAdapter):
         self._state["lease_reconciliation"] = {
             "version": 1,
             "required": True,
-            **proof,
+            "agent_id": proof["agent_id"],
+            "mode": proof["mode"],
+            "generation": proof["generation"],
             "reconcile_after": 0,
         }
         self._lease_quarantined = True
@@ -1430,16 +1538,27 @@ class MupotAdapter(BasePlatformAdapter):
             require_supported_profile_runtime({})
             await self._client.connect()
             value = await asyncio.wait_for(
-                self._client.call("inbox_consumer_status", {}),
+                self._client.call("inbox_consumer_status", {"strict_scope": True}),
                 timeout=self.rpc_timeout,
             )
         except Exception:
             logger.error("[mupot] inbox reconciliation readback failed")
             return False
-        proof = _consumer_fence_proof(value, marker["agent_id"])
+        proof = _consumer_fence_proof(
+            value,
+            marker["agent_id"],
+            marker["tenant"],
+            strict_scope=True,
+        )
         if proof is None or any(
             proof[field] != marker[field]
-            for field in ("agent_id", "mode", "generation")
+            for field in (
+                "tenant",
+                "agent_id",
+                "effective_inbox_seat",
+                "mode",
+                "generation",
+            )
         ):
             logger.error("[mupot] inbox reconciliation readback mismatch")
             return False
@@ -1451,10 +1570,17 @@ class MupotAdapter(BasePlatformAdapter):
                 ),
                 timeout=self.rpc_timeout,
             )
-            outcome = validate_lease_attempt_result(result, marker["attempt_id"])
+            outcome = validate_lease_attempt_result(
+                result,
+                marker["attempt_id"],
+                marker,
+            )
             if outcome["state"] == "leased":
                 message = outcome["messages"][0]
-                await self._process_leased_message(message)
+                await self._process_leased_message(
+                    message,
+                    attempt_id=marker["attempt_id"],
+                )
                 message_id = message["id"]
                 if message_id not in self._state.get("processed", []):
                     raise _protocol_error()
@@ -1525,7 +1651,11 @@ class MupotAdapter(BasePlatformAdapter):
                     arguments,
                     before_attempt=lambda: self._persist_prelease_fence(attempt_id),
                 )
-                outcome = validate_lease_attempt_result(payload, attempt_id)
+                outcome = validate_lease_attempt_result(
+                    payload,
+                    attempt_id,
+                    self._consumer_fence,
+                )
                 if outcome["state"] == "leased":
                     message = outcome["messages"][0]
                     message_id = str(message.get("id") or "")
@@ -1536,7 +1666,7 @@ class MupotAdapter(BasePlatformAdapter):
                         message.get("delivery_attempts"),
                         message.get("request_id"),
                     )
-                    await self._process_leased_message(message)
+                    await self._process_leased_message(message, attempt_id=attempt_id)
                     if message_id not in self._state.get("processed", []):
                         raise _protocol_error()
                 self._clear_lease_fence()
@@ -1547,39 +1677,47 @@ class MupotAdapter(BasePlatformAdapter):
                 return
             await asyncio.sleep(self.poll_interval)
 
-    async def _process_leased_message(self, message: dict[str, Any]) -> None:
+    async def _process_leased_message(
+        self,
+        message: dict[str, Any],
+        attempt_id: Optional[str] = None,
+    ) -> None:
         """Route one authenticated leased row without widening peer authority."""
         from .routine_events import is_routine_event_candidate, quarantine_routine_event
 
         message_id = str(message.get("id") or "")
         if is_routine_event_candidate(message):
             if self.routine_events_enabled:
-                await self._handle_routine_event(message)
+                await self._handle_routine_event(message, attempt_id=attempt_id)
             else:
                 quarantine_routine_event(
                     self._state, self.store, message, "routine_events_disabled"
                 )
-                await self._ack_expected(message_id)
+                await self._ack_expected(message_id, attempt_id=attempt_id)
                 self._commit(message_id)
             return
         if message_id in self._state["processed"]:
-            await self._ack_expected(message_id)
+            await self._ack_expected(message_id, attempt_id=attempt_id)
             return
         if is_ack_envelope(message) and should_accept_message(
             message, self.allowed_agents
         ):
-            await self._handle_ack_envelope(message)
+            await self._handle_ack_envelope(message, attempt_id=attempt_id)
             return
         if should_accept_message(message, self.allowed_agents):
-            await self._deliver(message)
+            await self._deliver(message, attempt_id=attempt_id)
             return
         self._state["dlq"].append({"message": message, "reason": "sender_policy"})
         self._state["dlq"] = self._state["dlq"][-100:]
         self.store.save(self._state)
-        await self._ack_expected(message_id)
+        await self._ack_expected(message_id, attempt_id=attempt_id)
         self._commit(message_id)
 
-    async def _handle_routine_event(self, message: dict[str, Any]) -> None:
+    async def _handle_routine_event(
+        self,
+        message: dict[str, Any],
+        attempt_id: Optional[str] = None,
+    ) -> None:
         """Take custody, ACK exactly one source, then durably mark it processed."""
         from .notifications import enqueue
         from .routine_events import (
@@ -1599,7 +1737,7 @@ class MupotAdapter(BasePlatformAdapter):
             quarantine_routine_event(
                 self._state, self.store, message, "invalid_routine_event"
             )
-            await self._ack_expected(message_id)
+            await self._ack_expected(message_id, attempt_id=attempt_id)
             self._commit(message_id)
             return
 
@@ -1612,7 +1750,7 @@ class MupotAdapter(BasePlatformAdapter):
             activation_required=True,
             activation_after_processed=True,
         )
-        await self._ack_expected(event.source_id)
+        await self._ack_expected(event.source_id, attempt_id=attempt_id)
         mark_routine_processed(self._state, self.store, event.source_id)
 
     async def _replay_routine_events(self) -> None:
@@ -1640,7 +1778,11 @@ class MupotAdapter(BasePlatformAdapter):
             await self._ack_expected(event.source_id)
             mark_routine_processed(self._state, self.store, event.source_id)
 
-    async def _handle_ack_envelope(self, message: dict[str, Any]) -> None:
+    async def _handle_ack_envelope(
+        self,
+        message: dict[str, Any],
+        attempt_id: Optional[str] = None,
+    ) -> None:
         """Quarantine incomplete ACKs; persist complete receipts before ACKing."""
         message_id = str(message.get("id") or "")
         if not is_terminal_ack(message):
@@ -1649,7 +1791,7 @@ class MupotAdapter(BasePlatformAdapter):
             self._state["dlq"] = quarantined[-100:]
             self.store.save(self._state)
             if message_id:
-                await self._ack_expected(message_id)
+                await self._ack_expected(message_id, attempt_id=attempt_id)
                 self._commit(message_id)
             return
         receipts = deque(self._state.get("terminal_receipts") or [], maxlen=100)
@@ -1662,14 +1804,18 @@ class MupotAdapter(BasePlatformAdapter):
         if self.notification_recipients:
             from .notifications import enqueue
             enqueue(self._state, self.store, message, str(message.get("body") or ""))
-        await self._ack_expected(message_id)
+        await self._ack_expected(message_id, attempt_id=attempt_id)
         self._commit(message_id)
 
-    async def _deliver(self, message: dict[str, Any]) -> None:
+    async def _deliver(
+        self,
+        message: dict[str, Any],
+        attempt_id: Optional[str] = None,
+    ) -> None:
         message_id = str(message.get("id") or "")
         self._state["pending"] = {"message": message}
         self.store.save(self._state)
-        event, runtime = self._begin_delivery(message)
+        event, runtime = self._begin_delivery(message, attempt_id=attempt_id)
         if self._expire_if_needed(runtime):
             logger.warning("[mupot] refusing expired leased message=%s", message_id)
             self.store.save(self._state)
@@ -1707,7 +1853,10 @@ class MupotAdapter(BasePlatformAdapter):
                 # concrete Mupot receipt and its human notice has custody.
                 self.store.save(self._state)
                 return
-            await self._ack_expected(message_id)
+            await self._ack_expected(
+                message_id,
+                attempt_id=runtime.context.attempt_id,
+            )
             self._commit(message_id)
             self._mark_reply_complete(message_id)
             return
@@ -1723,7 +1872,33 @@ class MupotAdapter(BasePlatformAdapter):
             return
         _delivery_context.set(runtime.context)
 
-    async def _ack_expected(self, expected_id: str) -> None:
+    async def _ack_expected(
+        self,
+        expected_id: str,
+        attempt_id: Optional[str] = None,
+    ) -> None:
+        if attempt_id is not None:
+            marker = _lease_reconciliation_proof(
+                self._state.get("lease_reconciliation")
+            )
+            if (
+                marker is None
+                or marker.get("version") != _LEASE_ATTEMPT_MARKER_VERSION
+                or marker.get("attempt_id") != attempt_id
+            ):
+                raise _protocol_error()
+            payload = await self._call_consumer(
+                "inbox_lease_ack",
+                {"attempt_id": attempt_id},
+            )
+            receipt = validate_lease_attempt_ack(payload, attempt_id, marker)
+            if receipt["state"] != "acked" or receipt["consumed"] is not True:
+                raise _protocol_error()
+            logger.info(
+                "[mupot] inbox_lease_ack attempt=%s state=acked",
+                attempt_id,
+            )
+            return
         payload = await self._call_consumer(
             "inbox_ack",
             {"ids": [expected_id]},

@@ -43,18 +43,24 @@ class ProtocolClient:
         self.calls.append((tool, copy.deepcopy(arguments)))
         if tool == "inbox_consumer_status":
             return {
+                "strict_scope": True,
+                "tenant": "tenant-test",
                 "agent_id": "receiver",
+                "effective_inbox_seat": "native",
                 "mode": "bearer_only",
                 "generation": 0,
                 "key_matches": True,
             }
         if tool == "inbox_lease":
             return {
+                "tenant": "tenant-test",
+                "agent_id": "receiver",
+                "effective_inbox_seat": "native",
+                "attempt_id": arguments["attempt_id"],
+                "state": "empty",
+                "lease_expires_at": None,
                 "messages": [],
-                "remaining": 0,
-                "complete": True,
-                "dead_lettered": 0,
-                "lease_seconds": arguments["lease_seconds"],
+                "consumed": False,
             }
         if tool == "inbox_ack":
             message_id = arguments["ids"][0]

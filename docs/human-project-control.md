@@ -54,12 +54,14 @@ and a live non-admin pilot. Enabling handlers or notifications alone does not pr
 loop. Ordinary project members receive no agent token or administrator access.
 
 Native inbox recovery is server-authoritative. Before each one-message lease, the plugin
-fsyncs a bounded random attempt ID together with the authenticated consumer fence. A safe
-pre-send retry reuses that ID. After restart or an ambiguous response, the plugin verifies
-the same consumer fence and asks Mupot for the durable attempt receipt; local wall-clock
-movement cannot authorize recovery. Only an exact live leased tuple is processed and ACKed.
-Empty or terminal tombstones clear without invoking the runtime, while malformed,
-mismatched, or legacy local-clock markers stay fenced for explicit operator reconciliation.
+reads strict tenant/agent/effective-seat scope and fsyncs that scope with a bounded random
+attempt ID. A safe pre-send retry reuses that ID. After restart or an ambiguous response,
+the plugin verifies the same strict scope and asks Mupot for the durable attempt receipt;
+local wall-clock movement cannot authorize recovery. Only the exact scoped leased tuple is
+processed. Attempt-originated work uses `inbox_lease_ack`, never the generic ACK path, and
+local commit requires an exact `acked` receipt with `consumed: true`. Scope changes,
+non-consumed ACKs, malformed responses, and older markers remain fenced for explicit
+operator reconciliation.
 
 Use exactly one native Mupot receiver and one Telegram bot per Hermes profile. The same
 profile owns deterministic commands and return delivery; a second receiver or bot creates
@@ -100,9 +102,9 @@ fail closed. Suspension and capability revocation must deny subsequent commands.
 restart, timeout, or ambiguous reply, reconcile the durable Telegram and domain receipts
 before retrying a decision.
 
-Receipt meanings stay separate throughout: Routine custody, exact source ACK, private
-activation scheduling, channel delivery, human decision, and domain completion each need
-their own readback. No earlier receipt proves a later boundary.
+Receipt meanings stay separate throughout: Routine custody, exact scope-bound attempt ACK,
+private activation scheduling, channel delivery, human decision, and domain completion each
+need their own readback. No earlier receipt proves a later boundary.
 
 This flow grants no merge, deploy, publish, spending, organization-admin, token, or
 independent gate authority. See the

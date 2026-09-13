@@ -103,7 +103,10 @@ class PollRoutineClient(RoutineClient):
         if tool == "inbox_consumer_status":
             self.calls.append((tool, copy.deepcopy(arguments)))
             return {
+                "strict_scope": True,
+                "tenant": "tenant-a",
                 "agent_id": "agent-consumer",
+                "effective_inbox_seat": None,
                 "mode": "bearer_only",
                 "generation": 0,
                 "key_matches": True,
@@ -121,11 +124,25 @@ class PollRoutineClient(RoutineClient):
                 state = "leased"
                 lease_expires_at = self.message["lease_expires_at"]
             return {
+                "tenant": "tenant-a",
+                "agent_id": "agent-consumer",
+                "effective_inbox_seat": None,
                 "attempt_id": attempt_id,
                 "state": state,
                 "lease_expires_at": lease_expires_at,
                 "messages": messages,
                 "consumed": False,
+            }
+        if tool == "inbox_lease_ack":
+            self.calls.append((tool, copy.deepcopy(arguments)))
+            self.already_read = True
+            return {
+                "tenant": "tenant-a",
+                "agent_id": "agent-consumer",
+                "effective_inbox_seat": None,
+                "attempt_id": arguments["attempt_id"],
+                "state": "acked",
+                "consumed": True,
             }
         return await super().call(tool, arguments)
 
@@ -387,7 +404,8 @@ async def test_poll_loop_routes_routine_to_private_activation_without_peer_turn_
         assert len(activations) == 1
         assert peer_turns == []
         assert not any(tool == "send" for tool, _arguments in client.calls)
-        assert ("inbox_ack", {"ids": ["routine-message-1"]}) in client.calls
+        assert any(tool == "inbox_lease_ack" for tool, _arguments in client.calls)
+        assert not any(tool == "inbox_ack" for tool, _arguments in client.calls)
     finally:
         await adapter.disconnect()
 

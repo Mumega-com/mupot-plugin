@@ -812,3 +812,143 @@ async def test_registered_plugin_activates_native_gateway_and_preserves_control_
         manager.unload("mupot")
         await asyncio.gather(*list(runner._background_tasks), return_exceptions=True)
         await asyncio.gather(*list(target_adapter._session_tasks.values()), return_exceptions=True)
+
+
+# ── P0-1 residual (kasra-review re-gate, 2026-09-14): fence escape unit tests ──
+
+
+@pytest.mark.parametrize(
+    "n",
+    [3, 4, 5, 6, 9],
+)
+def test_fenced_untrusted_block_escapes_every_backtick_run_length(n: int) -> None:
+    """Direct unit-level proof for _fenced_untrusted_block, independent of the
+    full flush()-level test in tests/native/test_routine_events.py. The prior
+    escape (`text.replace("```", "`\\u200b``")`) is a left-to-right,
+    non-overlapping str.replace: a run whose length is not itself a multiple
+    of 3 leaves a leftover backtick that recombines with the replacement into
+    a fresh literal run of 3. Mutating the escape to a no-op must turn this
+    red (verified manually during development: `safe = text` here fails at
+    every one of these parametrized lengths)."""
+    import re as _re
+
+    from plugin.mupot_gateway.notifications import _fenced_untrusted_block
+
+    payload = "`" * n
+    result = _fenced_untrusted_block(payload)
+    assert result.startswith("```mupot-notice\n")
+    assert result.endswith("\n```")
+    body = result[len("```mupot-notice\n"):-len("\n```")]
+    assert _re.search(r"`{2,}", body) is None, (n, body)
+    assert body.replace("​", "") == payload
+
+
+def test_fenced_untrusted_block_escapes_ansi_prefixed_run() -> None:
+    from plugin.mupot_gateway.notifications import _fenced_untrusted_block
+    import re as _re
+
+    payload = "\x1b[31m" + "`" * 4 + "\x1b[0m"
+    result = _fenced_untrusted_block(payload)
+    body = result[len("```mupot-notice\n"):-len("\n```")]
+    assert _re.search(r"`{2,}", body) is None
+    assert body.replace("​", "") == payload
+
+
+def test_fenced_untrusted_block_escapes_mixed_cr_lf_zwsp_body() -> None:
+    from plugin.mupot_gateway.notifications import _fenced_untrusted_block
+    import re as _re
+
+    payload = "line1\r\nline2​" + "`" * 6 + "​more\r\n" + "`" * 4
+    result = _fenced_untrusted_block(payload)
+    body = result[len("```mupot-notice\n"):-len("\n```")]
+    assert _re.search(r"`{2,}", body) is None
+    assert body.replace("​", "") == payload.replace("​", "")
+
+
+def test_fenced_untrusted_block_no_backticks_is_unchanged_modulo_fence() -> None:
+    """Control: a body with no backticks at all is not needlessly mangled."""
+    from plugin.mupot_gateway.notifications import _fenced_untrusted_block
+
+    payload = "plain human-readable status update, no code fences here"
+    result = _fenced_untrusted_block(payload)
+    assert result == "```mupot-notice\n" + payload + "\n```"
+
+
+@pytest.mark.asyncio
+async def test_flush_real_estop_sentinel_blocks_activation_at_the_single_choke_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Isolates the SINGLE CHOKE POINT fix in flush() itself (notifications.py),
+    independent of MupotAdapter._handle_routine_event / _handle_ack_envelope's
+    own entry-level gates: enqueue a notice while e-stop is NOT engaged (so it
+    is durably queued exactly as it would be from either producer), THEN
+    engage the real agent/estop.py sentinel and call flush() directly. If this
+    choke point were missing, flush() would still call activate() for an
+    already-queued notice regardless of which path produced it -- which is
+    exactly the "gating the path you named, not the path the finding was
+    about" failure mode from the re-gate. Proves the fix is structural (every
+    producer inherits it) rather than duplicated per call site."""
+    import hermes_constants
+    from agent import estop as real_estop
+    from plugin.mupot_gateway import notifications
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    token = hermes_constants.set_hermes_home_override(str(hermes_home))
+    try:
+        monkeypatch.setattr(
+            notifications,
+            "active_sessions",
+            lambda: [
+                {
+                    "id": "human",
+                    "session_key": "agent:main:telegram:dm:123",
+                    "source": "telegram",
+                    "user_id": "owner",
+                    "chat_id": "123",
+                    "chat_type": "dm",
+                    "last_active": 1,
+                }
+            ],
+        )
+        adapter = adapter_at(tmp_path)
+        activations: list[tuple[str, dict]] = []
+        adapter.message_injector = lambda content, **kw: activations.append((content, kw)) or True
+        adapter.notification_activate = True
+
+        # Enqueue while NOT paused -- this notice exists in durable custody
+        # exactly as either _handle_routine_event or _handle_ack_envelope
+        # would have left it.
+        assert real_estop.is_engaged() is False
+        notifications.enqueue(adapter._state, adapter.store, source("choke-1"), "Please review.")
+
+        real_estop.engage(reason="kasra-review-regate-test")
+        assert real_estop.is_engaged() is True
+
+        await adapter._flush_notifications()
+        assert activations == []
+        notice = StateStore(tmp_path / "inbox.json").load()["notification_outbox"]["choke-1"]
+        # Deferred, not misreported as an ambiguous in-flight activation: the
+        # notice must stay retryable ("pending"), never "activation_unknown"
+        # (that status means "we don't know if Hermes saw it", which is untrue
+        # here -- we refused before ever calling activate()).
+        assert notice["status"] == "pending"
+        assert notice["activation_status"] == "not_started"
+
+        real_estop.disengage()
+        assert real_estop.is_engaged() is False
+
+        # RetryLater's exponential backoff (10s, 20s, ...) is exactly what a
+        # normal poll cycle honors by waiting; simulate "later" deterministically
+        # rather than sleeping in a test, matching how retry_at is otherwise
+        # only ever cleared by real elapsed time.
+        state = StateStore(tmp_path / "inbox.json").load()
+        state["notification_outbox"]["choke-1"]["retry_at"] = 0
+        StateStore(tmp_path / "inbox.json").save(state)
+        adapter._state = state
+
+        await adapter._flush_notifications()
+        assert len(activations) == 1
+    finally:
+        real_estop.disengage()
+        hermes_constants.reset_hermes_home_override(token)

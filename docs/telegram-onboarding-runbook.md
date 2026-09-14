@@ -105,6 +105,12 @@ Before restart or participant invitation:
 2. Verify `native_gateway_enabled: true`, `inbox_watch_enabled: false`, and
    `mupot.routine_events_enabled: true`; the plugin rejects simultaneous native and legacy
    receivers. Keep `mupot-routines` out of the peer `allowed_agents` list.
+   `allowed_agents` entries are lowercased and have one leading `agent:` prefix stripped
+   before comparison (a hand-typed `agent:Kasra` and `kasra` match the same entry). A
+   configured empty value means deny-all and is honored as written; only a genuinely
+   absent key falls back to the default roster
+   (`hadi-codex,hadi-codex-cli,kasra,hermes`) — set it explicitly rather than relying on
+   that default for a real deployment.
 3. Verify the credential-free HTTPS origin is exactly `https://mupot.mumega.com`, with no
    user info, query, or fragment.
 4. Verify the configured tenant and welded agent ID against authenticated Mupot readback.
@@ -206,6 +212,35 @@ external scheduling outcome is uncertain and must not be replayed automatically.
 or a completed turn. If saving the queued state fails after acceptance, the earlier durable
 uncertain state remains the replay fence. Routine activation eligibility is read from the
 exact durable processed Routine receipt, not the bounded recent `processed` ID window.
+
+### Operating on a stranded notification
+
+Call the `mupot_gateway_status` MCP tool to see any notification the receiver could not
+resolve: `stranded_notifications` lists every source ID currently at status
+`activation_unknown` (Hermes accepted or refused scheduling, but the receiver crashed or
+lost the response before it could persist which) or `transport_unknown` (the same
+ambiguity for a direct channel send). Both are deliberately durable, deliberately
+un-retried terminal states, not bugs: an automatic replay would risk delivering the same
+human notice twice with no way to tell.
+
+To operate on a stranded ID:
+
+1. Read the notice's own text (from the retained state file's `notification_outbox` entry,
+   never re-derived) and independently confirm, from the platform side (the Telegram chat
+   history, or the linked human directly), whether the message actually arrived.
+2. If it arrived: leave the record as-is. It is evidence, not a queue entry — nothing else
+   in the plugin acts on it, and it will not be resent.
+3. If it did NOT arrive and the underlying need is still live: drive a fresh, ordinary
+   notification through its normal path (a new Routine action reusing the stable
+   `routine-human:` request ID, or a new peer terminal ACK) rather than editing or
+   resurrecting the stranded record — this repository does not ship a "force retry" tool
+   for `activation_unknown`/`transport_unknown` by design, to avoid ever double-delivering
+   under uncertainty.
+4. Only after confirming delivery status either way, note the reconciliation in your own
+   operator log; the stranded record itself is not cleared automatically and its presence
+   in future `mupot_gateway_status` calls is expected until the underlying state file is
+   rotated or pruned by the normal completed-notice retention (oldest completed records are
+   dropped once more than 999 accumulate).
 
 ## Suspension, revocation, and rollback
 

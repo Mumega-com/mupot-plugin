@@ -52,6 +52,12 @@ provides_tools:
     description: Mint a show-once member credential welded to a configured-squad agent.
   - name: mupot_agent_manager_revoke_token
     description: Revoke a credential welded to a configured-squad agent.
+  - name: mupot_gateway_status
+    description: >
+      Report native Mupot gateway health that nothing else surfaces, including
+      notifications stranded in activation_unknown or transport_unknown
+      (interrupted mid-flight; require operator reconciliation). Only
+      registered when native_gateway_enabled is set.
 
 provides_hooks:
   - name: on_session_start

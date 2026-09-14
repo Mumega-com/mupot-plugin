@@ -569,6 +569,9 @@ def should_accept_message(
     return bool(sender and sender in allowed and str(message.get("body") or "").strip())
 
 
+_ESTOP_IMPORT_WARNED = False
+
+
 def _estop_engaged() -> bool:
     """Enforce Hermes's own global emergency stop for a mupot-originated turn.
 
@@ -579,11 +582,30 @@ def _estop_engaged() -> bool:
     -- `hermes pause` silently does not stop mupot traffic through that path. Rather than
     drop internal=True (which would also skip _is_user_authorized_for_source and route
     mupot's synthetic, unpaired sources through end-user auth they were never designed to
-    satisfy), enforce the same property directly here.
+    satisfy), enforce the same property directly here -- at every call site that reaches
+    a source ACK/consume or a human-session injection (_deliver, _handle_routine_event,
+    _handle_ack_envelope, and notifications.flush()'s activation call), not only one of
+    them.
     """
+    global _ESTOP_IMPORT_WARNED
     try:
         from agent.estop import is_engaged
     except ImportError:
+        # Silent fail-open here would defeat `hermes pause` for all mupot traffic
+        # without a trace. This is the NORMAL, expected path outside the native
+        # Hermes runtime (the plain test.sh suite has no `agent` package at all),
+        # so warn once per process rather than once per call -- every _deliver,
+        # every routine event, and every notification flush would otherwise log.
+        if not _ESTOP_IMPORT_WARNED:
+            _ESTOP_IMPORT_WARNED = True
+            logger.warning(
+                "[mupot] agent.estop is not importable; failing OPEN (treating "
+                "Hermes's global emergency stop as NOT engaged) for every mupot "
+                "e-stop check until it becomes importable again. Expected outside "
+                "the native Hermes runtime (e.g. scripts/test.sh); inside a native "
+                "profile this means agent.estop has moved or been removed and "
+                "`hermes pause` no longer stops mupot traffic."
+            )
         return False
     try:
         return bool(is_engaged())
@@ -875,6 +897,16 @@ class MupotAdapter(BasePlatformAdapter):
             allowed = "hadi-codex,hadi-codex-cli,kasra,hermes"
         if isinstance(allowed, str):
             allowed = [item.strip() for item in allowed.split(",")]
+        elif not isinstance(allowed, (list, tuple, set, frozenset)):
+            # A non-iterable value (int, bool, dict, ...) previously fell straight
+            # into `for item in allowed` below and raised a raw, unhelpful
+            # TypeError. Match the style already used for native_gateway_enabled /
+            # routine_events_enabled elsewhere in this constructor: a clear
+            # config-error message at the point of misconfiguration.
+            raise ValueError(
+                "allowed_agents must be a comma-separated string or a list of "
+                f"agent names, got {type(allowed).__name__}"
+            )
         self.allowed_agents = {
             normalize_agent(item) for item in allowed if normalize_agent(item)
         }
@@ -884,13 +916,21 @@ class MupotAdapter(BasePlatformAdapter):
         # (:233) -- Hermes's own authorization and `hermes pause` never run for a
         # mupot turn. `self.allowed_agents` (should_accept_message, checked before
         # _deliver is ever called) is therefore the ONLY sender fence, and the
-        # e-stop is enforced explicitly in _deliver (see _estop_engaged) instead of
+        # e-stop is enforced explicitly at every call site that reaches a source
+        # ACK/consume or a human-session injection (see _estop_engaged) instead of
         # relying on Hermes's bypassed gate. There used to be a stale
         # `extra["allow_from"] = sorted(self.allowed_agents)` here implying Hermes
-        # consults a second, canonical copy of this allowlist -- it does not
-        # (verified: "allow_from" is read nowhere in gateway/*.py at the pinned
-        # rev); that line was dead and has been removed rather than fixed to avoid
-        # two copies of one predicate.
+        # consults a second, canonical copy of this allowlist. That is FALSE as a
+        # global claim: gateway/authz_mixin.py's _adapter_extra_allowlist_authorizes,
+        # gateway/config_loader.py, and gateway/pairing.py all read extra["allow_from"]
+        # at the pinned rev. The claim only holds SCOPED to this adapter's own call
+        # path: that reader lives on the non-internal auth branch, and
+        # build_mupot_event always sets internal=True, which skips that branch
+        # entirely today. If internal=True is ever dropped from build_mupot_event,
+        # this allowlist must be revisited -- Hermes would then consult
+        # extra["allow_from"] on its own authz path and a caller-supplied identity
+        # could ride in through it. The dead-line removal above is correct only
+        # because of that scoping, not because the tree-wide grep is empty.
         self.server_name = str(extra.get("mcp_server") or "mupot")
         self.expected_agent_id = extra.get("expected_agent_id")
         self.expected_tenant = extra.get("expected_tenant")
@@ -2033,6 +2073,30 @@ class MupotAdapter(BasePlatformAdapter):
         if not self.routine_events_enabled:
             raise RuntimeError("Mupot Routine events are disabled")
         message_id = str(message.get("id") or "")
+        if _estop_engaged():
+            # SECOND named gap from the kasra-review re-gate (2026-09-14): the
+            # round-1 fix only checked _estop_engaged() in _deliver. This
+            # function is reached from _process_leased_message WITHOUT ever
+            # going through _deliver, and -- unlike a peer message -- it
+            # doesn't just risk an unwanted injection: it ACKs (irreversibly
+            # consumes) the Routine source itself via _ack_persisted_ownership
+            # below, before the human ever sees the notice (activation happens
+            # later, in a separate _flush_notifications poll). Proven live with
+            # the real agent/estop.py sentinel: under `hermes pause`, this
+            # path acked the source AND (via the later flush) injected into the
+            # human's session -- only the unrelated _deliver peer-turn path was
+            # blocked. Refuse before validating, persisting, enqueuing, or
+            # acking anything: leave the source entirely untouched so Mupot's
+            # own visibility lease expires and redelivers it once `hermes
+            # resume` lifts the pause, exactly like _deliver already does for
+            # peer turns, instead of recording a local "pending" state that
+            # would need its own reconciliation path.
+            logger.warning(
+                "[mupot] deferring Routine event message=%s: Hermes global "
+                "emergency stop is engaged",
+                message_id,
+            )
+            return
         try:
             event = validate_routine_event(message)
         except RoutineEventValidationError:
@@ -2097,6 +2161,19 @@ class MupotAdapter(BasePlatformAdapter):
     ) -> None:
         """Quarantine incomplete ACKs; persist complete receipts before ACKing."""
         message_id = str(message.get("id") or "")
+        if _estop_engaged():
+            # Same class as _handle_routine_event's gate above: a peer terminal-ACK
+            # body is enqueue()'d into the notification outbox verbatim (see
+            # notifications.py's flush() docstring on notice["text"] being
+            # attacker-reachable here) and this function ACKs the source itself,
+            # neither of which goes through _deliver. Refuse before touching any
+            # durable state, same as _deliver and _handle_routine_event.
+            logger.warning(
+                "[mupot] deferring ack envelope message=%s: Hermes global "
+                "emergency stop is engaged",
+                message_id,
+            )
+            return
         if not is_terminal_ack(message):
             quarantined = self._state.get("dlq") or []
             quarantined.append({"message": dict(message), "reason": "invalid_ack_envelope"})
@@ -2453,6 +2530,23 @@ def register(
             secret_owner=secret_owner,
         )
         _live_adapter[:] = [instance]
+
+        # mupot_gateway_status must never report a DEAD adapter's stale state as
+        # if it were live: wrap disconnect() so the moment Hermes tears this
+        # instance down, the status tool's `_live_adapter[0] if _live_adapter
+        # else None` lookup goes back to None (native_gateway_not_connected)
+        # instead of continuing to answer from an adapter that no longer polls,
+        # acks, or activates anything.
+        original_disconnect = instance.disconnect
+
+        async def _disconnect_and_clear_live_adapter() -> None:
+            try:
+                await original_disconnect()
+            finally:
+                if _live_adapter and _live_adapter[0] is instance:
+                    _live_adapter.clear()
+
+        instance.disconnect = _disconnect_and_clear_live_adapter  # type: ignore[method-assign]
         return instance
 
     ctx.register_platform(

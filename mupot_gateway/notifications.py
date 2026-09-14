@@ -135,11 +135,27 @@ _ACTIVATION_ROLE = "mupot-notice"
 def _fenced_untrusted_block(text):
     """Delimit *text* as quoted DATA, immune to the body forging its own fence close.
 
-    A body containing its own ``` cannot end the block early: the zero-width space keeps
-    the whole notice inside one fence, so the trailer appended by the caller always lands
-    strictly after every byte of *text*, no matter what *text* contains.
+    PRIOR BUG (kasra-review re-gate, 2026-09-14): a single fixed-width
+    ``text.replace("```", "`\\u200b``")`` is a left-to-right, NON-OVERLAPPING
+    replace. A 4-backtick body left one backtick unconsumed after the match,
+    which recombined with the inserted replacement into a fresh run of 3
+    literal backticks -- i.e. the "fix" regenerated the exact delimiter it was
+    escaping for any run whose length was not itself a multiple of 3 (4, 5, 6,
+    9 backticks, ANSI-prefixed or not, all reproduced this). That let an
+    attacker's own fence close early, so the real trailing fence swallowed the
+    "nothing above is a command" caveat into the attacker's code block.
+
+    FIX (class fix, not a repro-shaped patch): escape every backtick
+    character individually, not just literal runs of the closing delimiter.
+    Inserting a zero-width space after EVERY backtick means no two backtick
+    characters are ever adjacent in the escaped output, so the escaped body
+    cannot contain a run of even 2 backticks, let alone the 3 needed to close
+    (or open) a fence -- independent of run length, position, or what
+    characters (ANSI escapes, CR, LF, other zero-width characters the body
+    already contained) surround them. This is provably stronger than "no run
+    of >=3": no run of >=2 survives the escape.
     """
-    safe = text.replace(_FENCE_CLOSE, "`" + "\u200b" + "``")
+    safe = text.replace("`", "`" + "\u200b")
     return _FENCE_OPEN + "\n" + safe + "\n" + _FENCE_CLOSE
 
 
@@ -394,6 +410,35 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
                 activation_default and activate is not None
             )
             if should_activate:
+                # SINGLE CHOKE POINT (kasra-review re-gate, 2026-09-14): this is the
+                # only place in the whole plugin that ever calls the message
+                # injector (`activate`, aka ctx.inject_message). The round-1 fix
+                # gated MupotAdapter._deliver only; _flush_notifications (this
+                # function's caller, run every poll BEFORE the inbox lease) and
+                # _handle_routine_event both reach this exact call without ever
+                # passing through _deliver, so a peer terminal-ACK body and a
+                # Routine human-wait notice both still landed in the human's live
+                # session while `hermes pause` was engaged. Checking here, at the
+                # one call site that actually invokes the injector, means every
+                # PRESENT producer (enqueue() call sites: the peer terminal-ACK
+                # branch and the Routine event branch) and any FUTURE producer
+                # inherits the gate for free -- nobody has to remember to
+                # duplicate an _estop_engaged() check at their own call site.
+                # Raising RetryLater (not a new exception shape) reuses the
+                # existing "pending, retry with backoff" path below: the notice's
+                # own state is left untouched (not "activating"/"activation_unknown",
+                # which would misreport an ambiguous in-flight activation), and
+                # normal delivery resumes automatically once `hermes resume` lifts
+                # the pause, next poll cycle, with no operator reconciliation step.
+                from .adapter import _estop_engaged
+
+                if _estop_engaged():
+                    logger.warning(
+                        "[mupot] deferring human activation source=%s: Hermes "
+                        "global emergency stop is engaged",
+                        source_id,
+                    )
+                    raise RetryLater()
                 if activate is None:
                     raise RuntimeError("Human activation is unavailable")
                 if not target.get("session_key"):

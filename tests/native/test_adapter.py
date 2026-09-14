@@ -1208,6 +1208,36 @@ async def test_terminal_ack_receipt_persistence_failure_prevents_ack(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_estop_engaged_defers_ack_envelope_before_any_state_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Third path from the same class as P0-2: a peer terminal-ACK body is
+    enqueue()'d verbatim into the notification outbox (attacker-reachable, per
+    notifications.py's own docstring) and this function ACKs the source --
+    neither goes through _deliver, so the round-1 fix never covered it either.
+    Gate it the same way as _handle_routine_event: refuse before touching any
+    durable state."""
+    fake_estop = types.SimpleNamespace(is_engaged=lambda: True)
+    monkeypatch.setitem(sys.modules, "agent.estop", fake_estop)
+
+    client = AckMupotClient()
+    config = PlatformConfig(
+        enabled=True,
+        typing_indicator=False,
+        extra={"state_path": str(tmp_path / "state.json")},
+    )
+    adapter = MupotAdapter(config, client_factory=lambda *_: client)
+
+    await adapter._handle_ack_envelope(client.message)
+
+    assert client.ack_calls == 0
+    assert client.sent == []
+    assert "ack-1" not in adapter._state.get("processed", [])
+    assert adapter._state.get("terminal_receipts") in (None, [])
+    assert adapter._state.get("notification_outbox", {}) == {}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tenant,agent,accepted", [("right-tenant", "right-agent", True),
     ("other-tenant", "right-agent", False), ("right-tenant", "other-agent", False)])
 async def test_gateway_verifies_operator_identity_before_reading_mail(tmp_path, tenant, agent, accepted):
@@ -1366,16 +1396,43 @@ def test_absent_allowed_agents_key_falls_back_to_the_documented_default(tmp_path
     assert adapter.allowed_agents == {"hadi-codex", "hadi-codex-cli", "kasra", "hermes"}
 
 
-def test_allow_from_is_not_derived_dead_config(tmp_path: Path) -> None:
-    """The removed `extra["allow_from"]` line implied Hermes consults a second copy
-    of this allowlist; it does not (verified against the pinned Hermes rev: "allow_from"
-    is read nowhere in gateway/*.py). Guard against it silently coming back."""
+def test_allow_from_is_not_derived_on_the_internal_true_path(tmp_path: Path) -> None:
+    """CORRECTED CLAIM (kasra-review re-gate, 2026-09-14): the removed
+    `extra["allow_from"] = sorted(self.allowed_agents)` line implied Hermes
+    consults a second copy of this allowlist. The prior version of this test
+    (and its docstring/comment) asserted a FALSE global negative: "allow_from"
+    IS read at the pinned rev, at gateway/authz_mixin.py's
+    _adapter_extra_allowlist_authorizes, and handled by gateway/config_loader.py
+    and gateway/pairing.py. The reason the removal is still correct is narrower
+    and SCOPED to this adapter's own call path: that reader lives on Hermes's
+    non-internal auth branch, and build_mupot_event always sets internal=True,
+    which skips that branch entirely today (gateway/run_inbound.py:174). If
+    internal=True is ever dropped from build_mupot_event, allow_from must be
+    revisited -- this test only guards against the dead line silently coming
+    back, it does not (and must not be read to) claim Hermes never consults
+    "allow_from" anywhere in the tree."""
     config = PlatformConfig(enabled=True, extra={
         "allowed_agents": "kasra",
         "state_path": str(tmp_path / "state.json"),
     })
     MupotAdapter(config, client_factory=lambda *_: FakeMupotClient())
     assert "allow_from" not in (config.extra or {})
+
+
+@pytest.mark.parametrize("bad_value", [0, 1, True, False, 3.5, {"a": "b"}])
+def test_allowed_agents_non_iterable_value_raises_clear_config_error(
+    tmp_path: Path, bad_value: object,
+) -> None:
+    """A non-string, non-list allowed_agents (int/bool/float/dict) previously fell
+    straight into `for item in allowed` and raised a raw, unhelpful TypeError.
+    Match the style already used for native_gateway_enabled/routine_events_enabled:
+    a clear config-error message naming the offending field."""
+    config = PlatformConfig(enabled=True, extra={
+        "allowed_agents": bad_value,
+        "state_path": str(tmp_path / "state.json"),
+    })
+    with pytest.raises(ValueError, match="allowed_agents must be"):
+        MupotAdapter(config, client_factory=lambda *_: FakeMupotClient())
 
 
 @pytest.mark.asyncio
@@ -1435,15 +1492,48 @@ async def test_estop_not_engaged_dispatches_normally(
 
 
 def test_estop_engaged_fails_open_to_false_when_hermes_estop_is_unimportable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Outside the native Hermes runtime (e.g. the plain test.sh suite), `agent.estop`
-    does not exist; _estop_engaged must degrade to "not engaged" rather than crash the
-    adapter import/construction path."""
-    from plugin.mupot_gateway.adapter import _estop_engaged
+    """P1 residual (kasra-review re-gate, 2026-09-14): this test used to
+    `monkeypatch.delitem(sys.modules, "agent.estop")` and assert the result was
+    False. But this test file runs in the NATIVE suite, where `agent.estop`
+    genuinely exists on sys.path -- deleting the cached module only forces a
+    successful RE-import, so the test passed for the wrong reason. Proven:
+    replacing `except ImportError: return False` with `raise AssertionError`
+    left the whole 276-test native suite green, i.e. the fail-open branch had
+    zero real coverage.
 
-    monkeypatch.delitem(sys.modules, "agent.estop", raising=False)
-    assert _estop_engaged() is False
+    Fix: force a REAL ImportError via the import machinery itself
+    (builtins.__import__), which is the only honest way to exercise this
+    except-branch from inside an environment where the module actually is
+    importable. Also assert the WARNING log line fires exactly once (the
+    fail-open must never be silent), reset via the module's own log-once flag
+    so this test is independent of whatever ran before it.
+    """
+    import builtins
+
+    from plugin.mupot_gateway import adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "_ESTOP_IMPORT_WARNED", False)
+    real_import = builtins.__import__
+
+    def blocking_import(name, *args, **kwargs):
+        if name == "agent.estop":
+            raise ImportError("agent.estop forced unavailable for this test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocking_import)
+
+    with caplog.at_level(logging.WARNING, logger="plugin.mupot_gateway.adapter"):
+        assert adapter_module._estop_engaged() is False
+        # A second call must not spam a second warning (log once per process).
+        assert adapter_module._estop_engaged() is False
+
+    warnings = [
+        record for record in caplog.records
+        if "agent.estop is not importable" in record.getMessage()
+    ]
+    assert len(warnings) == 1
 
 
 @pytest.mark.asyncio
@@ -1514,3 +1604,46 @@ def test_gateway_status_tool_reports_stranded_notifications(tmp_path: Path) -> N
         "delivery_status": None,
         "last_error": None,
     }]
+
+
+@pytest.mark.asyncio
+async def test_gateway_status_clears_to_disconnected_after_adapter_disconnect(
+    tmp_path: Path,
+) -> None:
+    """P2 hygiene item from the kasra-review re-gate (2026-09-14): _live_adapter
+    was never cleared on disconnect/close, so mupot_gateway_status could go on
+    reporting a DEAD adapter's stale local state (stranded_notifications etc)
+    as if the native gateway were still connected. register()'s adapter_factory
+    must wrap disconnect() so the status tool's live-instance lookup reverts to
+    native_gateway_not_connected once Hermes tears the platform down."""
+    from plugin.mupot_gateway.adapter import register as register_native_gateway
+
+    tools: dict[str, object] = {}
+
+    class Ctx:
+        def inject_message(self, *_a, **_kw):
+            return True
+
+        def register_platform(self, **kwargs):
+            self.adapter_factory = kwargs["adapter_factory"]
+
+        def register_tool(self, **kwargs):
+            tools[kwargs["name"]] = kwargs["handler"]
+
+    ctx = Ctx()
+    register_native_gateway(ctx)
+    instance = ctx.adapter_factory(
+        PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "state.json")})
+    )
+    # Swap in a client whose close() is a real no-op coroutine so disconnect()
+    # can run to completion without a live MCP connection.
+    instance._client = FakeMupotClient()
+    instance._send_client = instance._client
+
+    connected = json.loads(tools["mupot_gateway_status"]({}))
+    assert connected["ok"] is True
+
+    await instance.disconnect()
+
+    disconnected = json.loads(tools["mupot_gateway_status"]({}))
+    assert disconnected == {"ok": False, "error": "native_gateway_not_connected"}

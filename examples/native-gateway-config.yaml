@@ -36,6 +36,11 @@ mupot:
   # During migration, use the exact existing path; do not start a new empty ledger.
   # Fresh installations may omit this and use the profile-aware default.
   state_path: <ABSOLUTE_PATH_TO_EXISTING_MUPOT_STATE_JSON>
+  # Comma-separated string or a list; each entry is lowercased and has one leading
+  # "agent:" prefix stripped before comparison. An explicit empty value ([] or "")
+  # means deny-all and is honored as written. Only a genuinely ABSENT key falls back
+  # to the default four-agent roster (hadi-codex,hadi-codex-cli,kasra,hermes) -- set
+  # this explicitly for a real deployment rather than relying on that default.
   allowed_agents: [<ALLOWED_PEER_AGENT_ID>]
   notification_recipients:
     telegram: '<IMMUTABLE_TELEGRAM_USER_ID>'

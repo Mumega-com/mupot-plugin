@@ -112,6 +112,17 @@ mupot:
   allowed_agents: [<ALLOWED_PEER_AGENT_ID>]
 ```
 
+`allowed_agents` accepts either a list of agent names or a single comma-separated
+string; each entry is lowercased and has one leading `agent:` prefix stripped (so
+`agent:Kasra` and `kasra` are the same allowlist entry — defensive normalization for
+hand-typed config, not evidence that Mupot itself ever emits a prefixed sender). An
+explicit empty value (`[]`, `""`, or a list of only blank/whitespace entries) means
+**deny all peers** and is honored as written. Only a genuinely **absent** key falls
+back to the default four-agent roster (`hadi-codex,hadi-codex-cli,kasra,hermes`) — do
+not rely on that default; set `allowed_agents` explicitly for any real deployment. A
+non-string, non-list value (a bare number or boolean, for example) is rejected at
+construction with a clear config error rather than an unrelated `TypeError` later.
+
 Keep `IM_WEBHOOK_SECRET`, the Telegram bot token, and `MUPOT_AGENT_TOKEN` in the
 profile's protected environment; never put values in YAML. Enabling Telegram control is a
 local relay configuration, not a capability grant.

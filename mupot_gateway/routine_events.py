@@ -24,7 +24,14 @@ _BODY_VERSION = "routine.human-wait/v1"
 _BODY_TYPE = "routine_human_wait"
 _BODY_LIMIT = 8000
 _REF_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
-_SOURCE_ID_RE = re.compile(r"^[^\s]{1,128}$")
+# P3 hardening (kasra-review re-gate #2, 2026-09-14): source_id lands unfenced in
+# the injected notification header (notifications.py's _notice_text: "Reference: "
+# + source_id). Not attacker-reachable today -- mupot generates ids via
+# crypto.randomUUID (messages.ts idGen), which this pattern still admits, and the
+# server, not this plugin, is the only producer of a routine event's id -- but
+# exclude backtick/`[`/`]` defensively so a future id source can't fence-escape or
+# fake a markdown link inside that header.
+_SOURCE_ID_RE = re.compile(r"^[^\s`\[\]]{1,128}$")
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _CHECKSUM_RE = re.compile(r"^[a-f0-9]{64}$")
 _RECEIPT_VERSION = 2

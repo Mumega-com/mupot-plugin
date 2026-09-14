@@ -129,6 +129,23 @@ class MupotSafeRetryError(RuntimeError):
     """A connection failure proven to occur before any request bytes were sent."""
 
 
+class _EstopDeferred(Exception):
+    """A leased message was deferred because Hermes's global e-stop is engaged.
+
+    A pause is a TEMPORAL condition, never a state transition: it must never
+    surface as `_protocol_error()` (which the poll loop treats as a permanent
+    protocol violation and answers by calling `_quarantine_inbox_polling()` --
+    a durable, `connect()`-refusing state that outlives the pause and requires
+    manual `reconcile_inbox_polling()`). `_deliver`, `_handle_routine_event`
+    and `_handle_ack_envelope` raise this -- instead of a bare `return` -- the
+    moment their `_estop_engaged()` guard fires, before any durable state is
+    touched, so every caller of `_process_leased_message` (the live poll loop
+    and `reconcile_inbox_polling`) can recognise "deferred by pause" and
+    release the lease to expire for natural redelivery, rather than folding it
+    into "message not marked processed => protocol error".
+    """
+
+
 def _protocol_error() -> MupotProtocolError:
     return MupotProtocolError(_GENERIC_MCP_PROTOCOL_ERROR)
 
@@ -907,6 +924,17 @@ class MupotAdapter(BasePlatformAdapter):
                 "allowed_agents must be a comma-separated string or a list of "
                 f"agent names, got {type(allowed).__name__}"
             )
+        # P3 hardening (kasra-review re-gate #2, 2026-09-14): a non-string entry
+        # inside an otherwise-valid list (e.g. [123, "kasra"]) previously reached
+        # normalize_agent()'s `str(value or "")`, which silently stringifies it
+        # into a plausible-looking agent name instead of failing the
+        # misconfiguration loudly, same class as the non-iterable check above.
+        for item in allowed:
+            if not isinstance(item, str):
+                raise ValueError(
+                    "allowed_agents entries must be strings, got "
+                    f"{type(item).__name__}: {item!r}"
+                )
         self.allowed_agents = {
             normalize_agent(item) for item in allowed if normalize_agent(item)
         }
@@ -1919,10 +1947,25 @@ class MupotAdapter(BasePlatformAdapter):
             )
             if outcome["state"] == "leased":
                 message = outcome["messages"][0]
-                await self._process_leased_message(
-                    message,
-                    attempt_id=marker["attempt_id"],
-                )
+                try:
+                    await self._process_leased_message(
+                        message,
+                        attempt_id=marker["attempt_id"],
+                    )
+                except _EstopDeferred:
+                    # Same class as _poll_loop's own handling: a pause that happens
+                    # to be engaged while an operator is reconciling an existing
+                    # quarantine is not itself a NEW protocol violation. Leave the
+                    # quarantine marker exactly as it was (nothing here proves the
+                    # original attempt's outcome one way or the other) and let the
+                    # caller retry `reconcile_inbox_polling()` once `hermes resume`
+                    # lifts the pause, instead of logging this as a failed
+                    # reconciliation.
+                    logger.info(
+                        "[mupot] inbox reconciliation deferred: Hermes global "
+                        "emergency stop is engaged"
+                    )
+                    return False
                 message_id = message["id"]
                 if message_id not in self._state.get("processed", []):
                     raise _protocol_error()
@@ -1981,6 +2024,20 @@ class MupotAdapter(BasePlatformAdapter):
                 await asyncio.sleep(self.poll_interval)
                 continue
 
+            # THIRD named gap from the kasra-review re-gate #2 (2026-09-14): a pause
+            # is a TEMPORAL condition, never a state transition. Checking here, before
+            # `inbox_lease` is ever called, means nothing is leased, nothing is acked,
+            # and no durable state is written for the duration of the pause -- this is
+            # also what keeps the routine_events_disabled-quarantine branch (below,
+            # `_process_leased_message`) and the sender-policy DLQ branch from
+            # consuming a message while paused: neither branch can run without a lease
+            # first, and no lease is ever attempted here while `_estop_engaged()`.
+            if _estop_engaged():
+                logger.info(
+                    "[mupot] inbox polling paused: Hermes global emergency stop is engaged"
+                )
+                await asyncio.sleep(self.poll_interval)
+                continue
             try:
                 attempt_id = self._new_lease_attempt_id()
                 arguments = {
@@ -2008,7 +2065,29 @@ class MupotAdapter(BasePlatformAdapter):
                         message.get("delivery_attempts"),
                         message.get("request_id"),
                     )
-                    await self._process_leased_message(message, attempt_id=attempt_id)
+                    try:
+                        await self._process_leased_message(message, attempt_id=attempt_id)
+                    except _EstopDeferred:
+                        # The e-stop engaged between this iteration's pre-lease check
+                        # above and the message actually being handled (a narrow race,
+                        # not the common case, but the SAME class: a pause is never a
+                        # protocol error). `_deliver`/`_handle_routine_event`/
+                        # `_handle_ack_envelope` raise this before touching any durable
+                        # state, so there is nothing to unwind here -- release this
+                        # attempt's lease fence (no reconciliation is owed for a lease
+                        # we chose to abandon, as opposed to one a genuine protocol
+                        # violation left dangling) and let the server-side lease expire
+                        # on its own so `inbox_lease` redelivers the exact same message
+                        # once `hermes resume` lifts the pause.
+                        logger.info(
+                            "[mupot] deferring leased message=%s mid-poll: Hermes "
+                            "global emergency stop is engaged; leaving lease to expire "
+                            "for redelivery",
+                            message_id,
+                        )
+                        self._clear_lease_fence()
+                        await asyncio.sleep(self.poll_interval)
+                        continue
                     if message_id not in self._state.get("processed", []):
                         raise _protocol_error()
                 self._clear_lease_fence()
@@ -2088,15 +2167,21 @@ class MupotAdapter(BasePlatformAdapter):
             # blocked. Refuse before validating, persisting, enqueuing, or
             # acking anything: leave the source entirely untouched so Mupot's
             # own visibility lease expires and redelivers it once `hermes
-            # resume` lifts the pause, exactly like _deliver already does for
-            # peer turns, instead of recording a local "pending" state that
-            # would need its own reconciliation path.
+            # resume` lifts the pause. THIRD named gap (re-gate #2): a bare
+            # `return` here left the message unmarked-processed, which
+            # `_poll_loop` then read as a protocol violation and answered with
+            # `_quarantine_inbox_polling()` -- a DURABLE, `connect()`-refusing
+            # state that survives the pause and needs a manual
+            # `reconcile_inbox_polling()` to clear. Raising `_EstopDeferred`
+            # instead lets `_poll_loop` recognise "deferred by a pause" and
+            # release the lease without ever recording a "pending"
+            # reconciliation state.
             logger.warning(
                 "[mupot] deferring Routine event message=%s: Hermes global "
                 "emergency stop is engaged",
                 message_id,
             )
-            return
+            raise _EstopDeferred(message_id)
         try:
             event = validate_routine_event(message)
         except RoutineEventValidationError:
@@ -2164,16 +2249,18 @@ class MupotAdapter(BasePlatformAdapter):
         if _estop_engaged():
             # Same class as _handle_routine_event's gate above: a peer terminal-ACK
             # body is enqueue()'d into the notification outbox verbatim (see
-            # notifications.py's flush() docstring on notice["text"] being
-            # attacker-reachable here) and this function ACKs the source itself,
-            # neither of which goes through _deliver. Refuse before touching any
-            # durable state, same as _deliver and _handle_routine_event.
+            # notifications.py's flush() for how that body reaches a human) and
+            # this function ACKs the source itself, neither of which goes through
+            # _deliver. Refuse before touching any durable state, same as _deliver
+            # and _handle_routine_event -- and raise _EstopDeferred rather than
+            # return bare, so the poll loop treats this as a pause to wait out,
+            # never as a protocol violation to quarantine.
             logger.warning(
                 "[mupot] deferring ack envelope message=%s: Hermes global "
                 "emergency stop is engaged",
                 message_id,
             )
-            return
+            raise _EstopDeferred(message_id)
         if not is_terminal_ack(message):
             quarantined = self._state.get("dlq") or []
             quarantined.append({"message": dict(message), "reason": "invalid_ack_envelope"})
@@ -2205,13 +2292,14 @@ class MupotAdapter(BasePlatformAdapter):
         if _estop_engaged():
             # Refuse before touching any durable state: leave the message unacked so
             # Mupot's own visibility lease expires and redelivers it once `hermes
-            # resume` lifts the pause, instead of recording a local "pending" that
-            # would need its own reconciliation path.
+            # resume` lifts the pause. Raise _EstopDeferred (not a bare return) so
+            # the poll loop treats this as a pause to wait out, never as a protocol
+            # violation that needs `_quarantine_inbox_polling()`.
             logger.warning(
                 "[mupot] deferring leased message=%s: Hermes global emergency stop is engaged",
                 message_id,
             )
-            return
+            raise _EstopDeferred(message_id)
         self._state["pending"] = {"message": message}
         self.store.save(self._state)
         event, runtime = self._begin_delivery(message, attempt_id=attempt_id)

@@ -215,6 +215,76 @@ class PollRoutineClient(RoutineClient):
         return await super().call(tool, arguments)
 
 
+class ResilientPollClient(RoutineClient):
+    """Like PollRoutineClient, but re-offers the SAME message on every
+    inbox_lease call until it is genuinely acked (via inbox_lease_ack) --
+    models a real broker's lease-expiry redelivery. PollRoutineClient's
+    "leased once, empty forever after" stub cannot prove a message deferred by
+    a pause (never acked) comes back once `hermes resume` lifts it; this one
+    can. ``on_first_lease`` fires exactly once, the moment the message is
+    handed back for the first time, to simulate an e-stop engaging during the
+    inbox_lease round trip (after the poll loop's pre-lease pause check
+    already passed)."""
+
+    def __init__(self, message: dict[str, object], *, on_first_lease=None) -> None:
+        super().__init__()
+        self.message = message
+        self.on_first_lease = on_first_lease
+        self._fired_first_lease = False
+        self.acked = False
+
+    async def close(self) -> None:
+        return None
+
+    async def call(self, tool: str, arguments: dict) -> dict:
+        if tool == "inbox_consumer_status":
+            self.calls.append((tool, copy.deepcopy(arguments)))
+            return {
+                "strict_scope": True,
+                "tenant": "tenant-a",
+                "agent_id": "agent-consumer",
+                "effective_inbox_seat": None,
+                "mode": "bearer_only",
+                "generation": 0,
+                "key_matches": True,
+            }
+        if tool == "inbox_lease":
+            self.calls.append((tool, copy.deepcopy(arguments)))
+            attempt_id = arguments["attempt_id"]
+            if self.acked:
+                messages, state, lease_expires_at = [], "empty", None
+            else:
+                messages = [copy.deepcopy(self.message)]
+                state = "leased"
+                lease_expires_at = self.message["lease_expires_at"]
+                if not self._fired_first_lease:
+                    self._fired_first_lease = True
+                    if self.on_first_lease is not None:
+                        self.on_first_lease()
+            return {
+                "tenant": "tenant-a",
+                "agent_id": "agent-consumer",
+                "effective_inbox_seat": None,
+                "attempt_id": attempt_id,
+                "state": state,
+                "lease_expires_at": lease_expires_at,
+                "messages": messages,
+                "consumed": False,
+            }
+        if tool == "inbox_lease_ack":
+            self.calls.append((tool, copy.deepcopy(arguments)))
+            self.acked = True
+            return {
+                "tenant": "tenant-a",
+                "agent_id": "agent-consumer",
+                "effective_inbox_seat": None,
+                "attempt_id": arguments["attempt_id"],
+                "state": "acked",
+                "consumed": True,
+            }
+        return await super().call(tool, arguments)
+
+
 def adapter_at(
     tmp_path: Path,
     client: RoutineClient,
@@ -314,6 +384,35 @@ def test_refuses_each_spoof_or_legacy_dimension(
         updates = {**updates, "body": routine_body(**body_updates)}
     with pytest.raises(RoutineEventValidationError):
         validate_routine_event(routine_message(**updates))
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "id-with-a-`-backtick",
+        "id-with-[brackets]",
+        "id[0]",
+        "`id`",
+    ],
+)
+def test_source_id_regex_rejects_backtick_and_bracket_characters(bad_id: str) -> None:
+    """P3 hardening (kasra-review re-gate #2, 2026-09-14): source_id lands
+    unfenced in the injected notification header (notifications.py's
+    _notice_text: "Reference: " + source_id). Not attacker-reachable today
+    (mupot generates ids via crypto.randomUUID), but exclude backtick/`[`/`]`
+    defensively so a future id source can't fence-escape or fake a markdown
+    link inside that header."""
+    with pytest.raises(RoutineEventValidationError):
+        validate_routine_event(routine_message(id=bad_id))
+
+
+def test_source_id_regex_still_accepts_a_real_uuid() -> None:
+    """Control for the test above: the tightened regex must not reject the
+    actual id shape mupot generates (crypto.randomUUID)."""
+    event = validate_routine_event(
+        routine_message(id="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+    )
+    assert event.source_id == "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
 
 def test_rejects_duplicate_json_keys_and_truncated_summary_is_never_consent() -> None:
@@ -652,7 +751,13 @@ async def test_real_estop_sentinel_blocks_routine_ack_and_injection_then_resumes
     HERMES_HOME (agent.estop.engage(), not a monkeypatched is_engaged), drives
     a routine.human-wait envelope through _handle_routine_event, and asserts
     ZERO inbox_ack MCP calls and ZERO injections while paused -- then
-    disengages and confirms normal delivery resumes with no special-casing."""
+    disengages and confirms normal delivery resumes with no special-casing.
+
+    re-gate #2 (2026-09-14): _handle_routine_event now raises _EstopDeferred
+    instead of returning bare -- this test only proves the direct-call level
+    (no durable state touched); see test_real_poll_loop_* below for the
+    end-to-end proof that this doesn't get treated as a protocol error by the
+    poll loop."""
     import hermes_constants
     from agent import estop as real_estop
     from plugin.mupot_gateway import notifications
@@ -689,7 +794,10 @@ async def test_real_estop_sentinel_blocks_routine_ack_and_injection_then_resumes
         adapter = adapter_at(tmp_path, client, injector=activate)
         message = routine_message()
 
-        await adapter._handle_routine_event(message)
+        from plugin.mupot_gateway.adapter import _EstopDeferred
+
+        with pytest.raises(_EstopDeferred):
+            await adapter._handle_routine_event(message)
         await adapter._flush_notifications()
 
         assert client.calls == []
@@ -779,7 +887,10 @@ async def test_real_estop_sentinel_blocks_ack_envelope_injection_then_resumes(
             "lease_expires_at": "2026-09-13T10:05:00.000Z",
         }
 
-        await adapter._handle_ack_envelope(message)
+        from plugin.mupot_gateway.adapter import _EstopDeferred
+
+        with pytest.raises(_EstopDeferred):
+            await adapter._handle_ack_envelope(message)
         await adapter._flush_notifications()
 
         assert client.calls == []
@@ -796,6 +907,215 @@ async def test_real_estop_sentinel_blocks_ack_envelope_injection_then_resumes(
 
         await adapter._flush_notifications()
         assert len(activations) == 1
+    finally:
+        real_estop.disengage()
+        hermes_constants.reset_hermes_home_override(token)
+
+
+@pytest.mark.asyncio
+async def test_real_poll_loop_pauses_before_lease_then_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0 (kasra-review re-gate #2, 2026-09-14), proven through the REAL
+    `_poll_loop` background task (not a direct call to a gated method): a
+    pause is a temporal condition, never a state transition. Round-2's fix
+    added `_estop_engaged()` checks inside `_deliver`/`_handle_routine_event`/
+    `_handle_ack_envelope`, but `_poll_loop` itself (adapter.py:2012 at the
+    reviewed head) then read the resulting "message not marked processed" as
+    a protocol violation and called `_quarantine_inbox_polling()` -- a
+    durable, `connect()`-refusing state that survives the pause. This test
+    engages the REAL agent/estop.py sentinel BEFORE `connect()`, lets the real
+    background poll task run for several ticks, and asserts: zero
+    `inbox_lease` calls (the pre-lease check must stop the loop before it ever
+    asks for work, which is also what keeps the routine_events_disabled and
+    sender-policy-DLQ branches inside `_process_leased_message` from firing --
+    neither can run without a lease first), the poll task still alive (not
+    exited via `_quarantine_inbox_polling()`'s `return`), `_lease_quarantined`
+    still False, and `state.json` carrying no `lease_reconciliation` key. Then
+    disengages and confirms the SAME still-running poll task delivers the
+    message exactly once with no special-casing needed."""
+    import hermes_constants
+    from agent import estop as real_estop
+    from plugin.mupot_gateway import adapter as adapter_module
+    from plugin.mupot_gateway import notifications
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    token = hermes_constants.set_hermes_home_override(str(hermes_home))
+    try:
+        real_estop.engage(reason="kasra-review-regate2-poll-loop-test")
+        assert real_estop.is_engaged() is True
+
+        monkeypatch.setattr(
+            adapter_module, "require_supported_profile_runtime", lambda _config: None
+        )
+        monkeypatch.setattr(
+            notifications,
+            "active_sessions",
+            lambda: [
+                {
+                    "id": "human",
+                    "session_key": "agent:main:telegram:dm:123",
+                    "source": "telegram",
+                    "user_id": "owner",
+                    "chat_id": "123",
+                    "chat_type": "dm",
+                    "last_active": 1,
+                }
+            ],
+        )
+        activations: list[tuple[str, dict]] = []
+
+        def activate(content, **kwargs):
+            activations.append((content, kwargs))
+            return True
+
+        client = ResilientPollClient(routine_message())
+        adapter = adapter_at(tmp_path, client, injector=activate)
+        adapter.poll_interval = 0.01
+
+        assert await adapter.connect() is True
+        try:
+            # Several real poll ticks while paused.
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+
+            lease_calls = [c for c in client.calls if c[0] != "inbox_consumer_status"]
+            assert lease_calls == [], (
+                "inbox_lease (or any other post-connect consumer call) must "
+                f"never be attempted while paused, got: {client.calls}"
+            )
+            assert activations == []
+            assert adapter._poll_task is not None
+            assert not adapter._poll_task.done(), (
+                "the poll task must still be running -- it must never exit "
+                "via _quarantine_inbox_polling()'s `return` for a mere pause"
+            )
+            assert adapter._lease_quarantined is False
+            state = StateStore(tmp_path / "state.json").load()
+            assert "lease_reconciliation" not in state
+            assert state.get("processed", []) == []
+
+            real_estop.disengage()
+            assert real_estop.is_engaged() is False
+
+            for _ in range(200):
+                if activations:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(activations) == 1
+            ack_calls = [c for c in client.calls if c[0] == "inbox_lease_ack"]
+            assert len(ack_calls) == 1, f"expected exactly one ack, got: {client.calls}"
+            state = StateStore(tmp_path / "state.json").load()
+            assert state["processed"] == ["routine-message-1"]
+            assert not adapter._poll_task.done()
+        finally:
+            await adapter.disconnect()
+    finally:
+        real_estop.disengage()
+        hermes_constants.reset_hermes_home_override(token)
+
+
+@pytest.mark.asyncio
+async def test_real_poll_loop_defers_mid_message_then_resumes_without_quarantine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Second half of the same P0 class: the e-stop can engage in the narrow
+    window AFTER the poll loop's pre-lease check passes but BEFORE the leased
+    message is actually handled (a real race, not the common case).
+    `ResilientPollClient.on_first_lease` fires the moment `inbox_lease` hands
+    back the message the first time, engaging the REAL sentinel mid-round-trip
+    -- by the time `_handle_routine_event`'s own `_estop_engaged()` check
+    runs, it is True. This must release the lease (no `inbox_lease_ack`, no
+    `_protocol_error()`, no `_quarantine_inbox_polling()`) and let the SAME
+    still-unacked message be leased and delivered again once resumed, exactly
+    once."""
+    import hermes_constants
+    from agent import estop as real_estop
+    from plugin.mupot_gateway import adapter as adapter_module
+    from plugin.mupot_gateway import notifications
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    token = hermes_constants.set_hermes_home_override(str(hermes_home))
+    try:
+        assert real_estop.is_engaged() is False
+
+        monkeypatch.setattr(
+            adapter_module, "require_supported_profile_runtime", lambda _config: None
+        )
+        monkeypatch.setattr(
+            notifications,
+            "active_sessions",
+            lambda: [
+                {
+                    "id": "human",
+                    "session_key": "agent:main:telegram:dm:123",
+                    "source": "telegram",
+                    "user_id": "owner",
+                    "chat_id": "123",
+                    "chat_type": "dm",
+                    "last_active": 1,
+                }
+            ],
+        )
+        activations: list[tuple[str, dict]] = []
+
+        def activate(content, **kwargs):
+            activations.append((content, kwargs))
+            return True
+
+        client = ResilientPollClient(
+            routine_message(),
+            on_first_lease=lambda: real_estop.engage(
+                reason="kasra-review-regate2-mid-message-test"
+            ),
+        )
+        adapter = adapter_at(tmp_path, client, injector=activate)
+        adapter.poll_interval = 0.01
+
+        assert await adapter.connect() is True
+        try:
+            for _ in range(200):
+                if client.calls and client.calls[0][0] == "inbox_lease":
+                    break
+                await asyncio.sleep(0.01)
+            # Give the poll loop a few more ticks to prove it neither acks nor
+            # quarantines while the mid-message defer is in effect.
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+
+            assert real_estop.is_engaged() is True
+            ack_calls = [c for c in client.calls if c[0] == "inbox_lease_ack"]
+            assert ack_calls == [], (
+                "a mid-message defer must never ack the lease it abandoned"
+            )
+            assert activations == []
+            assert adapter._poll_task is not None
+            assert not adapter._poll_task.done(), (
+                "a mid-message defer must never be treated as a protocol "
+                "violation that ends the poll task via "
+                "_quarantine_inbox_polling()"
+            )
+            assert adapter._lease_quarantined is False
+            state = StateStore(tmp_path / "state.json").load()
+            assert "lease_reconciliation" not in state
+            assert state.get("processed", []) == []
+
+            real_estop.disengage()
+            assert real_estop.is_engaged() is False
+
+            for _ in range(200):
+                if activations:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(activations) == 1
+            ack_calls = [c for c in client.calls if c[0] == "inbox_lease_ack"]
+            assert len(ack_calls) == 1, f"expected exactly one ack, got: {client.calls}"
+            state = StateStore(tmp_path / "state.json").load()
+            assert state["processed"] == ["routine-message-1"]
+        finally:
+            await adapter.disconnect()
     finally:
         real_estop.disengage()
         hermes_constants.reset_hermes_home_override(token)

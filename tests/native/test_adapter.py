@@ -22,6 +22,7 @@ from plugin.mupot_gateway.adapter import (  # noqa: E402
     MupotTransportError,
     MupotAdapter,
     StateStore,
+    _EstopDeferred,
     build_mupot_event,
     is_ack_envelope,
     is_terminal_ack,
@@ -1216,7 +1217,18 @@ async def test_estop_engaged_defers_ack_envelope_before_any_state_mutation(
     notifications.py's own docstring) and this function ACKs the source --
     neither goes through _deliver, so the round-1 fix never covered it either.
     Gate it the same way as _handle_routine_event: refuse before touching any
-    durable state."""
+    durable state.
+
+    re-gate #2 (2026-09-14): this must raise _EstopDeferred, not just return
+    silently -- a bare return left the caller (_poll_loop / _process_leased_
+    message) with no way to tell "deferred by a pause" apart from "the message
+    was simply never processed", and the poll loop answered the latter with
+    `_protocol_error()` -> `_quarantine_inbox_polling()`, turning a temporary
+    pause into a durable, connect()-refusing quarantine. See
+    test_routine_events.py's real-poll-loop tests for that end-to-end proof;
+    this test only proves the narrower "no durable state was touched" property
+    at the direct-call level.
+    """
     fake_estop = types.SimpleNamespace(is_engaged=lambda: True)
     monkeypatch.setitem(sys.modules, "agent.estop", fake_estop)
 
@@ -1228,7 +1240,8 @@ async def test_estop_engaged_defers_ack_envelope_before_any_state_mutation(
     )
     adapter = MupotAdapter(config, client_factory=lambda *_: client)
 
-    await adapter._handle_ack_envelope(client.message)
+    with pytest.raises(_EstopDeferred):
+        await adapter._handle_ack_envelope(client.message)
 
     assert client.ack_calls == 0
     assert client.sent == []
@@ -1435,6 +1448,24 @@ def test_allowed_agents_non_iterable_value_raises_clear_config_error(
         MupotAdapter(config, client_factory=lambda *_: FakeMupotClient())
 
 
+@pytest.mark.parametrize("bad_entry", [123, True, False, 3.5, None, {"a": "b"}, ["x"]])
+def test_allowed_agents_non_string_list_entry_raises_clear_config_error(
+    tmp_path: Path, bad_entry: object,
+) -> None:
+    """P3 (kasra-review re-gate #2, 2026-09-14): a non-string entry inside an
+    otherwise-valid list (e.g. [123, "kasra"]) previously reached
+    normalize_agent()'s `str(value or "")`, which silently stringifies it
+    into a plausible-looking agent name instead of failing the
+    misconfiguration loudly -- same class as the non-iterable top-level
+    check above, one level deeper."""
+    config = PlatformConfig(enabled=True, extra={
+        "allowed_agents": ["kasra", bad_entry],
+        "state_path": str(tmp_path / "state.json"),
+    })
+    with pytest.raises(ValueError, match="allowed_agents entries must be strings"):
+        MupotAdapter(config, client_factory=lambda *_: FakeMupotClient())
+
+
 @pytest.mark.asyncio
 async def test_estop_engaged_blocks_dispatch_before_any_state_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -1442,7 +1473,13 @@ async def test_estop_engaged_blocks_dispatch_before_any_state_mutation(
     """Kills the P0-2 e-stop bypass: build_mupot_event always sets internal=True, which
     at the pinned Hermes rev skips gateway/run_inbound.py's own e-stop gate entirely
     (:174 returns before :233). This adapter must enforce the same property itself in
-    _deliver, since Hermes's own gate never runs for this call path."""
+    _deliver, since Hermes's own gate never runs for this call path.
+
+    re-gate #2 (2026-09-14): _deliver must raise _EstopDeferred, not just return
+    silently, so the poll loop can tell "deferred by a pause" apart from a genuine
+    protocol violation (see test_routine_events.py's real-poll-loop tests for the
+    end-to-end proof that a bare return previously turned every pause into a
+    durable inbox quarantine)."""
     from plugin.mupot_gateway import adapter as adapter_module
 
     fake_estop = types.SimpleNamespace(is_engaged=lambda: True)
@@ -1457,7 +1494,8 @@ async def test_estop_engaged_blocks_dispatch_before_any_state_mutation(
     handled: list[str] = []
     adapter.set_message_handler(lambda event: handled.append(event.text))
 
-    await adapter._deliver(dict(client.message))
+    with pytest.raises(adapter_module._EstopDeferred):
+        await adapter._deliver(dict(client.message))
 
     assert handled == []
     assert client.sent == []
@@ -1489,6 +1527,191 @@ async def test_estop_not_engaged_dispatches_normally(
     adapter.set_message_handler(handler)
     await adapter._deliver(dict(client.message))
     assert handled == ["full Mupot answer"]
+
+
+class PausableFakeMupotClient(FakeMupotClient):
+    """Like FakeMupotClient, but fires ``on_first_lease`` the moment
+    inbox_lease hands back the message for the first time -- simulates an
+    e-stop engaging during the inbox_lease round trip, i.e. AFTER the poll
+    loop's own pre-lease pause check already passed but BEFORE the leased
+    message is actually handled."""
+
+    def __init__(self, *, on_first_lease=None) -> None:
+        super().__init__()
+        self.on_first_lease = on_first_lease
+        self._fired_first_lease = False
+
+    async def call(self, tool: str, arguments: dict) -> dict:
+        result = await super().call(tool, arguments)
+        if (
+            tool == "inbox_lease"
+            and not self._fired_first_lease
+            and result.get("messages")
+        ):
+            self._fired_first_lease = True
+            if self.on_first_lease is not None:
+                self.on_first_lease()
+        return result
+
+
+@pytest.mark.asyncio
+async def test_real_poll_loop_pauses_before_lease_then_resumes_deliver(
+    tmp_path: Path,
+) -> None:
+    """P0 (kasra-review re-gate #2, 2026-09-14), proven through the REAL
+    `_poll_loop` background task for the peer `_deliver` path specifically
+    (the routine-event equivalent lives in test_routine_events.py). Engages
+    the REAL agent/estop.py sentinel BEFORE `connect()`, lets the real
+    background poll task run for several ticks, and asserts zero
+    `inbox_lease` calls, the poll task still alive, `_lease_quarantined`
+    still False, and `state.json` carrying no `lease_reconciliation` key --
+    then disengages and confirms the SAME still-running poll task delivers
+    the message exactly once."""
+    import hermes_constants
+    from agent import estop as real_estop
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    token = hermes_constants.set_hermes_home_override(str(hermes_home))
+    try:
+        real_estop.engage(reason="kasra-review-regate2-poll-loop-deliver-test")
+        assert real_estop.is_engaged() is True
+
+        client = PausableFakeMupotClient()
+        config = PlatformConfig(
+            enabled=True,
+            typing_indicator=False,
+            extra={
+                "allowed_agents": "hadi-codex",
+                "poll_interval": 0.01,
+                "state_path": str(tmp_path / "state.json"),
+            },
+        )
+        adapter = MupotAdapter(config, client_factory=lambda *_: client)
+        handled: list[str] = []
+
+        async def handler(event):
+            handled.append(event.text)
+            return "{ack_for:req-7} accepted"
+
+        adapter.set_message_handler(handler)
+
+        assert await adapter.connect()
+        try:
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+
+            assert client.lease_calls == 0, (
+                f"inbox_lease must never be attempted while paused, got "
+                f"{client.lease_calls} calls"
+            )
+            assert handled == []
+            assert client.sent == []
+            assert client.acked is False
+            assert adapter._poll_task is not None
+            assert not adapter._poll_task.done()
+            assert adapter._lease_quarantined is False
+            state = StateStore(tmp_path / "state.json").load()
+            assert "lease_reconciliation" not in state
+            assert state.get("processed", []) == []
+
+            real_estop.disengage()
+            assert real_estop.is_engaged() is False
+
+            for _ in range(200):
+                if client.acked:
+                    break
+                await asyncio.sleep(0.01)
+            assert client.acked
+            assert handled == ["full Mupot answer"]
+            state = StateStore(tmp_path / "state.json").load()
+            assert "m-1" in state["processed"]
+            assert not adapter._poll_task.done()
+        finally:
+            await adapter.disconnect()
+    finally:
+        real_estop.disengage()
+        hermes_constants.reset_hermes_home_override(token)
+
+
+@pytest.mark.asyncio
+async def test_real_poll_loop_defers_mid_message_deliver_then_resumes_without_quarantine(
+    tmp_path: Path,
+) -> None:
+    """Mid-message half of the same P0 class, for `_deliver`: the e-stop
+    engages in the narrow window AFTER the poll loop's pre-lease check passes
+    but BEFORE the leased message is handled. This must release the lease (no
+    `inbox_lease_ack`, no `_protocol_error()`, no
+    `_quarantine_inbox_polling()`) and let the SAME still-unacked message be
+    leased and delivered again once resumed, exactly once."""
+    import hermes_constants
+    from agent import estop as real_estop
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    token = hermes_constants.set_hermes_home_override(str(hermes_home))
+    try:
+        assert real_estop.is_engaged() is False
+
+        client = PausableFakeMupotClient(
+            on_first_lease=lambda: real_estop.engage(
+                reason="kasra-review-regate2-mid-message-deliver-test"
+            ),
+        )
+        config = PlatformConfig(
+            enabled=True,
+            typing_indicator=False,
+            extra={
+                "allowed_agents": "hadi-codex",
+                "poll_interval": 0.01,
+                "state_path": str(tmp_path / "state.json"),
+            },
+        )
+        adapter = MupotAdapter(config, client_factory=lambda *_: client)
+        handled: list[str] = []
+
+        async def handler(event):
+            handled.append(event.text)
+            return "{ack_for:req-7} accepted"
+
+        adapter.set_message_handler(handler)
+
+        assert await adapter.connect()
+        try:
+            for _ in range(200):
+                if client.lease_calls:
+                    break
+                await asyncio.sleep(0.01)
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+
+            assert real_estop.is_engaged() is True
+            assert handled == []
+            assert client.sent == []
+            assert client.acked is False
+            assert adapter._poll_task is not None
+            assert not adapter._poll_task.done()
+            assert adapter._lease_quarantined is False
+            state = StateStore(tmp_path / "state.json").load()
+            assert "lease_reconciliation" not in state
+            assert state.get("processed", []) == []
+
+            real_estop.disengage()
+            assert real_estop.is_engaged() is False
+
+            for _ in range(200):
+                if client.acked:
+                    break
+                await asyncio.sleep(0.01)
+            assert client.acked
+            assert handled == ["full Mupot answer"]
+            state = StateStore(tmp_path / "state.json").load()
+            assert "m-1" in state["processed"]
+        finally:
+            await adapter.disconnect()
+    finally:
+        real_estop.disengage()
+        hermes_constants.reset_hermes_home_override(token)
 
 
 def test_estop_engaged_fails_open_to_false_when_hermes_estop_is_unimportable(

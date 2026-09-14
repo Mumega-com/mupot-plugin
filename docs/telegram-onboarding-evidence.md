@@ -469,3 +469,180 @@ the four round-1 guards this round's diff does not touch but the brief named exp
   previously-undocumented question worth a future pass: should e-stop pause plain human
   notifications too, or is that a deliberate "notifications keep flowing, only autonomous
   agent action pauses" design choice? Not decided here.
+
+## Kasra re-gate #3 repair, round 4 (2026-09-14)
+
+Round 3 fixed the pause-durably-quarantines-the-inbox outage and shared the fence across all
+three `flush()` sinks, but re-gate #3 (head `58602a83`) BLOCKed again on the exact question
+round 3's own section above left open plainly: "the plain (non-activation) Telegram/mirror
+notification path is NOT gated by `_estop_engaged()` at all." That widened into the full
+finding: `_poll_loop` only checked `_estop_engaged()` immediately before `inbox_lease`, so its
+first three statements — `_replay_routine_events`, `_replay_reply_outbox`, `_flush_notifications`
+— ran unconditionally every tick while paused, plus three `_process_leased_message` branches
+(routine-events-disabled quarantine, already-processed re-ack, sender-policy DLQ) consumed a
+message without ever reaching a gated function. Each of rounds 1-3 fixed the NAMED site the
+prior re-gate pointed at; this round closes the CLASS instead of chasing the next named site.
+
+### What was actually wrong (re-gate #3 verdict on head `58602a83`)
+
+1. **P1 — `hermes pause` does not stop egress or replay-consume.** `adapter.py:2035` gated only
+   statement #4 of the poll body (the `inbox_lease` call). Statements #1-#3 ran unconditionally
+   every tick while paused: `_replay_routine_events` → `inbox_ack` + enqueue + processed;
+   `_replay_reply_outbox` → peer `send` + `inbox_lease_ack` + commit; `_flush_notifications` →
+   `flush()`'s non-activation branch → Telegram `sendMessage` + transcript row. The comment at
+   `adapter.py:2028-2030` ("nothing is leased, nothing is acked, and no durable state is
+   written for the duration of the pause") was false — it described only the fourth statement.
+2. **P2 — mid-lease race still consumes on two dispatcher branches.** `adapter.py`'s
+   `_process_leased_message`: the `routine_events_disabled` quarantine branch and the
+   sender-policy DLQ branch each quarantine/DLQ-append and then `_ack_expected()` a message
+   without any `_estop_engaged()` guard of their own and without ever reaching `_deliver`/
+   `_handle_routine_event`/`_handle_ack_envelope` — proven: acked and marked processed while
+   paused if the e-stop engaged between the pre-lease check and this dispatch.
+3. **P2 — `reconcile_inbox_polling`'s `_EstopDeferred` handler was unpinned (E6).** The handler
+   added in round 3 (return `False`, leave the marker) had no dedicated test — mutating it to
+   clear the quarantine and return `True` instead left the full suite green.
+
+### Fix shape (class fix, not repro-shaped)
+
+- **Whole-iteration gate.** `_poll_loop` now checks `_estop_engaged()` as its very FIRST
+  statement, before `_replay_routine_events`/`_replay_reply_outbox`/`_flush_notifications` are
+  ever called: a paused tick does nothing at all but sleep/backoff. The pre-existing check right
+  before `inbox_lease` is left in place as a second layer for the narrow race where the pause
+  engages after the top check passes.
+- **`_EstopDeferred` handled explicitly in both replay wrappers.** Because `_replay_routine_events`
+  and `_replay_reply_outbox` can now raise `_EstopDeferred` mid-iteration (via the choke points
+  below), `_poll_loop` catches it explicitly for each, BEFORE their pre-existing broad
+  `except Exception`/`except MupotProtocolError` clauses — otherwise a mid-iteration pause for
+  `_replay_routine_events` would have been misclassified as a fatal
+  `mupot_routine_event_reconciliation_required` state.
+- **`_process_leased_message` gates itself, structurally.** A single `_estop_engaged()` check at
+  the very top of the function, before dispatching to ANY branch, closes the two previously-named
+  ungated branches (and the already-processed re-ack branch) at once — a future branch added to
+  this dispatcher inherits the gate for free instead of needing its own copy.
+- **One shared choke point for every ack/commit call site.** A new module-level
+  `_refuse_ack_if_estop_engaged(message_id)` is called from both `_ack_expected` and
+  `_ack_persisted_ownership` — the only two functions in the module that ever call
+  `inbox_lease_ack`/`inbox_ack`. Every `_commit()` call site is reached only immediately after
+  one of these two succeeds, so gating the ack transitively gates the commit with no separate
+  check needed there.
+- **Peer `send` gated at both its call sites.** `_transmit_final_reply` (used by both
+  `_replay_reply_outbox` and the live `send()` "final reply" path) and `send()`'s own `interim`
+  branch (the OTHER call site that ever invokes the `send` MCP tool, for in-turn progress ACKs)
+  each refuse before the network call.
+- **`notifications.flush()` gates all three sinks independently**, not just the activation
+  branch that round 3 gated: a fresh `_estop_engaged()` check immediately precedes `deliver_text`
+  and, separately, immediately precedes `mirror_text` — so a notice whose Telegram send already
+  completed on an earlier tick still can't be mirrored while paused, and vice versa.
+- **E6 pinned.** `reconcile_inbox_polling`'s `_EstopDeferred` handler is now covered by
+  `test_item1d_reconcile_while_paused` (ported into `tests/native/test_estop_egress_gate.py`),
+  which mutation-testing confirms actually pins the "returns `False`, marker preserved, nothing
+  acked" contract.
+- **Comments/docs.** `_EstopDeferred`'s and `_estop_engaged`'s docstrings now state the
+  exhaustive current list of gated primitives (replacing the stale per-round named-function
+  lists that went stale every round). `docs/telegram-onboarding-runbook.md` gained a new
+  "Emergency stop (`hermes pause`)" section documenting that lease release is expiry-only
+  (redelivery latency bounded by `lease_seconds`, up to 3600s, not by how fast the pause lifts)
+  and that `reconcile_inbox_polling()` respects an engaged pause.
+
+### Tests ported from kasra-review's own independent execution drivers
+
+kasra-review's re-gate #3 comment pointed at `tests/native/test_k3{drv,egress,replay,item4}.py`
+in its own isolated sandbox — explicitly NOT part of the PR. Ported the useful parts into
+permanent regression tests this round:
+
+- `tests/native/test_estop_lease_gate.py` (from `test_k3drv.py`, near-verbatim): drives the REAL
+  `_poll_loop` with the REAL `agent/estop.py` sentinel across the 5 message classes the re-gate
+  named (peer deliver, routine event, ack envelope, sender-policy DLQ, routine-events-disabled
+  quarantine), both pre-lease-pause and mid-lease-pause. Strengthened beyond the original driver:
+  the driver measured `dlq`/`routine_quarantine` counts but never asserted on them (and its own
+  `routine_quarantine` state key never matched the real `routine_event_quarantine` key, so that
+  measurement was always silently `0` regardless of what the code did); both are fixed and
+  asserted here, which is what actually pins `_process_leased_message`'s own top-of-function gate
+  as independently load-bearing rather than redundant with the ack choke point.
+- `tests/native/test_estop_egress_gate.py` (from `test_k3egress.py`'s ITEM 3 and ITEM 1D,
+  near-verbatim): an outbox notice persisted before `hermes pause` must not reach Telegram or the
+  conversation mirror during the pause (direct `flush()` call and the real background poll loop),
+  and `reconcile_inbox_polling()` under a live pause returns `False` without acking, marker
+  preserved (E6). ITEM 2's fence-per-branch assertions were NOT duplicated — they are already
+  pinned by `test_notifications.py`'s existing `test_flush_fences_and_shares_one_string_across_deliver_and_mirror`
+  and `test_flush_real_estop_sentinel_blocks_activation_at_the_single_choke_point`.
+- `tests/native/test_estop_replay_gate.py` (from `test_k3replay.py`, ADAPTED): the driver called
+  `_replay_routine_events`/`_replay_reply_outbox` directly and expected a bare return while
+  paused. The actual fix shape makes their ack/send choke points raise `_EstopDeferred` instead
+  (correct for `_poll_loop`, which now catches it explicitly), so a direct caller must expect and
+  catch that same exception — adapted to `pytest.raises(_EstopDeferred)` around each call, then
+  asserts the same "nothing ACKed/sent to the server" properties the driver named. Also adds:
+  the live interim-send choke point (the driver didn't cover this path at all), and two tests
+  that directly pin `_poll_loop`'s own except-clause wiring for both replay functions (isolating
+  the exception-routing contract from the realistic, timing-dependent mid-iteration race).
+- Two new tests in `tests/native/test_notifications.py` (`test_flush_real_estop_sentinel_blocks_deliver_text_at_its_own_choke_point`,
+  `..._mirror_text_at_its_own_choke_point`), mirroring the existing activation choke-point test's
+  pattern, for the two sinks round 3 left ungated.
+- `test_k3item4.py` was NOT ported: it re-tests round 3's already-confirmed-fixed
+  `_SOURCE_ID_RE`/`allowed_agents` guards (out of this round's assigned class), and its own
+  "ansi" case assertion is stale against the actual regex (`^[^\s`\[\]]{1,128}$` already excludes
+  ANSI escape sequences, which contain a literal `[` — stricter than the driver's own comment
+  claimed, not a regression).
+
+### Mutation table (round 4, this session)
+
+Every row: temporary in-place edit (`sed`, occurrence-checked) on a clean, already-committed
+tree (commit `b9ed905`), real pytest run via `scripts/test-native.sh` (fresh `HERMES_SOURCE`/
+`HERMES_PYTHON` pointed at the pinned `233757037df1f03f9fe1cfddc097acd5ad7f7510` clone) or
+`scripts/test.sh` where noted, `git checkout -- <file>` to restore, `git status --short`
+confirmed empty before moving to the next row.
+
+| # | Guard | File:line | Mutation | Result |
+|---|---|---|---|---|
+| 1 | Whole-iteration top gate (NEW, P1) | `adapter.py` `_poll_loop`: `if _estop_engaged():` (first statement) → `if False:` | **RED** — 8 tests failed across `test_estop_egress_gate.py`, `test_adapter.py`, `test_estop_lease_gate.py` (5 of its 10 cases), `test_routine_events.py` | **GREEN** |
+| 2 | `_process_leased_message` top gate (NEW, P2) | `adapter.py` `_process_leased_message`: `if _estop_engaged():` (first statement) → `if False:` | **RED** — `test_mid_message_pause[sender_policy_dlq]` and `[routine_disabled_quarantine]` both failed (`dlq_paused`/`routine_quarantine_paused` > 0) — only visible after strengthening the ported driver's own vacuous `routine_quarantine` measurement (see above); the ack choke (row 3) alone does not catch this since it only prevents the ack, not the durable dlq/quarantine write that precedes it | **GREEN** |
+| 3 | Shared ack/commit choke, `_refuse_ack_if_estop_engaged` (NEW) | `adapter.py`: `if _estop_engaged():` → `if False:` | **RED** — `test_replay_routine_events_defers_without_acking_or_processing_while_paused` failed (only this test — the `_process_leased_message`-reached branches stayed green here since row 2's gate still covers them, demonstrating the layered defense is real, not duplicated) | **GREEN** |
+| 4 | Peer `send` choke, `_transmit_final_reply` (NEW) | `adapter.py`: `if _estop_engaged():` → `if False:` | **RED** — `test_replay_reply_outbox_defers_without_transmitting_while_paused` failed | **GREEN** |
+| 5 | Peer `send` choke, live `send()` interim path (NEW) | `adapter.py` `send()`: `if _estop_engaged():` → `if False:` | **RED** — new `test_live_interim_send_defers_without_transmitting_while_paused` failed (added this round; no prior test covered this path at all) | **GREEN** |
+| 6 | `deliver_text` choke (NEW, P1) | `notifications.py` `flush()`: `if _estop_engaged():` (before `deliver_text`) → `if False:` | **RED** — `test_item3_outbox_egress_during_pause` AND new `test_flush_real_estop_sentinel_blocks_deliver_text_at_its_own_choke_point` both failed | **GREEN** |
+| 7 | `mirror_text` choke (NEW, P1) | `notifications.py` `flush()`: `if _estop_engaged():` (before `mirror_text`) → `if False:` | **RED** — new `test_flush_real_estop_sentinel_blocks_mirror_text_at_its_own_choke_point` failed | **GREEN** |
+| 8 | `_poll_loop` except-ordering for `_replay_routine_events` (NEW) | `adapter.py` `_poll_loop`: `except _EstopDeferred:` → `except KeyError:` | **RED** — new `test_poll_loop_treats_replay_routine_events_estop_deferred_as_a_pause` failed (`_fatal_error_code` was set — misclassified as the fatal routine-event-reconciliation-required state) | **GREEN** |
+| 9 | `_poll_loop` except-ordering for `_replay_reply_outbox` (NEW) | `adapter.py` `_poll_loop`: `except _EstopDeferred:` → `except KeyError:` | **RED** — new `test_poll_loop_treats_replay_reply_outbox_estop_deferred_as_a_pause` failed. Note: this path is not fatal even when misclassified (both branches sleep-and-continue), so the test pins the log message text via `caplog`, the only observable difference | **GREEN** |
+| E6 | `reconcile_inbox_polling`'s `_EstopDeferred` handler (previously unpinned) | `adapter.py`: `return False` → clear quarantine (`_lease_quarantined = False`, reset fatal-error fields) + `return True` | **RED** — `test_item1d_reconcile_while_paused` failed (`reconcile_returned` was `True`) | **GREEN** |
+
+Spot-checks that round 1-3 guards are unchanged (full mutation re-verification of all 21 prior
+rows was not repeated — this round's diff does not touch `should_accept_message`,
+`_fenced_untrusted_block`, `lease_ownership.py`, `__init__.py`, or `telegram_control.py`, and the
+full suite is green both before and after every mutation restore above, same reasoning round 3
+used for M7/M12/M17/M18):
+
+| Guard (round) | File:line | Mutation | Result |
+|---|---|---|---|
+| M1 — peer allowlist (round 1) | `adapter.py` `_process_leased_message`: `if should_accept_message(...)` → `if True:` | bypass allowlist | **RED** — `test_unlisted_sender_is_quarantined_never_delivered` failed |
+| F1 — fence escape (round 2) | `notifications.py` `_fenced_untrusted_block`: `safe = text.replace(...)` → `safe = text` | neuter escape | **RED** — 15 tests failed across `test_notifications.py` and `test_routine_events.py` |
+| M17 — lease attempt_id format (round 1) | `lease_ownership.py`: `or _ATTEMPT_ID_RE.fullmatch(attempt_id) is None` → `or False` | bypass format check | **RED** — 9 cases in `plugin/tests/test_lease_ownership.py` failed (plain suite) |
+| E3 — `_deliver`'s own gate (round 3) | `adapter.py` `_deliver`: `if _estop_engaged():` → `if False:` | bypass gate | **RED** — `test_estop_engaged_blocks_dispatch_before_any_state_mutation` failed |
+
+### Real test counts (round 4, this session)
+
+- `scripts/test.sh`: **240 passed, 12 subtests passed** (pytest, unchanged — this round's new
+  tests are all in `tests/native/`) + **27/27** (`unittest` `test_operator`), 0 failures.
+- `scripts/test-native.sh` (fresh clone at the pinned
+  `233757037df1f03f9fe1cfddc097acd5ad7f7510` rev, matches CI): **339 tests passed, 0 failed**,
+  across 12 files (up from round 3's 319 — 20 net-new: 10 in `test_estop_lease_gate.py`, 3 in
+  `test_estop_egress_gate.py`, 6 in `test_estop_replay_gate.py`, 2 new + strengthened assertions
+  in existing tests in `test_notifications.py`).
+
+### Not done / could not verify (round 4)
+
+- `scripts/test-integration.sh` still not run this round for the same reason as rounds 1-3 (no
+  provisioned `MUPOT_SERVER_SOURCE`).
+- `ruff`/`mypy` were not re-run this round; `py_compile` on every changed `.py` file (via
+  `scripts/test.sh`'s own `py_compile` step) gated this commit.
+- Full mutation re-verification of all 21 prior rounds' rows was not repeated — 4 targeted
+  spot-checks (above) plus the full suite passing clean before and after every round-4 mutation
+  stand in for it, same reasoning round 3 applied to M7/M12/M17/M18.
+- The interim-send choke point (`send()`'s `if interim:` branch) is new defense-in-depth: no
+  finding in re-gate #3's comment named this specific path, but it is the other call site for the
+  `send` MCP tool alongside `_transmit_final_reply`, so it was gated and tested for consistency
+  with "every consume/egress primitive," not because a live gap was proven there this round.
+- Whether e-stop should also gate a plain (non-activation, non-routine) human notification's
+  activation-independent delivery differently from how it's gated now — this round gates
+  `deliver_text`/`mirror_text` unconditionally for every notice, closing round 3's own open
+  question in the strictest direction (pause blocks ALL egress, not just autonomous injection).
+  Not revisited as a design question, just implemented per this round's explicit brief.

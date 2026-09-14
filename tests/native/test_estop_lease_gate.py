@@ -227,7 +227,13 @@ async def _run_case(tmp_path, message, *, mid_message, routine_events_enabled=Tr
             out["lease_reconciliation_paused"] = st.get("lease_reconciliation")
             out["processed_paused"] = st.get("processed", [])
             out["dlq_paused"] = len(st.get("dlq") or [])
-            out["routine_quarantine_paused"] = len(st.get("routine_quarantine") or [])
+            # NOTE (adaptation from the original driver): the real durable
+            # state key is "routine_event_quarantine" (routine_events.py's
+            # quarantine_routine_event) -- the driver's own "routine_quarantine"
+            # never matched any real key, so this always silently read 0
+            # regardless of what the code did. Fixed here so this is an actual
+            # measurement, not a vacuous one.
+            out["routine_quarantine_paused"] = len(st.get("routine_event_quarantine") or [])
             out["pending_paused"] = st.get("pending")
             out["outbox_paused"] = len(st.get("notifications") or st.get("outbox") or [])
             out["state_digest_paused"] = digest(state_path)
@@ -272,6 +278,8 @@ async def test_pre_lease_pause(tmp_path, label, msg, ren):
     assert out["quarantined_paused"] is False
     assert out["lease_reconciliation_paused"] is None
     assert out["processed_paused"] == []
+    assert out["dlq_paused"] == 0, "wrote to the DLQ while paused"
+    assert out["routine_quarantine_paused"] == 0, "wrote a routine quarantine record while paused"
 
 
 @pytest.mark.asyncio
@@ -285,5 +293,19 @@ async def test_pre_lease_pause(tmp_path, label, msg, ren):
 async def test_mid_message_pause(tmp_path, label, msg, ren):
     out = await _run_case(tmp_path, msg, mid_message=True, routine_events_enabled=ren)
     _report(f"MID/{label}", out)
-    # Report only; assertions live in the per-branch analysis below.
     assert out["poll_task_alive"] is True
+    # This is the specific race _process_leased_message's own top-of-function
+    # gate closes: the e-stop engages DURING the inbox_lease call (the
+    # DriverClient's on_first_lease hook), so the pre-lease check above this
+    # function already passed -- without a gate at the top of
+    # _process_leased_message itself, three of its branches
+    # (routine-events-disabled quarantine, sender-policy DLQ, and the
+    # already-processed re-ack) would write durable state (a DLQ entry or a
+    # routine_event_quarantine record) BEFORE ever reaching the ack choke
+    # point inside _ack_expected -- proving the gate is not merely redundant
+    # with the ack choke, it prevents the write that would otherwise precede
+    # it.
+    assert out["dlq_paused"] == 0, "wrote to the DLQ mid-lease while paused"
+    assert out["routine_quarantine_paused"] == 0, (
+        "wrote a routine quarantine record mid-lease while paused")
+    assert out["processed_paused"] == [], "marked a source processed mid-lease while paused"

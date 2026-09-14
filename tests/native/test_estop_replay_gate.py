@@ -15,6 +15,7 @@ nothing was durably consumed" properties the original driver named.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -229,3 +230,174 @@ async def test_replay_reply_outbox_defers_without_transmitting_while_paused(
     finally:
         real_estop.disengage()
         hermes_constants.reset_hermes_home_override(token)
+
+
+@pytest.mark.asyncio
+async def test_live_interim_send_defers_without_transmitting_while_paused(tmp_path):
+    """The live `send()` interim-ACK path (a progress update sent WHILE a turn
+    is still being handled, e.g. "still working...") is the OTHER call site
+    that ever invokes the `send` MCP tool, alongside `_transmit_final_reply`.
+    It has its own independent choke point (adapter.py's `send()`, `if
+    interim:` branch) -- this pins that it is not merely inherited from
+    `_transmit_final_reply`, which this path never calls."""
+    import sys
+    from pathlib import Path as _P
+    sys.path.insert(0, str(_P(__file__).parent))
+    import importlib
+    rp = importlib.import_module("test_reply_protocol")
+
+    import hermes_constants
+    from agent import estop as real_estop
+
+    token = hermes_constants.set_hermes_home_override(str(tmp_path / "hh"))
+    (tmp_path / "hh").mkdir()
+    try:
+        assert real_estop.is_engaged() is False
+        client = rp.ProtocolClient()
+        adapter = rp.adapter_at(tmp_path, client)
+        await rp.bind_delivery(adapter, rp.source_message())
+
+        real_estop.engage(reason="k3-interim-send")
+        assert real_estop.is_engaged() is True
+
+        result = await adapter.send(
+            "sender", "still working", metadata={"_interim_send": True}
+        )
+        out = {
+            "estop_engaged": real_estop.is_engaged(),
+            "send_result_success": result.success,
+            "server_calls_during_pause": [t for t, _ in client.calls],
+        }
+        _report("interim_send_paused", out)
+        assert out["send_result_success"] is False, (
+            "reported success for an interim send while the e-stop was engaged")
+        assert "send" not in out["server_calls_during_pause"], (
+            "transmitted an interim progress ACK to a mupot peer while the "
+            "e-stop was engaged")
+
+        real_estop.disengage()
+        assert real_estop.is_engaged() is False
+        result2 = await adapter.send(
+            "sender", "still working", metadata={"_interim_send": True}
+        )
+        assert result2.success is True
+        assert "send" in [t for t, _ in client.calls]
+    finally:
+        real_estop.disengage()
+        hermes_constants.reset_hermes_home_override(token)
+
+
+class _NoOpClient:
+    async def connect(self):
+        return None
+
+    async def close(self):
+        return None
+
+    async def call(self, tool, arguments):
+        raise AssertionError(f"unexpected tool call during a deferred tick: {tool}")
+
+
+def _bare_adapter(tmp_path, client):
+    return MupotAdapter(PlatformConfig(enabled=True, extra={
+        "allowed_agents": "kasra",
+        "poll_interval": 0.01,
+        "state_path": str(tmp_path / "state.json"),
+        "routine_events_enabled": True,
+    }), client_factory=lambda *_: client)
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_treats_replay_routine_events_estop_deferred_as_a_pause(tmp_path):
+    """Directly pins _poll_loop's own wiring for `_replay_routine_events`
+    (kasra-review re-gate #3's exact named risk): an `_EstopDeferred` raised
+    from it must be recognised as 'defer this tick, sleep and continue',
+    never fall through to the broad `except Exception` below it -- which
+    sets a FATAL, `connect()`-refusing 'Routine event reconciliation is
+    required' state and stops the poll task outright. This isolates
+    _poll_loop's own except-ordering from the realistic mid-iteration race
+    (covered end-to-end by the other tests in this file and in
+    test_estop_lease_gate.py), which is timing-dependent and hard to force
+    deterministically through the real call chain."""
+    adapter = _bare_adapter(tmp_path, _NoOpClient())
+    calls = {"n": 0}
+
+    async def raising_replay():
+        calls["n"] += 1
+        raise _EstopDeferred("mid-iteration-race")
+
+    adapter._replay_routine_events = raising_replay
+    adapter._running = True
+    task = asyncio.ensure_future(adapter._poll_loop())
+    try:
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            if calls["n"] >= 2:
+                break
+        assert calls["n"] >= 2, "the poll loop stopped ticking"
+        assert adapter._fatal_error_code is None, (
+            "an _EstopDeferred from _replay_routine_events was misclassified "
+            "as a fatal routine-event-reconciliation-required error")
+        assert not task.done(), "the poll task exited instead of continuing to poll"
+    finally:
+        adapter._running = False
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_treats_replay_reply_outbox_estop_deferred_as_a_pause(
+    tmp_path, caplog
+):
+    """Same class as the routine-events test above, for `_replay_reply_outbox`
+    (its peer `send` choke point in `_transmit_final_reply`): an
+    `_EstopDeferred` must be recognised EXPLICITLY as a deferral. Unlike the
+    routine-events case, falling through to the bare `except Exception`
+    clause below it is not fatal here (both paths sleep and continue) -- so
+    this pins the log message itself, which is the only observable
+    difference between "handled explicitly" and "fell through to the
+    generic reply-replay-deferred warning", exactly the ambiguity
+    kasra-review's re-gate #3 named as the wrong shape to extend."""
+    import logging
+
+    adapter = _bare_adapter(tmp_path, _NoOpClient())
+    calls = {"n": 0}
+
+    async def raising_replay():
+        calls["n"] += 1
+        raise _EstopDeferred("mid-iteration-race")
+
+    async def noop_routine_events():
+        return None
+
+    adapter._replay_routine_events = noop_routine_events
+    adapter._replay_reply_outbox = raising_replay
+    adapter._running = True
+    caplog.set_level(logging.INFO, logger="plugin.mupot_gateway.adapter")
+    task = asyncio.ensure_future(adapter._poll_loop())
+    try:
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            if calls["n"] >= 2:
+                break
+        assert calls["n"] >= 2, "the poll loop stopped ticking"
+        assert adapter._fatal_error_code is None, (
+            "an _EstopDeferred from _replay_reply_outbox was misclassified as "
+            "a fatal reply-reconciliation-required error")
+        assert adapter._reply_reconciliation_required is False
+        assert not task.done(), "the poll task exited instead of continuing to poll"
+        messages = [r.message for r in caplog.records]
+        assert any("reply outbox replay deferred mid-iteration" in m for m in messages), (
+            "_EstopDeferred from _replay_reply_outbox fell through to the "
+            "generic 'reply replay deferred' warning instead of the explicit "
+            "pause-deferral clause")
+    finally:
+        adapter._running = False
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass

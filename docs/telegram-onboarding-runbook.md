@@ -242,6 +242,49 @@ To operate on a stranded ID:
    rotated or pruned by the normal completed-notice retention (oldest completed records are
    dropped once more than 999 accumulate).
 
+## Emergency stop (`hermes pause`)
+
+`hermes pause` engages Hermes's own global emergency-stop sentinel
+(`agent/estop.py`). The receiver checks this sentinel at every consume and
+egress primitive, not one named code path: the top of every poll iteration
+(so a paused tick does nothing at all — no routine-event replay, no
+reply-outbox replay, no notification flush, no inbox lease attempt), both
+inbox ACK primitives (`inbox_lease_ack` and `inbox_ack`, covering every
+branch that consumes a leased message — including the routine-events-disabled
+quarantine and sender-policy dead-letter branches, which never call
+`_deliver`/`_handle_routine_event`/`_handle_ack_envelope` themselves), the
+peer `send` MCP call (both a live in-turn reply and a replayed prepared
+reply), and each of the three notification sinks independently (the
+activation injector into a human's live Hermes session, the external
+Telegram send, and the conversation mirror write). A pause is always a
+**temporal condition** the receiver waits out, never a state transition it
+records: nothing is leased, ACKed, sent, delivered, mirrored, or injected
+while paused, and no durable quarantine/reconciliation marker is written for
+the pause itself. `hermes resume` picks delivery back up on the very next
+poll cycle with no operator action required.
+
+**Lease release is expiry-only.** The receiver never calls a server-side
+"release this lease early" operation when it defers a message for a pause —
+it lets the in-flight visibility lease run out naturally so the exact same
+message is redelivered once resumed. This means the worst-case redelivery
+latency after `hermes resume` is bounded by whatever `lease_seconds` was in
+effect for that lease, not by how quickly the pause is lifted: `lease_seconds`
+defaults to `turn_timeout + 60s` and is clamped to `[1, 3600]` seconds
+(`mupot_gateway/adapter.py` — the config's `lease_seconds` extra can override
+the default within that range). A message leased immediately before
+`hermes pause` can take up to that many seconds to redeliver after
+`hermes resume`, even though the pause itself may have lasted only moments.
+This is a deliberate trade — avoiding a second, more invasive release-path
+primitive — not an oversight; plan any time-sensitive pause/resume operation
+with that ceiling in mind.
+
+**`reconcile_inbox_polling()` respects an engaged pause.** If an operator (or
+an automated reconciliation) calls it while `hermes pause` is still engaged,
+it returns `False` without ACKing anything and without clearing the durable
+lease-quarantine marker that required reconciliation in the first place —
+the marker is left exactly as it was so the same reconciliation can be
+retried once `hermes resume` lifts the pause.
+
 ## Suspension, revocation, and rollback
 
 When access must stop, suspend the exact Mupot member first so subsequent Telegram lookup

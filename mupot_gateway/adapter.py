@@ -130,19 +130,49 @@ class MupotSafeRetryError(RuntimeError):
 
 
 class _EstopDeferred(Exception):
-    """A leased message was deferred because Hermes's global e-stop is engaged.
+    """Work was deferred because Hermes's global e-stop is engaged.
 
     A pause is a TEMPORAL condition, never a state transition: it must never
     surface as `_protocol_error()` (which the poll loop treats as a permanent
     protocol violation and answers by calling `_quarantine_inbox_polling()` --
     a durable, `connect()`-refusing state that outlives the pause and requires
-    manual `reconcile_inbox_polling()`). `_deliver`, `_handle_routine_event`
-    and `_handle_ack_envelope` raise this -- instead of a bare `return` -- the
-    moment their `_estop_engaged()` guard fires, before any durable state is
-    touched, so every caller of `_process_leased_message` (the live poll loop
-    and `reconcile_inbox_polling`) can recognise "deferred by pause" and
-    release the lease to expire for natural redelivery, rather than folding it
-    into "message not marked processed => protocol error".
+    manual `reconcile_inbox_polling()`).
+
+    Re-gate #3 (2026-09-14) found the round-1/2 fix gated only three NAMED
+    functions (`_deliver`, `_handle_routine_event`, `_handle_ack_envelope`),
+    while `_poll_loop` still ran `_replay_routine_events`/`_replay_reply_outbox`/
+    `_flush_notifications` unconditionally every tick, and three more branches
+    inside `_process_leased_message` (routine-events-disabled quarantine,
+    already-processed re-ack, sender-policy DLQ) acked/committed without ever
+    reaching a gated function at all -- each round fixed the named site, the
+    next round found the next ungated one. The round-4 fix (this class) closes
+    the CLASS instead of the next site: `_poll_loop` checks `_estop_engaged()`
+    as its very first statement (nothing -- no replay, no flush, no lease --
+    runs in a paused tick), and every remaining primitive that can consume a
+    source or ship output to a human/peer is its own choke point that raises
+    `_EstopDeferred` before touching any durable state or making any network
+    call, regardless of which function calls it:
+      - `_deliver`, `_handle_routine_event`, `_handle_ack_envelope` (unchanged
+        from round 3 -- still needed for the mid-lease race and for tests that
+        call them directly).
+      - `_process_leased_message` itself, at its very first statement, before
+        dispatching to ANY branch -- this is what closes the three branches
+        above structurally: a future branch added to this dispatcher inherits
+        the gate for free instead of needing its own copy.
+      - `_refuse_ack_if_estop_engaged()`, called from both `_ack_expected` and
+        `_ack_persisted_ownership` -- the only two functions that ever call
+        `inbox_lease_ack`/`inbox_ack`. Every `_commit()` call site in this
+        module is reached only immediately after one of these two succeeds,
+        so gating the ack transitively gates the commit with no separate
+        check needed.
+      - `_transmit_final_reply`, before the peer `send` MCP call (used by both
+        `_replay_reply_outbox` and the live `send()` interim path).
+      - `notifications.flush()`, at each of its three sinks (activation
+        injector, `deliver_text`, `mirror_text`) independently.
+    Every caller of `_process_leased_message` (the live poll loop and
+    `reconcile_inbox_polling`) recognises this exception as "deferred by
+    pause" and releases the lease to expire for natural redelivery, rather
+    than folding it into "message not marked processed => protocol error".
     """
 
 
@@ -599,10 +629,19 @@ def _estop_engaged() -> bool:
     -- `hermes pause` silently does not stop mupot traffic through that path. Rather than
     drop internal=True (which would also skip _is_user_authorized_for_source and route
     mupot's synthetic, unpaired sources through end-user auth they were never designed to
-    satisfy), enforce the same property directly here -- at every call site that reaches
-    a source ACK/consume or a human-session injection (_deliver, _handle_routine_event,
-    _handle_ack_envelope, and notifications.flush()'s activation call), not only one of
-    them.
+    satisfy), enforce the same property directly here.
+
+    As of round 4 (kasra-review re-gate #3, 2026-09-14) this is checked at ALL consume/
+    egress primitives, not a named list of functions -- see _EstopDeferred's docstring
+    for the exhaustive, current list and why a per-site list kept going stale (rounds
+    1-3 each fixed the previously-named sites and the next re-gate found the next
+    ungated one). In short: the top of every `_poll_loop` iteration, `_deliver`,
+    `_handle_routine_event`, `_handle_ack_envelope`, `_process_leased_message` itself,
+    both ack primitives (`_ack_expected`/`_ack_persisted_ownership` via
+    `_refuse_ack_if_estop_engaged`), the peer `send` choke point
+    (`_transmit_final_reply`, plus the live `send()` interim path), and each of
+    `notifications.flush()`'s three sinks (activation injector, `deliver_text`,
+    `mirror_text`) independently.
     """
     global _ESTOP_IMPORT_WARNED
     try:
@@ -631,6 +670,27 @@ def _estop_engaged() -> bool:
         # dispatch rather than silently let a mupot turn through while a global pause
         # cannot be confirmed lifted.
         return True
+
+
+def _refuse_ack_if_estop_engaged(message_id: str) -> None:
+    """Shared choke point for every `inbox_lease_ack`/`inbox_ack` call site.
+
+    `_ack_expected` and `_ack_persisted_ownership` are the only two functions
+    in this module that ever call `inbox_lease_ack` or `inbox_ack` (round 3
+    gated `_deliver`/`_handle_routine_event`/`_handle_ack_envelope` themselves,
+    but three OTHER call sites inside `_process_leased_message` -- the
+    routine-events-disabled quarantine branch, the already-processed re-ack
+    branch, and the sender-policy DLQ branch -- call `_ack_expected` directly
+    and never passed through any of those three). Every `_commit()` call site
+    in this module is reached only immediately after one of these two ack
+    functions succeeds, so refusing here transitively refuses the commit too
+    -- no separate check is needed in `_commit` itself. Mutating this one
+    function is therefore the single place that can silently reopen every
+    ack/commit call site in the module at once, which is deliberate: one
+    property, one guard, not N copies that can individually drift stale.
+    """
+    if _estop_engaged():
+        raise _EstopDeferred(message_id)
 
 
 def is_ack_envelope(message: dict[str, Any]) -> bool:
@@ -1284,6 +1344,13 @@ class MupotAdapter(BasePlatformAdapter):
         expected_id: str,
         ownership_value: Any,
     ) -> None:
+        # Choke point (see _refuse_ack_if_estop_engaged's docstring): this is
+        # the ONLY place in the module that calls `inbox_lease_ack` for an
+        # attempt-based ownership record (the `_ack_expected` fallback below
+        # covers the legacy path). Refuse before validating ownership or
+        # calling the consumer status/reconcile preflight, so nothing is
+        # touched while paused.
+        _refuse_ack_if_estop_engaged(expected_id)
         try:
             ownership = validate_ack_ownership(ownership_value)
         except AckOwnershipError:
@@ -1553,6 +1620,16 @@ class MupotAdapter(BasePlatformAdapter):
         if record["status"] == "reconciliation_required":
             raise _protocol_error()
         if record["status"] == "prepared":
+            # Choke point for the peer `send` MCP tool (kasra-review re-gate
+            # #3, 2026-09-14): `_replay_reply_outbox` calls this for a reply
+            # PREPARED before `hermes pause` was pressed -- proven live in
+            # re-gate #3 that without this check the prepared, immutable
+            # envelope is transmitted to the mupot peer during the pause.
+            # Refuse before the network call; the record stays "prepared" so
+            # the exact same envelope is retried, verbatim, once resumed.
+            # (The live `send()` interim path shares this same choke point.)
+            if _estop_engaged():
+                raise _EstopDeferred(source_id)
             try:
                 result = await asyncio.wait_for(
                     self._send_client.call("send", copy.deepcopy(record["arguments"])),
@@ -1982,8 +2059,50 @@ class MupotAdapter(BasePlatformAdapter):
 
     async def _poll_loop(self) -> None:
         while self._running:
+            # FOURTH named gap (kasra-review re-gate #3, 2026-09-14): checking
+            # `_estop_engaged()` only right before `inbox_lease` (as rounds 1-3
+            # did) left `_replay_routine_events`/`_replay_reply_outbox`/
+            # `_flush_notifications` -- statements #1-#3 of every iteration --
+            # running UNCONDITIONALLY while paused: real ACKs, real peer
+            # sends, real Telegram/mirror egress, proven live in re-gate #3.
+            # A pause is a TEMPORAL condition on the WHOLE iteration, not one
+            # stage of it. Checking here, as the very first statement, means
+            # a paused tick does nothing at all but sleep/backoff -- no
+            # replay, no flush, no lease attempt is even started. This is the
+            # PRIMARY defense; the individual `_estop_engaged()`/
+            # `_refuse_ack_if_estop_engaged()` checks inside `_deliver`,
+            # `_handle_routine_event`, `_handle_ack_envelope`,
+            # `_process_leased_message`, `_ack_expected`,
+            # `_ack_persisted_ownership`, `_transmit_final_reply`, and
+            # `notifications.flush()` are the SECOND layer: they catch the
+            # narrow mid-iteration race (pause engages after this check
+            # passes but before the tick finishes) and protect any direct
+            # caller that bypasses `_poll_loop` entirely (existing unit tests
+            # call `_deliver` etc. directly; `reconcile_inbox_polling` calls
+            # `_process_leased_message` directly).
+            if _estop_engaged():
+                logger.info(
+                    "[mupot] inbox polling paused: Hermes global emergency stop is "
+                    "engaged; skipping this tick entirely (no replay, no flush, no "
+                    "lease attempt)"
+                )
+                await asyncio.sleep(self.poll_interval)
+                continue
             try:
                 await self._replay_routine_events()
+            except _EstopDeferred:
+                # The e-stop engaged mid-iteration, after the top-of-loop check
+                # above passed but while `_replay_routine_events` was replaying a
+                # pending receipt (via `_ack_persisted_ownership`, itself gated).
+                # This is the SAME class as the lease-time race below: defer and
+                # retry next tick, never treat it as the routine-event
+                # reconciliation failure the bare `except Exception` below is for.
+                logger.info(
+                    "[mupot] routine event replay deferred mid-iteration: Hermes "
+                    "global emergency stop is engaged"
+                )
+                await asyncio.sleep(self.poll_interval)
+                continue
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1996,6 +2115,20 @@ class MupotAdapter(BasePlatformAdapter):
                 return
             try:
                 await self._replay_reply_outbox()
+            except _EstopDeferred:
+                # Same class, for `_replay_reply_outbox`'s peer `send` choke
+                # point (`_transmit_final_reply`). Without this explicit clause
+                # this would fall into the bare `except Exception` below and log
+                # as an ordinary "reply replay deferred" warning rather than the
+                # pause it actually is -- functionally harmless (both paths
+                # sleep and continue) but mislabeled, and the wrong shape to
+                # extend if this function ever needs pause-specific bookkeeping.
+                logger.info(
+                    "[mupot] reply outbox replay deferred mid-iteration: Hermes "
+                    "global emergency stop is engaged"
+                )
+                await asyncio.sleep(self.poll_interval)
+                continue
             except asyncio.CancelledError:
                 raise
             except MupotProtocolError:
@@ -2018,26 +2151,16 @@ class MupotAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                # notifications.flush()'s own choke points (activation injector,
+                # deliver_text, mirror_text) each raise RetryLater (an existing,
+                # non-pause-specific retry signal) and catch it internally --
+                # a pause never propagates out of flush() as an exception here.
                 logger.warning(
                     "[mupot] notification flush error: %s", exc, exc_info=True
                 )
                 await asyncio.sleep(self.poll_interval)
                 continue
 
-            # THIRD named gap from the kasra-review re-gate #2 (2026-09-14): a pause
-            # is a TEMPORAL condition, never a state transition. Checking here, before
-            # `inbox_lease` is ever called, means nothing is leased, nothing is acked,
-            # and no durable state is written for the duration of the pause -- this is
-            # also what keeps the routine_events_disabled-quarantine branch (below,
-            # `_process_leased_message`) and the sender-policy DLQ branch from
-            # consuming a message while paused: neither branch can run without a lease
-            # first, and no lease is ever attempted here while `_estop_engaged()`.
-            if _estop_engaged():
-                logger.info(
-                    "[mupot] inbox polling paused: Hermes global emergency stop is engaged"
-                )
-                await asyncio.sleep(self.poll_interval)
-                continue
             try:
                 attempt_id = self._new_lease_attempt_id()
                 arguments = {
@@ -2107,6 +2230,20 @@ class MupotAdapter(BasePlatformAdapter):
         from .routine_events import is_routine_event_candidate, quarantine_routine_event
 
         message_id = str(message.get("id") or "")
+        if _estop_engaged():
+            # Structural choke point (kasra-review re-gate #3, 2026-09-14):
+            # the routine-events-disabled quarantine branch below and the
+            # sender-policy DLQ branch further down each quarantine/DLQ and
+            # then _ack_expected() a message WITHOUT ever reaching _deliver,
+            # _handle_routine_event, or _handle_ack_envelope -- neither of
+            # those two branches' own `_estop_engaged()` gate (they have
+            # none) ever ran for them. Refusing here, before this function
+            # dispatches to ANY branch, closes all three ungated branches
+            # (routine_events_disabled, already-processed re-ack,
+            # sender_policy DLQ) plus the two named functions at once, and
+            # means a future branch added to this dispatcher inherits the
+            # gate automatically rather than needing its own copy.
+            raise _EstopDeferred(message_id)
         if is_routine_event_candidate(message):
             if self.routine_events_enabled:
                 await self._handle_routine_event(message, attempt_id=attempt_id)
@@ -2369,6 +2506,12 @@ class MupotAdapter(BasePlatformAdapter):
         expected_id: str,
         attempt_id: Optional[str] = None,
     ) -> None:
+        # Choke point (see _refuse_ack_if_estop_engaged's docstring): covers
+        # both the attempt-based inbox_lease_ack branch below AND the legacy
+        # inbox_ack branch, plus every caller (the three ungated
+        # _process_leased_message branches this now closes, and
+        # _ack_persisted_ownership's own legacy fallback).
+        _refuse_ack_if_estop_engaged(expected_id)
         if attempt_id is not None:
             marker = _lease_reconciliation_proof(
                 self._state.get("lease_reconciliation")
@@ -2517,6 +2660,14 @@ class MupotAdapter(BasePlatformAdapter):
         arguments: dict[str, Any] = {}
         try:
             if interim:
+                # Same peer `send` choke point as _transmit_final_reply's
+                # "prepared" branch above: this is the OTHER call site that
+                # ever invokes the `send` MCP tool. Refuse before building the
+                # progress-ACK arguments or touching the network while paused;
+                # `send()`'s own except-Exception below turns this into an
+                # ordinary retryable SendResult failure for Hermes.
+                if _estop_engaged():
+                    raise _EstopDeferred(inbound_id)
                 arguments = {
                     "to": recipient,
                     "body": str(content),

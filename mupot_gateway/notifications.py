@@ -416,6 +416,12 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
             logger.warning("[mupot] interrupted human notification requires reconciliation source=%s", source_id)
             continue
         try:
+            # Imported once here, used by all three independent choke points
+            # below (activation injector, deliver_text, mirror_text) -- see
+            # _EstopDeferred's docstring in adapter.py for the full list of
+            # consume/egress primitives this same predicate gates.
+            from .adapter import _estop_engaged
+
             # Pin the destination before sending; retries never switch recipients.
             target = notice.get("target")
             if target is None:
@@ -441,25 +447,25 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
                 activation_default and activate is not None
             )
             if should_activate:
-                # SINGLE CHOKE POINT for the message injector (kasra-review re-gate,
+                # CHOKE POINT for the message injector (kasra-review re-gate,
                 # 2026-09-14): this is the only place in the whole plugin that ever
-                # calls `activate` (aka ctx.inject_message). This check gates ONLY
-                # the injector call immediately below -- it does NOT gate
-                # deliver_text/mirror_text (the non-activation branch further down),
-                # which ship human notifications regardless of pause state; that is
-                # a deliberate, separate scope (see the P1 fencing note above for
-                # what it DOES share with this branch). _handle_routine_event and
-                # _handle_ack_envelope both enqueue() a notice without ever calling
-                # `activate` themselves, so this is where their producer's only
-                # injector reachability is gated. Raising RetryLater (not a new
-                # exception shape) reuses the existing "pending, retry with backoff"
-                # path below: the notice's own state is left untouched (not
-                # "activating"/"activation_unknown", which would misreport an
-                # ambiguous in-flight activation), and normal delivery resumes
-                # automatically once `hermes resume` lifts the pause, next poll
-                # cycle, with no operator reconciliation step.
-                from .adapter import _estop_engaged
-
+                # calls `activate` (aka ctx.inject_message). Round 3 left this as
+                # the ONLY gated sink in flush() -- deliver_text/mirror_text below
+                # shipped raw egress regardless of pause state (re-gate #3's P1,
+                # proven live). Round 4 (this pass) adds an independent, identically
+                # shaped check immediately before EACH of the three sinks
+                # (activation here, deliver_text and mirror_text further down) so
+                # every egress primitive is its own choke point, not a
+                # single shared gate one sink could fall outside of again.
+                # _handle_routine_event and _handle_ack_envelope both enqueue() a
+                # notice without ever calling `activate` themselves, so this is
+                # where their producer's only injector reachability is gated.
+                # Raising RetryLater (not a new exception shape) reuses the
+                # existing "pending, retry with backoff" path below: the notice's
+                # own state is left untouched (not "activating"/"activation_unknown",
+                # which would misreport an ambiguous in-flight activation), and
+                # normal delivery resumes automatically once `hermes resume` lifts
+                # the pause, next poll cycle, with no operator reconciliation step.
                 if _estop_engaged():
                     logger.warning(
                         "[mupot] deferring human activation source=%s: Hermes "
@@ -570,6 +576,21 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
                             source_id, target["session_key"])
                 break
             if not notice.get("delivery_receipt"):
+                # CHOKE POINT for the external Telegram send (kasra-review re-gate
+                # #3, 2026-09-14): before round 4, this branch shipped a real
+                # `deliver_text` egress unconditionally, paused or not -- proven
+                # live (an outbox item persisted BEFORE `hermes pause` was still
+                # delivered to Telegram DURING the pause). Refuse before touching
+                # any state (not even the "sending" transition) so a genuinely
+                # in-flight send is never left ambiguous; the notice stays exactly
+                # as it was and this same branch retries next poll cycle.
+                if _estop_engaged():
+                    logger.warning(
+                        "[mupot] deferring Telegram delivery source=%s: Hermes "
+                        "global emergency stop is engaged",
+                        source_id,
+                    )
+                    raise RetryLater()
                 # A crash anywhere across the external send must never cause a
                 # blind replay: Telegram has no idempotency key for sendMessage.
                 # P1: deliver_text ships fenced_text (the same fenced string the
@@ -582,6 +603,21 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
                 notice["delivery_receipt"] = await deliver_text(target, fenced_text)
                 notice.update(status="pending", delivery_status="receipt_recorded")
                 store.save(state)
+            # CHOKE POINT for the conversation mirror (kasra-review re-gate #3,
+            # 2026-09-14): same class as the deliver_text gate above -- proven
+            # live that a pre-paused outbox item was still mirrored into the
+            # human's transcript DURING the pause. Checked again here (not just
+            # once at the top of this branch) because deliver_text may have
+            # already completed on an earlier tick (delivery_receipt already
+            # set) and the pause may have engaged in between: the mirror write
+            # is its own independent egress and gets its own independent gate.
+            if _estop_engaged():
+                logger.warning(
+                    "[mupot] deferring conversation mirror source=%s: Hermes "
+                    "global emergency stop is engaged",
+                    source_id,
+                )
+                raise RetryLater()
             # A mirror failure retries only the mirror, never the platform send.
             # P1: mirror_text ships the same fenced_text, at role="user" (see
             # mirror_text's own docstring note) -- never the raw body at the

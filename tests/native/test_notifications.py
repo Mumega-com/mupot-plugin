@@ -1028,3 +1028,146 @@ async def test_flush_real_estop_sentinel_blocks_activation_at_the_single_choke_p
     finally:
         real_estop.disengage()
         hermes_constants.reset_hermes_home_override(token)
+
+
+@pytest.mark.asyncio
+async def test_flush_real_estop_sentinel_blocks_deliver_text_at_its_own_choke_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-4 companion to the activation choke-point test above (kasra-review
+    re-gate #3, 2026-09-14): re-gate #3 proved flush()'s non-activation branch
+    shipped a REAL Telegram send unconditionally while paused -- an outbox
+    item persisted BEFORE `hermes pause` was still delivered DURING the
+    pause, through both a direct flush() call and the live poll loop.
+    Isolates deliver_text's own independent choke point the same way as the
+    activation test: enqueue (via the real send() path) while NOT paused,
+    THEN engage the real sentinel and call flush() directly."""
+    import hermes_constants
+    from agent import estop as real_estop
+    from gateway.config import Platform
+    from gateway.platforms.base import SendResult
+    from hermes_state import SessionDB
+    from tools import send_message_senders
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    # Both the real agent.estop sentinel AND active_sessions()'s bare
+    # SessionDB(read_only=True) must resolve to the SAME isolated home: the
+    # override covers the former, HERMES_HOME the latter (see the ITEM3
+    # egress-gate driver test for the same combined setup).
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    token = hermes_constants.set_hermes_home_override(str(hermes_home))
+    db = SessionDB(hermes_home / "state.db")
+    try:
+        db.create_session("human", "telegram", user_id="owner", chat_id="123",
+                          chat_type="dm", session_key="agent:main:telegram:dm:123")
+        delivered: list[tuple[str, str]] = []
+
+        class Transport:
+            async def send(self, *, chat_id, content, metadata):
+                delivered.append((chat_id, content))
+                return SendResult(success=True, message_id="tg-choke-deliver")
+
+        def connected(platform):
+            assert platform == Platform.TELEGRAM
+            return None, Transport()
+
+        monkeypatch.setattr(send_message_senders, "_live_adapter", connected)
+        adapter = adapter_at(tmp_path)
+
+        assert real_estop.is_engaged() is False
+        await bind_delivery(adapter, {"id": "choke-deliver", "from_agent": "kasra"})
+        await adapter.send("kasra", "Please review the queued item.")
+
+        real_estop.engage(reason="kasra-review-regate3-round4-deliver")
+        assert real_estop.is_engaged() is True
+
+        await adapter._flush_notifications()
+        assert delivered == [], "shipped a Telegram send while paused"
+        notice = StateStore(tmp_path / "inbox.json").load()["notification_outbox"]["choke-deliver"]
+        # Deferred, not misreported as an in-flight/interrupted send: "sending"
+        # or "transport_unknown" would claim we don't know the outcome, which
+        # is untrue here -- we refused before ever calling deliver_text().
+        assert notice["status"] == "pending"
+        assert not notice.get("delivery_receipt")
+
+        real_estop.disengage()
+        assert real_estop.is_engaged() is False
+        # RetryLater's exponential backoff is exactly what a normal poll cycle
+        # honors by waiting; simulate "later" deterministically rather than
+        # sleeping in a test (same technique as the activation choke test).
+        state = StateStore(tmp_path / "inbox.json").load()
+        state["notification_outbox"]["choke-deliver"]["retry_at"] = 0
+        StateStore(tmp_path / "inbox.json").save(state)
+        adapter._state = state
+        await adapter._flush_notifications()
+        assert len(delivered) == 1
+        assert delivered[0][0] == "123"
+    finally:
+        real_estop.disengage()
+        db.close()
+        hermes_constants.reset_hermes_home_override(token)
+
+
+@pytest.mark.asyncio
+async def test_flush_real_estop_sentinel_blocks_mirror_text_at_its_own_choke_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same class as the deliver_text test above, isolating the conversation
+    mirror sink independently: a notice whose Telegram send already completed
+    (delivery_receipt set on an earlier tick, or before a crash) must not be
+    mirrored into the human transcript while paused -- the mirror write is
+    its own egress primitive with its own gate, not covered by having already
+    passed the deliver_text gate on a prior tick."""
+    import hermes_constants
+    from agent import estop as real_estop
+    from hermes_state import SessionDB
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    token = hermes_constants.set_hermes_home_override(str(hermes_home))
+    db = SessionDB(hermes_home / "state.db")
+    try:
+        db.create_session("human", "telegram", user_id="owner", chat_id="123",
+                          chat_type="dm", session_key="agent:main:telegram:dm:123")
+        adapter = adapter_at(tmp_path)
+        from plugin.mupot_gateway.notifications import enqueue
+        enqueue(adapter._state, adapter.store, source("choke-mirror"),
+                "Already delivered, pending mirror only.")
+        state = StateStore(tmp_path / "inbox.json").load()
+        state["notification_outbox"]["choke-mirror"].update(
+            status="pending",
+            delivery_status="receipt_recorded",
+            delivery_receipt={"message_id": "tg-already-sent", "platform": "telegram",
+                              "chat_id": "123"},
+            target={"platform": "telegram", "user_id": "owner", "chat_id": "123",
+                    "thread_id": None, "session_id": "human",
+                    "session_key": "agent:main:telegram:dm:123"},
+        )
+        StateStore(tmp_path / "inbox.json").save(state)
+        adapter._state = state
+
+        real_estop.engage(reason="kasra-review-regate3-round4-mirror")
+        assert real_estop.is_engaged() is True
+
+        await adapter._flush_notifications()
+        assert db.get_messages("human") == [], "mirrored a notice while paused"
+        notice = StateStore(tmp_path / "inbox.json").load()["notification_outbox"]["choke-mirror"]
+        assert notice["status"] != "delivered"
+
+        real_estop.disengage()
+        assert real_estop.is_engaged() is False
+        # Same deterministic "later" simulation as the deliver_text test above.
+        state = StateStore(tmp_path / "inbox.json").load()
+        state["notification_outbox"]["choke-mirror"]["retry_at"] = 0
+        StateStore(tmp_path / "inbox.json").save(state)
+        adapter._state = state
+        await adapter._flush_notifications()
+        mirrored = db.get_messages("human")
+        assert len(mirrored) == 1
+        assert mirrored[0]["role"] == "user"
+    finally:
+        real_estop.disengage()
+        db.close()
+        hermes_constants.reset_hermes_home_override(token)

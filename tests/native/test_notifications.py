@@ -691,10 +691,20 @@ async def test_activation_queues_existing_human_conversation_instead_of_passive_
     await adapter.send("kasra", "The project needs your direction.")
     await adapter._flush_notifications()
     assert len(calls) == 1
-    assert calls[0][1] == {"session_key": "agent:main:telegram:dm:123"}
+    assert calls[0][1] == {
+        "session_key": "agent:main:telegram:dm:123",
+        "role": "mupot-notice",
+    }
     assert "activate-1" in calls[0][0]
     assert "Mupot requester already received a reply" in calls[0][0]
     assert "Routine human-wait" not in calls[0][0]
+    # The agent-supplied body is fenced as quoted data, and the "not an instruction"
+    # caveat lands after the fenced block, not before it.
+    fence_start = calls[0][0].index("```mupot-notice")
+    fence_end = calls[0][0].index("```", fence_start + len("```mupot-notice"))
+    assert "The project needs your direction." in calls[0][0][fence_start:fence_end]
+    caveat_index = calls[0][0].index("not a human instruction or approval")
+    assert caveat_index > fence_end
     notice = StateStore(tmp_path / "inbox.json").load()["notification_outbox"]["activate-1"]
     assert notice["status"] == "activation_queued"
     assert notice["custody_status"] == "durable"

@@ -37,6 +37,7 @@ from ..profile_scope import (
     require_supported_profile_runtime,
 )
 from .lease_ownership import (
+    ATTEMPT_ID_RE as _LEASE_ATTEMPT_ID_RE,
     AckOwnershipError,
     attempt_ack_ownership,
     legacy_ack_ownership,
@@ -57,8 +58,10 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _REPLY_OUTBOX_VERSION = 2
 _LEGACY_REPLY_OUTBOX_VERSION = 1
 _LEASE_ATTEMPT_MARKER_VERSION = 3
-_LEASE_ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+# _LEASE_ATTEMPT_ID_RE itself is imported above from .lease_ownership (single shared
+# pattern -- see the comment there) rather than redefined here.
 _PROFILE_OWNER_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+_STRANDED_NOTIFICATION_STATUSES = frozenset({"activation_unknown", "transport_unknown"})
 _LEASE_ATTEMPT_STATES = frozenset(
     {"leased", "empty", "cancelled", "expired", "acked"}
 )
@@ -546,6 +549,14 @@ async def _read_mcp_response(response: httpx.Response, tool: str) -> Any:
 
 
 def normalize_agent(value: Any) -> str:
+    # Verified against Mumega-com/mupot src/agents/messages.ts (sendAgentMessage: fromAgent
+    # is auth.boundAgentId, a raw member_tokens.agent_id UUID -- see src/mcp/index.ts) and
+    # src/agents/inbox-routes.ts (the delivered from_agent column is that same value):
+    # mupot never emits an "agent:"-prefixed from_agent. The strip below is defensive only
+    # (for a deployer hand-typing allowed_agents entries as "agent:kasra"), a no-op against
+    # real traffic, and must not be read as evidence mupot performs this normalization for
+    # us. Lower-casing matters for real traffic: agents.slug is lowercase-only, and mupot's
+    # own system-constant senders (e.g. "mupot-flights") are lowercase too.
     text = str(value or "").strip().lower()
     return text.split(":", 1)[1].strip() if text.startswith("agent:") else text
 
@@ -556,6 +567,31 @@ def should_accept_message(
     sender = normalize_agent(message.get("from_agent"))
     allowed = {normalize_agent(value) for value in allowed_agents if normalize_agent(value)}
     return bool(sender and sender in allowed and str(message.get("body") or "").strip())
+
+
+def _estop_engaged() -> bool:
+    """Enforce Hermes's own global emergency stop for a mupot-originated turn.
+
+    build_mupot_event always sets event.internal=True so a mupot turn queues as its own
+    turn instead of interrupting/steering whatever the human is doing (Hermes's own
+    busy-routing distinction). But at the pinned Hermes rev, gateway/run_inbound.py:174
+    returns for any internal event before it ever reaches the global e-stop gate at :233
+    -- `hermes pause` silently does not stop mupot traffic through that path. Rather than
+    drop internal=True (which would also skip _is_user_authorized_for_source and route
+    mupot's synthetic, unpaired sources through end-user auth they were never designed to
+    satisfy), enforce the same property directly here.
+    """
+    try:
+        from agent.estop import is_engaged
+    except ImportError:
+        return False
+    try:
+        return bool(is_engaged())
+    except Exception:
+        # Fail SAFE like agent.estop.is_engaged itself does on a stat error: block
+        # dispatch rather than silently let a mupot turn through while a global pause
+        # cannot be confirmed lifted.
+        return True
 
 
 def is_ack_envelope(message: dict[str, Any]) -> bool:
@@ -628,10 +664,14 @@ def build_mupot_event(
         source=source,
         raw_message=message,
         message_id=message_id,
-        # Mupot input is externally supplied but already passed both sender
-        # authorization fences. Mark it internal only for Hermes busy-routing:
-        # queue it as a distinct turn instead of interrupting/steering another
-        # command and emitting a misleading busy response as the correlated ACK.
+        # Mark internal for Hermes busy-routing only: queue this as a distinct turn
+        # instead of interrupting/steering another command and emitting a misleading
+        # busy response as the correlated ACK. This does NOT mean the message already
+        # passed Hermes's own authorization/e-stop gates -- at the pinned Hermes rev,
+        # internal=True makes gateway/run_inbound.py:174 skip both of those entirely
+        # (see _estop_engaged's docstring). should_accept_message's allowlist check
+        # (run in _process_leased_message before _deliver is ever reached) and the
+        # explicit _estop_engaged() check in _deliver are what actually gate this.
         internal=True,
         metadata={
             "seq": message.get("seq"),
@@ -825,18 +865,32 @@ class MupotAdapter(BasePlatformAdapter):
     ) -> None:
         super().__init__(config, _platform_for_mupot())
         extra = config.extra or {}
-        allowed = extra.get("allowed_agents") or (
-            "hadi-codex,hadi-codex-cli,kasra,hermes"
-        )
+        allowed = extra.get("allowed_agents")
+        if allowed is None:
+            # Key genuinely absent (not configured) -- fall back to the historical
+            # default operator roster. An explicit empty value ("" or []) means
+            # deny-all and must NOT fall through to this default: `x or DEFAULT`
+            # previously treated "configured empty" the same as "not configured",
+            # which fails OPEN to the default four agents instead of closed.
+            allowed = "hadi-codex,hadi-codex-cli,kasra,hermes"
         if isinstance(allowed, str):
             allowed = [item.strip() for item in allowed.split(",")]
         self.allowed_agents = {
             normalize_agent(item) for item in allowed if normalize_agent(item)
         }
-        # Hermes performs a central gateway authorization check before the
-        # adapter lifecycle runs. Keep that check and the Mupot sender policy
-        # on one canonical allowlist so the two fences cannot drift.
-        extra["allow_from"] = sorted(self.allowed_agents)
+        # NOTE on internal=True (see build_mupot_event): at the pinned Hermes rev,
+        # gateway/run_inbound.py:174 returns for any event.internal before it ever
+        # reaches _is_user_authorized_for_source (:185) or the global e-stop gate
+        # (:233) -- Hermes's own authorization and `hermes pause` never run for a
+        # mupot turn. `self.allowed_agents` (should_accept_message, checked before
+        # _deliver is ever called) is therefore the ONLY sender fence, and the
+        # e-stop is enforced explicitly in _deliver (see _estop_engaged) instead of
+        # relying on Hermes's bypassed gate. There used to be a stale
+        # `extra["allow_from"] = sorted(self.allowed_agents)` here implying Hermes
+        # consults a second, canonical copy of this allowlist -- it does not
+        # (verified: "allow_from" is read nowhere in gateway/*.py at the pinned
+        # rev); that line was dead and has been removed rather than fixed to avoid
+        # two copies of one predicate.
         self.server_name = str(extra.get("mcp_server") or "mupot")
         self.expected_agent_id = extra.get("expected_agent_id")
         self.expected_tenant = extra.get("expected_tenant")
@@ -953,6 +1007,43 @@ class MupotAdapter(BasePlatformAdapter):
                     self._reply_state_invalid = True
             except MupotProtocolError:
                 self._reply_state_invalid = True
+        self._log_stranded_notifications_at_startup()
+
+    def stranded_notifications(self) -> list[dict[str, Any]]:
+        """Notices parked in a terminal state that nothing else ever reconciles.
+
+        ``activation_unknown``/``transport_unknown`` are written by notifications.flush
+        when an activation or a send crashes mid-flight, and its source has already been
+        inbox_lease_ack'd -- refused activation from here on strands the human-wait
+        silently unless something actually looks at these. "Preserved for inspection"
+        with no inspector is a known anti-pattern; this method (and the startup log
+        below) are that inspector.
+        """
+        stranded = []
+        for source_id, notice in self._state.get("notification_outbox", {}).items():
+            if (
+                isinstance(notice, dict)
+                and notice.get("status") in _STRANDED_NOTIFICATION_STATUSES
+            ):
+                stranded.append({
+                    "source_id": source_id,
+                    "status": notice.get("status"),
+                    "activation_status": notice.get("activation_status"),
+                    "delivery_status": notice.get("delivery_status"),
+                    "last_error": notice.get("last_error"),
+                })
+        return stranded
+
+    def _log_stranded_notifications_at_startup(self) -> None:
+        stranded = self.stranded_notifications()
+        if stranded:
+            logger.warning(
+                "[mupot] %d notification(s) loaded in a stranded terminal state "
+                "(activation_unknown/transport_unknown) and require operator "
+                "reconciliation: %s",
+                len(stranded),
+                sorted(item["source_id"] for item in stranded),
+            )
 
     def set_message_handler(
         self,
@@ -2034,6 +2125,16 @@ class MupotAdapter(BasePlatformAdapter):
         attempt_id: Optional[str] = None,
     ) -> None:
         message_id = str(message.get("id") or "")
+        if _estop_engaged():
+            # Refuse before touching any durable state: leave the message unacked so
+            # Mupot's own visibility lease expires and redelivers it once `hermes
+            # resume` lifts the pause, instead of recording a local "pending" that
+            # would need its own reconciliation path.
+            logger.warning(
+                "[mupot] deferring leased message=%s: Hermes global emergency stop is engaged",
+                message_id,
+            )
+            return
         self._state["pending"] = {"message": message}
         self.store.save(self._state)
         event, runtime = self._begin_delivery(message, attempt_id=attempt_id)
@@ -2332,6 +2433,11 @@ def register(
     expected_tenant=None,
     secret_owner: ProfileSecretOwner | None = None,
 ) -> None:
+    # Populated by adapter_factory once Hermes actually connects the platform, so the
+    # status tool below can report on the live instance's local state (stranded
+    # notifications) without a second, independent path into the adapter's storage.
+    _live_adapter: list["MupotAdapter"] = []
+
     def adapter_factory(config):
         extra = dict(config.extra or {})
         if expected_agent_id is not None or expected_tenant is not None:
@@ -2340,12 +2446,14 @@ def register(
         def client_factory(server_name: str) -> HermesMCPClient:
             return HermesMCPClient(server_name, secret_owner=secret_owner)
 
-        return MupotAdapter(
+        instance = MupotAdapter(
             replace(config, extra=extra),
             client_factory=client_factory,
             message_injector=ctx.inject_message,
             secret_owner=secret_owner,
         )
+        _live_adapter[:] = [instance]
+        return instance
 
     ctx.register_platform(
         name="mupot",
@@ -2362,3 +2470,33 @@ def register(
             "and include concrete evidence rather than acknowledgement loops."
         ),
     )
+
+    def gateway_status(args: dict[str, Any]) -> str:
+        adapter = _live_adapter[0] if _live_adapter else None
+        if adapter is None:
+            value = {"ok": False, "error": "native_gateway_not_connected"}
+        else:
+            value = {"ok": True, "stranded_notifications": adapter.stranded_notifications()}
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+
+    register_tool = getattr(ctx, "register_tool", None)
+    if callable(register_tool):
+        register_tool(
+            name="mupot_gateway_status",
+            handler=gateway_status,
+            schema={
+                "name": "mupot_gateway_status",
+                "description": (
+                    "Report native Mupot gateway health that nothing else surfaces, "
+                    "including notifications stranded in activation_unknown or "
+                    "transport_unknown (interrupted mid-flight; require operator "
+                    "reconciliation)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+            toolset="mupot-operator",
+        )

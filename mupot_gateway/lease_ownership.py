@@ -8,7 +8,10 @@ from typing import Any, Mapping
 
 
 _VERSION = 1
-_ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+# Single shared pattern: adapter.py imports this instead of keeping its own copy
+# (two copies of one predicate drift silently; see _LEASE_ATTEMPT_ID_RE there).
+ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_ATTEMPT_ID_RE = ATTEMPT_ID_RE
 _OWNER_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 _SCOPE_FIELDS = (
     "tenant",

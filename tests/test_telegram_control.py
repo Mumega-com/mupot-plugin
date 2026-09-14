@@ -4,16 +4,21 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import replace
+import http.server
 import json
 import sys
+import threading
 import types
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+from urllib.request import Request, build_opener
 
 import pytest
 
 from plugin import register
 from plugin.telegram_control import (
     TelegramControlSettings,
+    _NoRedirect,
     register_telegram_control,
     relay_telegram_update,
 )
@@ -566,3 +571,122 @@ def test_invalid_telegram_config_leaves_no_partial_plugin_surface() -> None:
     ):
         register(ctx)
     assert ctx.events == []
+
+
+def test_relay_refuses_an_unsupported_command_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kills M12 (telegram_control.py command-allowlist refusal): asserts the actual
+    relay refusal behavior for a command outside _COMMANDS, not merely that the five
+    supported commands got registered (test_factory_registers_only_the_five_exact_commands
+    proves registration shape only)."""
+    opener = Opener(AssertionError("network must not run"))
+    monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
+    update = Update(message=Message("/shutdown"))
+    with pytest.raises(ValueError, match="not supported"):
+        relay_telegram_update(valid_settings(), update)
+    assert opener.calls == []
+
+
+@pytest.mark.asyncio
+async def test_native_callback_replies_with_refusal_for_an_unsupported_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same refusal (M12) proven through the actual registered PTB callback, not
+    just through relay_telegram_update directly."""
+    factories: list[object] = []
+    handlers: list[object] = []
+
+    class CommandHandler:
+        def __init__(self, command: str, callback: object) -> None:
+            self.command = command
+            self.callback = callback
+
+    telegram = types.ModuleType("telegram")
+    telegram_ext = types.ModuleType("telegram.ext")
+    telegram_ext.CommandHandler = CommandHandler
+    monkeypatch.setitem(sys.modules, "telegram", telegram)
+    monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
+    opener = Opener(AssertionError("network must not run"))
+    monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
+    register_telegram_control(
+        types.SimpleNamespace(register_telegram_handler=factories.append),
+        valid_settings(),
+    )
+    factories[0](types.SimpleNamespace(add_handler=handlers.append), object())
+    replies: list[str] = []
+
+    async def reply_text(text: str) -> None:
+        replies.append(text)
+
+    update = Update(message=Message("/shutdown"))
+    update.effective_message.reply_text = reply_text
+    await handlers[0].callback(update, object())
+    assert replies == [
+        "This command is available only in your private, unforwarded Telegram chat."
+    ]
+    assert opener.calls == []
+
+
+def test_no_redirect_refuses_a_real_302_and_never_forwards_the_secret_header() -> None:
+    """Kills M18 (telegram_control.py:39 _NoRedirect): a real local HTTP server issues
+    a genuine 302, and a second real local HTTP server stands in as the attacker-owned
+    redirect target. Proves both that the request is refused (raised, not silently
+    followed) and that the secret header never reaches the second server -- against
+    real sockets, not a mock."""
+    captured: dict[str, object] = {}
+
+    class TargetHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler naming)
+            captured["hit"] = True
+            captured["headers"] = dict(self.headers)
+            body = b'{"ok":true,"reply":"leaked"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            return None
+
+    target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+    target_thread.start()
+    target_port = target.server_address[1]
+
+    class RedirectHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{target_port}/attacker")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *_args: object) -> None:
+            return None
+
+    redirector = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    redirector_thread = threading.Thread(target=redirector.serve_forever, daemon=True)
+    redirector_thread.start()
+    redirector_port = redirector.server_address[1]
+
+    try:
+        request = Request(
+            f"http://127.0.0.1:{redirector_port}/im/webhook",
+            data=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "X-Telegram-Bot-Api-Secret-Token": "must-not-leak-to-redirect-target",
+            },
+            method="POST",
+        )
+        with pytest.raises(HTTPError) as failure:
+            build_opener(_NoRedirect()).open(request, timeout=5)
+        assert failure.value.code == 302
+    finally:
+        target.shutdown()
+        redirector.shutdown()
+        target_thread.join(timeout=5)
+        redirector_thread.join(timeout=5)
+
+    assert captured == {}

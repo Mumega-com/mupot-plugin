@@ -150,8 +150,13 @@ class _EstopDeferred(Exception):
     as its very first statement (nothing -- no replay, no flush, no lease --
     runs in a paused tick), and every remaining primitive that can consume a
     source or ship output to a human/peer is its own choke point that raises
-    `_EstopDeferred` before touching any durable state or making any network
-    call, regardless of which function calls it:
+    `_EstopDeferred` before touching any durable state or making any
+    consuming/egress network call (read-only preflight
+    `inbox_consumer_status`/`inbox_lease_reconcile` may still be issued --
+    those never consume or ship anything). As of round 5 (kasra-review
+    re-gate #4, 2026-09-14 -- see `_maybe_start_inbox_stream`'s `deliver()`
+    in plugin/__init__.py) this covers every inject/consume/egress primitive
+    in this plugin, not just this module:
       - `_deliver`, `_handle_routine_event`, `_handle_ack_envelope` (unchanged
         from round 3 -- still needed for the mid-lease race and for tests that
         call them directly).
@@ -618,6 +623,41 @@ def should_accept_message(
 
 _ESTOP_IMPORT_WARNED = False
 
+# Set once agent.estop.is_engaged() itself has raised (a genuine check
+# failure, not a real pause) and _estop_engaged() has failed SAFE for it;
+# cleared the next time a check succeeds, so a NEW span of failures warns
+# again -- once per distinct failure window, not once per tick/poll.
+_ESTOP_CHECK_FAILSAFE_WARNED = False
+
+# Choke-point sites that have already logged an INFO line for the CURRENT
+# pause window (kasra-review re-gate #4, 2026-09-14: 4 of the 12 gate sites
+# refused silently -- _refuse_ack_if_estop_engaged, _transmit_final_reply,
+# _process_leased_message's own top gate, and send()'s interim path).
+# Cleared in full by _clear_estop_pause_log_sites() the next time
+# _estop_engaged() observes the sentinel lifted, so a NEW pause logs again
+# per site -- once per pause window, not once per message/tick.
+_ESTOP_PAUSE_LOG_SITES: set[str] = set()
+
+
+def _note_estop_pause_once(site: str, message: str) -> None:
+    """Log `message` at INFO the first time `site` refuses within this pause.
+
+    A pause is one shared, global sentinel (`agent.estop`): a single paused
+    window can refuse many messages across many choke points before it
+    lifts. Logging unconditionally at every refusal floods the log the
+    moment a burst of traffic (or a long pause) hits; logging nothing at all
+    is what re-gate #4 flagged as 4 of 12 choke points refusing silently.
+    This is the middle ground: once per site per pause window.
+    """
+    if site in _ESTOP_PAUSE_LOG_SITES:
+        return
+    _ESTOP_PAUSE_LOG_SITES.add(site)
+    logger.info(message)
+
+
+def _clear_estop_pause_log_sites() -> None:
+    _ESTOP_PAUSE_LOG_SITES.clear()
+
 
 def _estop_engaged() -> bool:
     """Enforce Hermes's own global emergency stop for a mupot-originated turn.
@@ -643,7 +683,7 @@ def _estop_engaged() -> bool:
     `notifications.flush()`'s three sinks (activation injector, `deliver_text`,
     `mirror_text`) independently.
     """
-    global _ESTOP_IMPORT_WARNED
+    global _ESTOP_IMPORT_WARNED, _ESTOP_CHECK_FAILSAFE_WARNED
     try:
         from agent.estop import is_engaged
     except ImportError:
@@ -664,12 +704,30 @@ def _estop_engaged() -> bool:
             )
         return False
     try:
-        return bool(is_engaged())
-    except Exception:
-        # Fail SAFE like agent.estop.is_engaged itself does on a stat error: block
-        # dispatch rather than silently let a mupot turn through while a global pause
-        # cannot be confirmed lifted.
+        engaged = bool(is_engaged())
+    except Exception as exc:
+        # P2 (kasra-review re-gate #4, 2026-09-14): this fail-safe returned
+        # True with zero log records -- a real is_engaged() failure (as
+        # opposed to a genuine pause) was indistinguishable from an ordinary
+        # pause in the logs. Fail SAFE exactly as before (block dispatch
+        # rather than silently let a mupot turn through while a global pause
+        # cannot be confirmed lifted), but now say so: once per distinct
+        # failure window (this is an error condition, not a tick/poll -- do
+        # NOT log on every call while is_engaged() keeps failing), cleared
+        # the next time a check succeeds so a NEW failure span warns again.
+        if not _ESTOP_CHECK_FAILSAFE_WARNED:
+            _ESTOP_CHECK_FAILSAFE_WARNED = True
+            logger.warning(
+                "[mupot] agent.estop.is_engaged() raised %s; failing SAFE "
+                "(treating Hermes's global emergency stop as ENGAGED) until "
+                "it succeeds again",
+                type(exc).__name__,
+            )
         return True
+    _ESTOP_CHECK_FAILSAFE_WARNED = False
+    if not engaged:
+        _clear_estop_pause_log_sites()
+    return engaged
 
 
 def _refuse_ack_if_estop_engaged(message_id: str) -> None:
@@ -690,6 +748,17 @@ def _refuse_ack_if_estop_engaged(message_id: str) -> None:
     property, one guard, not N copies that can individually drift stale.
     """
     if _estop_engaged():
+        # P2 (kasra-review re-gate #4, 2026-09-14): this choke point refused
+        # silently -- an operator watching the log had no signal that an ack
+        # was being held back for a pause specifically, as opposed to any
+        # other reason a message might not yet be acked. Once per pause
+        # window (not once per refused message): every ack this module ever
+        # attempts funnels through here, so a busy paused window could
+        # otherwise log once per message.
+        _note_estop_pause_once(
+            "_refuse_ack_if_estop_engaged",
+            "[mupot] refusing ack/commit: Hermes global emergency stop is engaged",
+        )
         raise _EstopDeferred(message_id)
 
 
@@ -1629,6 +1698,15 @@ class MupotAdapter(BasePlatformAdapter):
             # the exact same envelope is retried, verbatim, once resumed.
             # (The live `send()` interim path shares this same choke point.)
             if _estop_engaged():
+                # P2 (kasra-review re-gate #4, 2026-09-14): refused silently
+                # before -- once per pause window, not once per replayed/
+                # retried reply, so a backlog of prepared replies during a
+                # long pause does not flood the log.
+                _note_estop_pause_once(
+                    "_transmit_final_reply",
+                    "[mupot] refusing peer send: Hermes global emergency "
+                    "stop is engaged",
+                )
                 raise _EstopDeferred(source_id)
             try:
                 result = await asyncio.wait_for(
@@ -2196,12 +2274,18 @@ class MupotAdapter(BasePlatformAdapter):
                         # not the common case, but the SAME class: a pause is never a
                         # protocol error). `_deliver`/`_handle_routine_event`/
                         # `_handle_ack_envelope` raise this before touching any durable
-                        # state, so there is nothing to unwind here -- release this
-                        # attempt's lease fence (no reconciliation is owed for a lease
-                        # we chose to abandon, as opposed to one a genuine protocol
-                        # violation left dangling) and let the server-side lease expire
-                        # on its own so `inbox_lease` redelivers the exact same message
-                        # once `hermes resume` lifts the pause.
+                        # state -- but `_process_leased_message`'s own sender_policy
+                        # DLQ branch and `_handle_ack_envelope`'s invalid_ack_envelope
+                        # branch each write a DLQ row BEFORE reaching the ack that can
+                        # raise this (P3, kasra-review re-gate #4, 2026-09-14): that
+                        # write is idempotent by message id, so redelivery after this
+                        # exact race re-enters the same branch without duplicating the
+                        # row. Release this attempt's lease fence (no reconciliation is
+                        # owed for a lease we chose to abandon, as opposed to one a
+                        # genuine protocol violation left dangling) and let the
+                        # server-side lease expire on its own so `inbox_lease`
+                        # redelivers the exact same message once `hermes resume` lifts
+                        # the pause.
                         logger.info(
                             "[mupot] deferring leased message=%s mid-poll: Hermes "
                             "global emergency stop is engaged; leaving lease to expire "
@@ -2243,6 +2327,15 @@ class MupotAdapter(BasePlatformAdapter):
             # sender_policy DLQ) plus the two named functions at once, and
             # means a future branch added to this dispatcher inherits the
             # gate automatically rather than needing its own copy.
+            #
+            # P2 (kasra-review re-gate #4, 2026-09-14): refused silently
+            # before -- once per pause window, not once per leased message,
+            # so a busy paused poll loop does not flood the log.
+            _note_estop_pause_once(
+                "_process_leased_message",
+                "[mupot] refusing leased message dispatch: Hermes global "
+                "emergency stop is engaged",
+            )
             raise _EstopDeferred(message_id)
         if is_routine_event_candidate(message):
             if self.routine_events_enabled:
@@ -2265,8 +2358,20 @@ class MupotAdapter(BasePlatformAdapter):
         if should_accept_message(message, self.allowed_agents):
             await self._deliver(message, attempt_id=attempt_id)
             return
-        self._state["dlq"].append({"message": message, "reason": "sender_policy"})
-        self._state["dlq"] = self._state["dlq"][-100:]
+        # P3 (kasra-review re-gate #4, 2026-09-14): a pause landing between
+        # this DLQ write and the ack below (raised by _ack_expected's own
+        # _refuse_ack_if_estop_engaged choke point) leaves this branch
+        # unacked, so the message is redelivered once resumed and
+        # _process_leased_message runs this exact branch again -- append
+        # only if this message id is not already in the DLQ, so redelivery
+        # after a mid-write pause produces exactly one row, not a duplicate.
+        dlq = self._state["dlq"]
+        if not any(
+            str((entry.get("message") or {}).get("id") or "") == message_id
+            for entry in dlq
+        ):
+            dlq.append({"message": message, "reason": "sender_policy"})
+        self._state["dlq"] = dlq[-100:]
         self.store.save(self._state)
         await self._ack_expected(message_id, attempt_id=attempt_id)
         self._commit(message_id)
@@ -2399,8 +2504,19 @@ class MupotAdapter(BasePlatformAdapter):
             )
             raise _EstopDeferred(message_id)
         if not is_terminal_ack(message):
+            # P3 (kasra-review re-gate #4, 2026-09-14): same class as the
+            # sender_policy DLQ write in _process_leased_message above -- a
+            # pause between this write and the ack below (_ack_expected's
+            # own _refuse_ack_if_estop_engaged choke point) leaves the
+            # message unacked, so it redelivers and this branch runs again.
+            # Append only if not already present, so redelivery after a
+            # mid-write pause produces exactly one row.
             quarantined = self._state.get("dlq") or []
-            quarantined.append({"message": dict(message), "reason": "invalid_ack_envelope"})
+            if not any(
+                str((entry.get("message") or {}).get("id") or "") == message_id
+                for entry in quarantined
+            ):
+                quarantined.append({"message": dict(message), "reason": "invalid_ack_envelope"})
             self._state["dlq"] = quarantined[-100:]
             self.store.save(self._state)
             if message_id:
@@ -2665,8 +2781,19 @@ class MupotAdapter(BasePlatformAdapter):
                 # ever invokes the `send` MCP tool. Refuse before building the
                 # progress-ACK arguments or touching the network while paused;
                 # `send()`'s own except-Exception below turns this into an
-                # ordinary retryable SendResult failure for Hermes.
+                # ordinary retryable SendResult failure for Hermes. Its error
+                # string carries "estop_paused" (see the except clause below)
+                # so the reason is visible in Hermes's own log line, not just
+                # here.
                 if _estop_engaged():
+                    # P2 (kasra-review re-gate #4, 2026-09-14): refused
+                    # silently before -- once per pause window, not once per
+                    # interim send attempt.
+                    _note_estop_pause_once(
+                        "send_interim",
+                        "[mupot] refusing interim progress-ACK send: Hermes "
+                        "global emergency stop is engaged",
+                    )
                     raise _EstopDeferred(inbound_id)
                 arguments = {
                     "to": recipient,
@@ -2694,6 +2821,22 @@ class MupotAdapter(BasePlatformAdapter):
                 success=True,
                 message_id=receipt["id"],
                 raw_response=receipt,
+            )
+        except _EstopDeferred as exc:
+            # P2 (kasra-review re-gate #4, 2026-09-14): before this fix, a
+            # pause refusal fell into the generic `except Exception` below
+            # and surfaced as `error=str(exc)` -- a bare message/source id
+            # with no mention of a pause, so Hermes's own log line for the
+            # refused send gave no clue why. The choke point that raised
+            # this (this function's own interim-send gate, or
+            # `_transmit_final_reply`'s "prepared" gate for the non-interim
+            # branch) already logged the pause once per pause window; this
+            # is just the SendResult surface, retryable once resumed.
+            return SendResult(
+                success=False,
+                error=f"estop_paused: Hermes global emergency stop is engaged (message={exc})",
+                retryable=True,
+                error_kind="transient",
             )
         except Exception as exc:
             permanent = isinstance(exc, MupotProtocolError)

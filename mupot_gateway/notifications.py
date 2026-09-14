@@ -582,8 +582,22 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
                 # live (an outbox item persisted BEFORE `hermes pause` was still
                 # delivered to Telegram DURING the pause). Refuse before touching
                 # any state (not even the "sending" transition) so a genuinely
-                # in-flight send is never left ambiguous; the notice stays exactly
-                # as it was and this same branch retries next poll cycle.
+                # in-flight send is never left ambiguous; the notice stays
+                # "pending" and this same branch retries next poll cycle.
+                # NOTE (P3, kasra-review re-gate #4, 2026-09-14): "stays
+                # exactly as it was" overstated this -- RetryLater raised here
+                # is caught by this function's own `except Exception` below,
+                # which DOES write bookkeeping: notice["attempts"] +=1 and a
+                # new notice["retry_at"] (exponential backoff). That is
+                # harmless: `attempts` is read in exactly one place (the
+                # `delay = min(300, 10 * (2 ** min(attempts - 1, 5)))`
+                # backoff formula below), which already caps the exponent at
+                # 5, so churning `attempts` up during a pause cannot push the
+                # delay past its existing 300s ceiling or trip any other
+                # cap -- there is no "give up after N attempts" logic
+                # anywhere this could violate. It only ever makes the next
+                # real attempt wait a little longer, bounded the same as any
+                # other retry.
                 if _estop_engaged():
                     logger.warning(
                         "[mupot] deferring Telegram delivery source=%s: Hermes "

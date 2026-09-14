@@ -1,5 +1,6 @@
 """The single plugin must select one receiver without partially registering an invalid mode."""
 from contextlib import nullcontext
+import logging
 import sys
 import types
 from unittest.mock import patch
@@ -162,3 +163,62 @@ def test_maybe_start_inbox_stream_routes_deliver_through_shared_fence_helper(tmp
         assert caveat_index > fence_end
     finally:
         plugin._ACTIVE_WATCHERS.clear()
+
+
+def test_maybe_start_inbox_stream_deliver_fails_open_when_adapter_is_not_importable(
+    tmp_path, caplog
+):
+    """`deliver()`'s new `_estop_engaged()` check (kasra-review re-gate #4,
+    2026-09-14 -- see the native-suite test for the real gating behavior)
+    imports `mupot_gateway.adapter`, which imports Hermes-core `gateway.*`
+    modules at module level. Those are absent from this plain, non-native
+    suite by design (this suite tests the plugin standalone). Proves the
+    ImportError is caught and failed OPEN -- exactly like `_estop_engaged()`'s
+    own `agent.estop` ImportError handling -- rather than crashing a legacy
+    path that has nothing to do with the native gateway feature."""
+    captured: dict[str, object] = {}
+
+    class FakeInboxStream:
+        def __init__(self, settings, deliver, state_path=None):
+            captured["deliver"] = deliver
+
+        def set_session_key(self, *_a, **_kw):
+            pass
+
+        def start(self):
+            pass
+
+    injected: list[str] = []
+
+    class Ctx:
+        def inject_message(self, text):
+            injected.append(text)
+            return True
+
+        def register_hook(self, *_a, **_kw):
+            pass
+
+    plugin._LEGACY_INBOX_STREAM_PAUSE_LOGGED = False
+    plugin._LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED = False
+    try:
+        with patch("plugin.inbox_stream.InboxStream", FakeInboxStream):
+            plugin._maybe_start_inbox_stream(
+                Ctx(),
+                {
+                    "inbox_watch_enabled": True,
+                    "inbox_watch_sources": ["mupot"],
+                    "inbox_watch_state_file": str(tmp_path / "inbox-stream-state.json"),
+                },
+            )
+            deliver = captured["deliver"]
+            with caplog.at_level(logging.WARNING, logger="plugin"):
+                assert deliver("batch one") is True
+            assert len(injected) == 1, "delivery was dropped instead of failing open"
+            assert any(
+                "not importable; failing OPEN" in r.message for r in caplog.records
+            )
+    finally:
+        plugin._ACTIVE_WATCHERS.clear()
+        plugin._LEGACY_INBOX_STREAM_PAUSE_LOGGED = False
+        plugin._LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED = False
+        plugin._LEGACY_INBOX_STREAM_PAUSE_LOGGED = False

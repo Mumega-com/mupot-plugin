@@ -235,7 +235,15 @@ async def _run_case(tmp_path, message, *, mid_message, routine_events_enabled=Tr
             # measurement, not a vacuous one.
             out["routine_quarantine_paused"] = len(st.get("routine_event_quarantine") or [])
             out["pending_paused"] = st.get("pending")
-            out["outbox_paused"] = len(st.get("notifications") or st.get("outbox") or [])
+            # P3 (kasra-review re-gate #4, 2026-09-14): the real durable
+            # outbox keys are "notification_outbox" and "reply_outbox" (both
+            # dicts keyed by source_id -- see notifications.py/adapter.py's
+            # own state initialization). This used to read "notifications"/
+            # "outbox", neither a real key, so this was always a silent 0
+            # regardless of what the code did -- fixed here so it is an
+            # actual measurement.
+            out["notification_outbox_paused"] = len(st.get("notification_outbox") or {})
+            out["reply_outbox_paused"] = len(st.get("reply_outbox") or {})
             out["state_digest_paused"] = digest(state_path)
 
             real_estop.disengage()
@@ -280,6 +288,11 @@ async def test_pre_lease_pause(tmp_path, label, msg, ren):
     assert out["processed_paused"] == []
     assert out["dlq_paused"] == 0, "wrote to the DLQ while paused"
     assert out["routine_quarantine_paused"] == 0, "wrote a routine quarantine record while paused"
+    assert out["sent_paused"] == 0, "transmitted a peer send while paused"
+    assert out["injections_paused"] == 0, "injected into the human session while paused"
+    assert out["pending_paused"] is None, "pause drained or grew the pending queue"
+    assert out["notification_outbox_paused"] == 0, "enqueued a human notification while paused"
+    assert out["reply_outbox_paused"] == 0, "wrote a reply-outbox record while paused"
 
 
 @pytest.mark.asyncio
@@ -309,3 +322,9 @@ async def test_mid_message_pause(tmp_path, label, msg, ren):
     assert out["routine_quarantine_paused"] == 0, (
         "wrote a routine quarantine record mid-lease while paused")
     assert out["processed_paused"] == [], "marked a source processed mid-lease while paused"
+    assert out["ack_calls_paused"] == [], "acked the leased message mid-lease while paused"
+    assert out["sent_paused"] == 0, "transmitted a peer send mid-lease while paused"
+    assert out["injections_paused"] == 0, (
+        "injected into the human session mid-lease while paused")
+    assert out["pending_paused"] is None, (
+        "pause drained or grew the pending queue mid-lease")

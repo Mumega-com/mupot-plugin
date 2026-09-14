@@ -288,3 +288,102 @@ async def test_item1d_reconcile_while_paused(tmp_path, monkeypatch):
     finally:
         real_estop.disengage()
         hermes_constants.reset_hermes_home_override(token)
+
+
+# ------------------------------------------------------- legacy inbox stream
+def test_legacy_inbox_stream_deliver_refuses_inject_while_real_estop_engaged(
+    tmp_path, caplog
+):
+    """P2 (kasra-review re-gate #4, 2026-09-14): the legacy inbox-stream
+    `deliver()` closure (plugin/__init__.py's `_maybe_start_inbox_stream`,
+    the config-exclusive non-native receive path) had the untrusted-body
+    fence but no `_estop_engaged()` check at all, even though
+    `_EstopDeferred`'s docstring claimed plugin-wide coverage of every
+    inject/consume/egress primitive in this plugin. Drives the REAL
+    agent/estop.py sentinel (not a fake), proving: `inject_message` is never
+    reached while paused (this legacy stream has no deferral/redelivery
+    surface -- InboxStream's cursor/seen_keys already advanced for the batch
+    before deliver() runs, so a refusal here drops the batch rather than
+    retrying it, an accepted tradeoff, see the comment in `deliver()`); the
+    pause is logged once per pause window, not once per dropped batch; and a
+    NEW pause (engaged again after resuming) logs again."""
+    import hermes_constants
+    from agent import estop as real_estop
+    import plugin
+    import logging
+    from unittest.mock import patch
+
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    token = hermes_constants.set_hermes_home_override(str(home))
+
+    captured: dict[str, object] = {}
+
+    class FakeInboxStream:
+        def __init__(self, settings, deliver, state_path=None):
+            captured["deliver"] = deliver
+
+        def set_session_key(self, *_a, **_kw):
+            pass
+
+        def start(self):
+            pass
+
+    injected: list[str] = []
+
+    class Ctx:
+        def inject_message(self, text):
+            injected.append(text)
+            return True
+
+        def register_hook(self, *_a, **_kw):
+            pass
+
+    plugin._LEGACY_INBOX_STREAM_PAUSE_LOGGED = False
+    try:
+        assert real_estop.is_engaged() is False
+        with patch("plugin.inbox_stream.InboxStream", FakeInboxStream):
+            plugin._maybe_start_inbox_stream(
+                Ctx(),
+                {
+                    "inbox_watch_enabled": True,
+                    "inbox_watch_sources": ["mupot"],
+                    "inbox_watch_state_file": str(tmp_path / "inbox-stream-state.json"),
+                },
+            )
+            deliver = captured["deliver"]
+
+            real_estop.engage(reason="k4-legacy-inbox-stream")
+            assert real_estop.is_engaged() is True
+            with caplog.at_level(logging.INFO, logger="plugin"):
+                assert deliver("batch one") is False
+                assert deliver("batch two") is False
+            assert injected == [], "inject_message was reached while paused"
+            paused_records = [
+                r for r in caplog.records if "emergency stop is engaged" in r.message
+            ]
+            assert len(paused_records) == 1, (
+                "logged once per dropped batch instead of once per pause window"
+            )
+
+            caplog.clear()
+            real_estop.disengage()
+            assert real_estop.is_engaged() is False
+            with caplog.at_level(logging.INFO, logger="plugin"):
+                assert deliver("batch three") is True
+            assert len(injected) == 1
+
+            caplog.clear()
+            real_estop.engage(reason="k4-legacy-inbox-stream-2")
+            with caplog.at_level(logging.INFO, logger="plugin"):
+                assert deliver("batch four") is False
+            assert len(injected) == 1, "inject_message was reached on the new pause"
+            new_window_records = [
+                r for r in caplog.records if "emergency stop is engaged" in r.message
+            ]
+            assert len(new_window_records) == 1, "a new pause window did not log again"
+    finally:
+        real_estop.disengage()
+        plugin._ACTIVE_WATCHERS.clear()
+        plugin._LEGACY_INBOX_STREAM_PAUSE_LOGGED = False
+        hermes_constants.reset_hermes_home_override(token)

@@ -646,3 +646,159 @@ used for M7/M12/M17/M18):
   `deliver_text`/`mirror_text` unconditionally for every notice, closing round 3's own open
   question in the strictest direction (pause blocks ALL egress, not just autonomous injection).
   Not revisited as a design question, just implemented per this round's explicit brief.
+
+## Kasra re-gate #4 repair, round 5 (2026-09-14)
+
+Round 4's class fix closed the security question — re-gate #4 (head `709c0d0e`) returned
+**AMBER → merge-defensible**, not a BLOCK: "e-stop class closed by execution," 18/18 on the
+liveness matrix, 12/12 gate sites structurally covering every `inbox_lease_ack`/`inbox_ack`/peer
+`send`/`deliver_text`/`mirror_text`/`activate` call site. This round is a small tidy of the 5
+follow-ups the re-gate filed as P2/P3 (none a security hole): one real gap (the legacy inbox
+stream's inject choke point), an observability gap (silent refusals, an unlabeled fail-safe, an
+unlabeled `SendResult`), a data-quality bug (duplicated DLQ rows across a pause), three
+inaccurate comments, and a test that measured values it never asserted.
+
+### What re-gate #4 actually found (verdict on head `709c0d0e`)
+
+1. **P2 — `__init__.py`'s legacy `inbox_watch` inject path has the fence but no
+   `_estop_engaged()` check**, even though `_EstopDeferred`'s docstring claimed plugin-wide
+   coverage. Config-exclusive with the native gateway (mutually exclusive settings), so it
+   needed, and had never received, its own gate.
+2. **P2 — Observability.** `_estop_engaged()`'s fail-safe `except Exception: return True`
+   (`adapter.py:668`) returned `True` with zero log records. 4 of the 12 gate sites
+   (`_refuse_ack_if_estop_engaged`, `_transmit_final_reply`, `_process_leased_message`'s own top
+   gate, `send()`'s interim path) refused silently. A pause-refused final reply's `SendResult`
+   surfaced as `error=str(exc)` (a bare message/source id) with no mention of a pause.
+3. **P3 — DLQ row duplicated across a pause.** `_process_leased_message`'s sender-policy branch
+   (`:2268-2272` in the re-gate's line numbering) and `_handle_ack_envelope`'s
+   `invalid_ack_envelope` branch (`:2402-2406`) each write a DLQ row, THEN ack. A pause landing
+   between the write and the ack (`_ack_expected`'s own `_refuse_ack_if_estop_engaged` choke)
+   leaves the message unacked; redelivery re-enters the same branch and appended a second row for
+   one message. The `:2196` comment ("nothing to unwind here") was accurate for `_deliver`/
+   `_handle_routine_event`/`_handle_ack_envelope`'s OWN top gates but false for these two DLQ
+   writes, which precede the ack.
+4. **P3 — Three inaccurate comments.** `_EstopDeferred`'s docstring's "regardless of which
+   function calls it" overclaimed (true only once this round's item 1 lands); "or making any
+   network call" was too broad (the read-only preflight `inbox_consumer_status`/
+   `inbox_lease_reconcile` calls are exempt by design); `notifications.py:584`'s "stays exactly as
+   it was" ignored that `RetryLater`'s own except-handler writes `attempts`/`retry_at`.
+5. **P3 — Test quality.** `tests/native/test_estop_lease_gate.py:238` read
+   `st.get("notifications")`/`st.get("outbox")`, neither a real state key, so it was a silent 0
+   regardless of the code; `sent_paused`/`injections_paused`/`pending_paused` were measured every
+   run and never asserted; `test_mid_message_pause` had no `ack_calls_paused == []` assertion.
+
+### Fix shape
+
+- **Item 1.** `deliver()` inside `_maybe_start_inbox_stream` now checks `_estop_engaged()`
+  (imported lazily from `mupot_gateway.adapter`, with an `ImportError` fail-open + one-time
+  warning for the plain, non-native `scripts/test.sh` suite where the transitive `gateway.*`
+  Hermes-core import isn't available) before calling `inject_message`. This legacy stream has no
+  deferral/redelivery surface — `InboxStream._poll` already advances its cursor/seen-keys for a
+  batch before `deliver()` runs — so a refusal here DROPS the batch rather than deferring it; that
+  tradeoff is documented inline and in the runbook. Logged once per pause window, not once per
+  dropped batch, via a dedicated module-level flag mirroring `adapter.py`'s own pattern.
+- **Item 2.** A new shared `_note_estop_pause_once(site, message)` helper (paired with
+  `_clear_estop_pause_log_sites()`, called from `_estop_engaged()` whenever it observes the
+  sentinel lifted) logs an INFO line the first time each of the 4 previously-silent choke points
+  refuses within a pause window, never once per message/tick. The fail-safe `except Exception`
+  branch now warns once per distinct failure window (a dedicated flag, cleared on the next
+  successful check) with the exception's type name. `send()` now has its own
+  `except _EstopDeferred as exc:` clause (before the generic `except Exception`) that returns a
+  `SendResult` whose `error` contains the literal string `estop_paused`.
+- **Item 3.** Both DLQ-append sites now check "is this message id already in `dlq`" before
+  appending — idempotent by message id, so redelivery after a pause landing between the write and
+  the ack produces exactly one row, not two. The `:2196`-equivalent comment now names this
+  explicitly instead of claiming nothing precedes the ack.
+- **Item 4.** All three comments corrected as described above, with the actual verified reasoning
+  (not just the corrected wording) inline: `attempts` is read in exactly one place — the
+  `min(300, 10 * (2 ** min(attempts - 1, 5)))` backoff formula, already capped — so churning it up
+  during a pause cannot violate any bound that doesn't already exist.
+- **Item 5.** Fixed to the real `notification_outbox`/`reply_outbox` keys (both dicts keyed by
+  source_id); added the previously-silent `sent_paused == 0`, `injections_paused == 0`,
+  `pending_paused is None`, `notification_outbox_paused == 0`, `reply_outbox_paused == 0`
+  assertions to `test_pre_lease_pause`, and `ack_calls_paused == []` plus `sent_paused`/
+  `injections_paused`/`pending_paused` to `test_mid_message_pause`.
+
+### Mutation table (round 5, this session)
+
+New guards, each executed for real on the committed tree (temporary source edit → red → restore
+from a pre-mutation backup copy of the file, confirmed via `git diff --stat` returning empty →
+green):
+
+| Guard | File:line | Mutation | Result |
+|---|---|---|---|
+| Legacy inbox-stream estop gate (NEW, item 1) | `__init__.py` `deliver()`: `if engaged:` (after the `_estop_engaged()` call) → unreachable / real sentinel via `agent.estop.engage()` | drives the REAL sentinel through `plugin._maybe_start_inbox_stream`, not a fake | **RED** if the gate is skipped — `test_legacy_inbox_stream_deliver_refuses_inject_while_real_estop_engaged` (native suite) fails: `inject_message` is reached while paused | **GREEN** with the fix — new test passes, `injected == []` while paused |
+| `_refuse_ack_if_estop_engaged` log (NEW, item 2) | `adapter.py`: remove the `_note_estop_pause_once(...)` call (keep the `raise`) | drop the INFO log, keep the security gate itself intact | **RED** — `test_refuse_ack_if_estop_engaged_logs_once_per_pause_window` fails (0 records instead of 1) while the pre-existing security-gate tests (e.g. `test_estop_lease_gate.py`) stay green, proving the two are independent properties | **GREEN** |
+| `_process_leased_message` top-gate log (NEW, item 2) | `adapter.py`: remove the `_note_estop_pause_once(...)` call before the `raise` | same class | **RED** — `test_process_leased_message_top_gate_logs_once_per_pause_window` fails | **GREEN** |
+| `_transmit_final_reply` log + `SendResult.error` (NEW, item 2) | `adapter.py`: remove the `_note_estop_pause_once(...)` call; separately, delete the dedicated `except _EstopDeferred as exc:` clause in `send()` so it falls into the generic `except Exception` | drop the log; drop the "estop_paused" error string | **RED** — `test_transmit_final_reply_choke_point_logs_once_and_send_result_names_the_pause` fails on both the log-count assertion and the `"estop_paused" in result.error` assertion independently (verified each half separately) | **GREEN** |
+| `send()` interim log + `SendResult.error` (NEW, item 2) | `adapter.py`: same two independent removals as above, on the interim-send call site | drop the log; drop the "estop_paused" string | **RED** — `test_send_interim_choke_point_logs_once_and_send_result_names_the_pause` fails | **GREEN** |
+| `_estop_engaged` fail-safe warning window (NEW, item 2) | `adapter.py`: remove the `if not _ESTOP_CHECK_FAILSAFE_WARNED:` guard (warn unconditionally) — mutation in the OTHER direction from the fix; verified the fix's `assert len(...) == 1` fails against `>1` when the guard is removed by monkeypatching `agent.estop.is_engaged` to raise 3 times in a row | log-spam regression | **RED** — `test_estop_engaged_failsafe_warns_once_per_failure_window` fails (3 records, not 1) | **GREEN** |
+| DLQ idempotency, sender-policy branch (NEW, item 3) | `adapter.py` `_process_leased_message`: `if not any(...): dlq.append(...)` → unconditional `dlq.append(...)` | remove the id-dedup check | **RED** — `test_sender_policy_dlq_append_is_idempotent_across_a_pause_before_the_ack` fails (2 DLQ rows for one message id instead of 1) | **GREEN** |
+| `sent_paused`/`injections_paused`/`pending_paused` (test-quality fix, item 5) — mutation-load-bearing analysis | `adapter.py`: layered removal of `_process_leased_message`'s top gate + `_deliver`'s own gate (both, together) | bypass both redundant layers for the `peer_deliver` class | **RED** — `pending_paused` alone catches it (`pending` becomes non-`None`) while `dlq_paused`, `routine_quarantine_paused`, `processed_paused`, `ack_calls_paused`, `sent_paused`, and `injections_paused` all stay green for this specific mutation — proves `pending_paused` is independently load-bearing, not redundant with the pre-existing assertions | **GREEN** with either gate restored |
+| `sent_paused` — honest limitation | same two gates + `_transmit_final_reply`'s own gate (all three) | reach an actual `send()` call for `peer_deliver` | **RED** on BOTH `sent_paused` and `pending_paused` together (pending is set first, upstream of the send) — `sent_paused` is not provably *uniquely* load-bearing within this harness's message classes; it is a valid regression guard, and `_transmit_final_reply`/`send()`'s interim choke are independently, cleanly mutation-proven in isolation by the two rows above (`test_estop_observability.py`) | n/a — documented honestly rather than claimed as unique |
+| `injections_paused` — honest limitation | `_process_leased_message`'s top gate + `_handle_routine_event`'s own gate | let a routine notice reach `notification_outbox` while paused | `notification_outbox_paused` goes to 1 (an unasserted-in-this-test value), but `injections_paused` stays 0 regardless — `_run_case`'s `make_adapter()` never configures `notification_recipients`/activation, so the injector is structurally unreachable via this harness independent of any e-stop mutation; the injector choke point itself IS independently mutation-proven (see the "N-substitute" row below) | n/a — documented honestly |
+
+**On the brief's mutation IDs N1/N3/N6:** these do not exist anywhere in this repo's tables (all
+rounds searched) — like round 3's M15/M16/M20/M22, they appear to be kasra-review's own private
+driver numbering, never published to the PR. Substituted the closest equivalent — the
+`notifications.py` activation-injector choke point (the one guard in the same "N for
+Notifications" family with a clean, existing test) — and spot-checked it fresh this round:
+
+| Guard | File:line | Mutation | Result |
+|---|---|---|---|
+| Notification activation-injector choke (substitute for N1/N3/N6, closest recoverable equivalent) | `notifications.py` `flush()`: `if _estop_engaged():` (activation branch) → `if False:` | bypass the injector gate | **RED** — `test_flush_real_estop_sentinel_blocks_activation_at_the_single_choke_point` fails (`activations` non-empty while paused) | **GREEN** |
+
+### Spot-checks of prior-round guards (confirm round 5 did not weaken existing coverage)
+
+All executed for real on the committed tree this session (temporary edit → red → restored from a
+pre-mutation backup, `git diff --stat` empty after restore, full suite green before and after):
+
+| Guard (round) | File:line | Mutation | Result |
+|---|---|---|---|
+| M1 — peer allowlist (round 1) | `adapter.py` `_process_leased_message`: `if should_accept_message(...):` → `if True:` | bypass allowlist | **RED** — `test_unlisted_sender_is_quarantined_never_delivered` fails (attacker body reached the handler) | **GREEN** |
+| E6 — `reconcile_inbox_polling`'s `_EstopDeferred` handler (round 4) | `adapter.py`: `return False` (in the `except _EstopDeferred:` clause) → clear `_lease_quarantined`/`_fatal_error_code` + `return True` | resurrect round-4's exact named regression | **RED** — `test_item1d_reconcile_while_paused` fails (`reconcile_returned` is `True`) | **GREEN** |
+| F1 — fence escape (round 2) | `notifications.py` `_fenced_untrusted_block`: `safe = text.replace(...)` → `safe = text` | neuter escape | **RED** — 8 tests fail across `test_notifications.py` | **GREEN** |
+
+Full mutation re-verification of all rows from rounds 1-4 was not repeated (the brief named 6
+specific IDs; 3 resolved directly, 3 substituted as above) — this round's diff does not touch
+`should_accept_message`, `lease_ownership.py`, `telegram_control.py`, or the round-1/2/3 fence and
+allowlist logic beyond the DLQ/comment edits described above, and the full suite (both scripts)
+passed clean before this round's changes, after each individual mutation restore, and after the
+final commit.
+
+### Real test counts (round 5, this session)
+
+- `scripts/test.sh`: **241 passed, 12 subtests passed** (pytest, +1 net — the new legacy-inbox-
+  stream fail-open test in `tests/test_native_registration.py`) + **27/27** (`unittest`
+  `test_operator`), 0 failures.
+- `scripts/test-native.sh` (fresh clone at the pinned `233757037df1f03f9fe1cfddc097acd5ad7f7510`
+  rev, matches CI, reused the same pinned checkout + venv as round 4 after verifying the rev still
+  matches): **346 tests passed, 0 failed**, across 13 files (up from round 4's 339 — +7 net-new:
+  1 in `test_estop_egress_gate.py` [the real-sentinel legacy-inbox-stream test], 6 in the new
+  `test_estop_observability.py` [4 choke-point log tests + 1 fail-safe-warning test + 1 DLQ
+  idempotency test]). Item 5's assertions were added to two EXISTING parametrized tests
+  (`test_pre_lease_pause`/`test_mid_message_pause`, 5 cases each), so they add coverage without
+  changing the file/test count.
+
+### Discrepancy between this round's brief and the actual re-gate #4 comment
+
+The brief's 6 numbered items matched the AMBER comment's content closely; the only material
+differences: (a) the brief's line numbers (`:668`, `:692`, `:1631`, `:2233`, `:2669`, `:2268-2272`,
+`:2402-2406`, `:2196`, `:584`, `:238`) were the re-gate's own numbering against head `709c0d0e`
+and lined up with the actual code at those approximate locations once found by content match, not
+by exact line number (expected drift from 3 prior rounds' diffs); (b) the mutation IDs N1/N3/N6
+named in the verification section do not appear anywhere in this repo's evidence doc or the PR
+thread — resolved by substituting the closest equivalent guard and saying so plainly, per the
+comment-governs rule. No other discrepancy found between the brief's paraphrase and the live
+comment text.
+
+### Not done / could not verify (round 5)
+
+- `scripts/test-integration.sh` (no provisioned `MUPOT_SERVER_SOURCE`, same as every prior round).
+- `ruff`/`mypy` full sweeps.
+- Full mutation re-verification of every row from rounds 1-4 (3 of the 4 named prior-round IDs
+  spot-checked directly, one substituted; the rest inferred safe from the full suite passing
+  clean, same reasoning every prior round used).
+- Server-side lease invisibility, `scripts/test-integration.sh`, legacy SSE mode end-to-end,
+  multi-process shared `state_path` — all flagged "not verified" by re-gate #4 itself and out of
+  scope for a small tidy round.

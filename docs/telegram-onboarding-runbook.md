@@ -263,6 +263,17 @@ while paused, and no durable quarantine/reconciliation marker is written for
 the pause itself. `hermes resume` picks delivery back up on the very next
 poll cycle with no operator action required.
 
+**The legacy (non-native) inbox-stream receiver drops, not defers, while
+paused.** `inbox_watch_enabled` mode's `deliver()` callback also checks the
+same sentinel before injecting a batch into a human's live Hermes session,
+but that stream has no lease/redelivery surface — its cursor and seen-keys
+are already advanced for a batch before `deliver()` ever runs. A refusal
+there therefore drops the batch (logged once per pause window), it does not
+retry it once `hermes resume` lifts the pause. This is a deliberate,
+accepted tradeoff for the legacy path, not a bug: switch to the native
+gateway (`native_gateway_enabled`) if pause-safe redelivery matters for your
+deployment.
+
 **Lease release is expiry-only.** The receiver never calls a server-side
 "release this lease early" operation when it defers a message for a pause —
 it lets the in-flight visibility lease run out naturally so the exact same

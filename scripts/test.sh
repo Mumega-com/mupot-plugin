@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Tests supply their own credentials; never inherit a live agent/bus token.
+unset MUPOT_AGENT_TOKEN MUPOT_MEMBER_TOKEN MUPOT_CF_API_TOKEN CYRUS_SOS_TOKEN
+
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 tmp="$(mktemp -d)"
 python="${PYTHON:-python3}"
@@ -12,13 +15,14 @@ trap cleanup EXIT
 
 ln -s "$repo" "$tmp/plugin"
 cd "$tmp"
-"$python" -m pytest plugin/tests -q
+"$python" -m pytest plugin/tests --ignore=plugin/tests/native -q
 "$python" -m unittest -q plugin.tests.test_operator
 "$python" -m py_compile \
   plugin/__init__.py \
   plugin/mupot_operator.py \
   plugin/schemas.py \
   plugin/tools.py
+"$python" -m py_compile plugin/mupot_gateway/adapter.py plugin/mupot_gateway/notifications.py
 
 # Regression: starting Python from the plugin directory must not shadow the
 # standard-library `operator` module.

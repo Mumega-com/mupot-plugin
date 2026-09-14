@@ -1,0 +1,2 @@
+# Telegram handler tests exercise the real SDK while production imports stay lazy.
+python-telegram-bot[webhooks]==22.8

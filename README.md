@@ -9,6 +9,190 @@ restricted, agent-bound operator. Version 0.3 separates these trust zones by pro
 
 Do not combine the modes in one Hermes profile.
 
+## Native gateway receive and human conversation activation
+
+The native Mupot receiver and human-channel routing are owned by this repository
+under `mupot_gateway/`. Installing the operator plugin is sufficient; do not also
+install a separate `platforms/mupot` copy. See
+[`examples/native-gateway-config.yaml`](examples/native-gateway-config.yaml).
+
+Enable `settings.operator.native_gateway_enabled: true` to register the Mupot
+platform alongside the existing restricted operator tools. It is mutually exclusive
+with `inbox_watch_enabled`; enabling both is rejected before registration. Existing
+CLI/SSE-stream configurations remain opt-in and unchanged when native mode is off.
+
+The native receiver uses Mupot's server-authoritative `inbox_lease` attempt receipts and
+attempt-bound `inbox_lease_ack`. Its current attempt-v3 state requires server migration
+`0153_inbox_lease_attempt_reconciliation.sql`, applied after
+`0152_telegram_project_onboarding.sql`. It first reads the strict tenant/agent/effective-seat
+consumer scope, durably records that scope with one random attempt ID and the owning
+profile's non-secret immutable fingerprint, and reuses the ID for the single proven-safe
+transport retry. An ambiguous or restarted attempt is resolved through
+`inbox_lease_reconcile` only from the same profile owner. Token rotation inside that profile
+remains valid; a different profile presenting the same server scope stays fenced. Only an
+exact scope-matching
+`leased` tuple is processed, and only an exact `acked`/`consumed:true` attempt receipt permits
+local commit and marker clearing. Terminal non-consumed or mismatched receipts remain fenced.
+Before any source ACK, peer reply and Routine custody records also persist the originating
+attempt, strict scope, and profile owner. Restart replay revalidates those facts and remains
+on `inbox_lease_ack`; an expired attempt can never fall through and consume a newer lease.
+Before replaying a prepared outbound final, the adapter performs that owner and strict-scope
+preflight read-only and sends nothing on any mismatch or ambiguous status response. The
+successful order remains send receipt, durable human-notice custody, then exact attempt ACK.
+Only records durably identified as non-attempt work use `inbox_ack`; ambiguous older outbox
+records and older reconciliation markers stay fenced for manual recovery. The receiver also
+verifies the operator's expected agent/tenant, preserves
+message correlation, and consumes a source only after successful handling. Terminal ACKs
+are preserved without generating another peer reply. It does not start an SOS connection.
+
+Enable `mupot.routine_events_enabled: true` for the dedicated authenticated
+`routine.human-wait/v1` receive path. This opt-in does not add `mupot-routines` to
+`allowed_agents`: Routine events never start a peer model turn or send to their synthetic
+source. Their human notice becomes eligible for private-session activation only after
+durable custody, an exact scope-bound attempt ACK, and the local processed marker.
+
+For human updates, configure `mupot.notification_recipients` with the immutable user
+ID for each linked platform. Only matching active private conversations are eligible.
+With `mupot.notification_activate: true` and
+`plugins.entries.mupot.allow_gateway_injection: true`, Hermes's native plugin API
+starts a normal turn in the selected conversation. The native gateway rechecks
+authorization and prevents the injected event from executing human slash approvals.
+The previous split deployment verified Telegram; other platforms require their own
+identity binding and end-to-end verification.
+
+Keep each receipt at its own boundary: server Routine custody proves the human wait exists;
+the scope-bound attempt ACK proves only that the reconciled leased envelope was consumed;
+`activation_queued` proves
+only that Hermes accepted private-session scheduling; a channel receipt plus conversation
+mirror readback proves channel delivery; a Telegram webhook receipt plus Routine answer or
+task verdict proves the human decision; and terminal Routine/task evidence proves domain
+completion. None substitutes for another. Interrupted or ambiguous sends are retained for
+reconciliation rather than blindly replayed. This integration does not grant the agent
+human decision authority.
+
+`activating` and `activation_unknown` are durable no-replay states. If Hermes accepts
+scheduling but persisting `activation_queued` fails, the receiver retains the earlier
+uncertain state and requires operator reconciliation. Routine activation is authorized by
+the exact durable processed Routine receipt, not by the bounded recent `processed` list.
+
+For the broader project-onboarding and human-control scope, see
+[`docs/human-project-control.md`](docs/human-project-control.md).
+
+## Telegram project onboarding
+
+The optional deterministic Telegram control surface relays exactly `/start`, `/needs`,
+`/answer`, `/approve`, and `/reject` from a private, unforwarded chat to Mupot. These
+commands do not start an LLM turn: Mupot resolves the immutable Telegram identity,
+project visibility, role, pending decision, conflicts, and current authorization. Ordinary
+Telegram text remains owned by Hermes.
+
+Use one native Mupot receiver and one Telegram bot per Hermes profile. Do not install the
+legacy split Mupot platform beside this plugin, register a second receiver, or attach a
+second bot to the same profile. The production profile settings are:
+
+```yaml
+plugins:
+  enabled: [mupot]
+  disabled: [platforms/mupot, mupot-platform]
+  entries:
+    mupot:
+      allow_gateway_injection: true
+      settings:
+        mode: operator
+        operator:
+          native_gateway_enabled: true
+          inbox_watch_enabled: false
+          base_url: https://mupot.mumega.com
+          telegram_control_enabled: true
+          telegram_control_webhook_secret_env: IM_WEBHOOK_SECRET
+
+mupot:
+  enabled: true
+  routine_events_enabled: true
+  allowed_agents: [<ALLOWED_PEER_AGENT_ID>]
+```
+
+`allowed_agents` accepts either a list of agent names or a single comma-separated
+string; each entry is lowercased and has one leading `agent:` prefix stripped (so
+`agent:Kasra` and `kasra` are the same allowlist entry — defensive normalization for
+hand-typed config, not evidence that Mupot itself ever emits a prefixed sender). An
+explicit empty value (`[]`, `""`, or a list of only blank/whitespace entries) means
+**deny all peers** and is honored as written. Only a genuinely **absent** key falls
+back to the default four-agent roster (`hadi-codex,hadi-codex-cli,kasra,hermes`) — do
+not rely on that default; set `allowed_agents` explicitly for any real deployment. A
+non-string, non-list value (a bare number or boolean, for example) is rejected at
+construction with a clear config error rather than an unrelated `TypeError` later.
+
+Keep `IM_WEBHOOK_SECRET`, the Telegram bot token, and `MUPOT_AGENT_TOKEN` in the
+profile's protected environment; never put values in YAML. Enabling Telegram control is a
+local relay configuration, not a capability grant.
+
+The participant receives a one-time pairing code through an approved out-of-band channel
+and sends `/start <pairing-code>` in the approved bot's private chat. That response confirms
+the project; it is not authoritative role evidence. An operator must separately read back
+the active member and exact squad capability before `/needs` is treated as role-scoped.
+The participant then submits one exact `/answer <run-id> <choice>` or, only when
+independently authorized by the existing gate, `/approve <task-id>` or
+`/reject <task-id> <reason>`. Mupot records the decision, continues the Routine, and the
+native receiver returns the resulting update to the same private conversation automatically.
+
+Duplicate transport updates replay the stored response without a second effect. Stale or
+terminal decisions, invalid choices, unauthorized actions, and conflicting reuse of an
+update ID are refused without creating a new decision. Suspension and capability
+revocation are rechecked on every later command. Restart or timeout is an uncertain state:
+reconcile the Mupot receipt/domain state before issuing another decision; do not bypass the
+durable fence with a new command or delete receipt state.
+
+Onboarding grants no merge, deploy, publish, spending, organization-admin, token, or
+independent gate authority. See the [Telegram onboarding runbook](docs/telegram-onboarding-runbook.md)
+for setup, verification, retry, revocation, and rollback steps. A live pilot remains gated
+on independent review, exact deployment proof, migration readback, and protected webhook
+configuration.
+
+### Testing with Hermes
+
+`./scripts/test.sh` runs the standalone operator/provisioner and legacy stream tests.
+Native gateway tests use the actual Hermes runtime and its isolated test runner:
+
+```bash
+HERMES_SOURCE=/path/to/hermes-agent bash scripts/test-native.sh
+```
+
+The cross-repository acceptance additionally requires clean, pinned Mupot and Hermes
+checkouts and uses no credentials:
+
+```bash
+MUPOT_SERVER_SOURCE=/path/to/mupot \
+HERMES_SOURCE=/path/to/hermes-agent \
+HERMES_PYTHON=/usr/bin/python3 \
+  bash scripts/test-integration.sh
+```
+
+The bounded local receipt is recorded in
+[`docs/telegram-onboarding-evidence.md`](docs/telegram-onboarding-evidence.md).
+
+The CI native job pins Hermes commit
+`233757037df1f03f9fe1cfddc097acd5ad7f7510`; it exercises plugin registration,
+lease/ACK handling, private recipient selection, delivery/mirroring, retry recovery,
+and the normal conversation activation path. No API credentials are required.
+
+### Consolidating an existing split installation
+
+1. Preserve the old adapter/config and their receipt state outside plugin discovery.
+2. Update this `mupot` plugin; enable native mode and the `mupot` injection permission.
+3. Disable obsolete `platforms/mupot` and `mupot-platform` plugin entries so exactly
+   one plugin owns the Mupot platform. Keep the configured state path to retain ACK
+   and notification receipts. If the split adapter used its old default, explicitly
+   set that exact old path; the new default is profile-local. Verify processed IDs
+   and pending/notification records before and after the switch.
+4. Restart the gateway after checking that no turn/delivery is active, then verify
+   one authenticated source message, correlated ACK, native human-conversation turn,
+   and channel delivery receipt.
+
+Use a full gateway restart for this migration, not forced plugin reload. Existing
+legacy stream threads belong to the old process; a restart makes the single-receiver
+transition explicit. Native registration refuses a known active legacy stream.
+
 ## Restricted operator mode
 
 Copy `examples/operator-config.yaml` into an isolated Hermes profile, replace every

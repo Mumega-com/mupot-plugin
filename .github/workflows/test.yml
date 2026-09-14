@@ -17,5 +17,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: python -m pip install --disable-pip-version-check pytest
+      - run: python -m pip install --disable-pip-version-check -r requirements-test.txt
       - run: chmod +x scripts/test.sh && ./scripts/test.sh
+  native-gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: plugin
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 233757037df1f03f9fe1cfddc097acd5ad7f7510
+          path: hermes-runtime
+      - run: |
+          python -m venv hermes-runtime/.venv
+          hermes-runtime/.venv/bin/python -m pip install --disable-pip-version-check \
+            -e './hermes-runtime[dev]' \
+            -r plugin/requirements-native-test.txt
+      - run: HERMES_SOURCE="$GITHUB_WORKSPACE/hermes-runtime" bash plugin/scripts/test-native.sh

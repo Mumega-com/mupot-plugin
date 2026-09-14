@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -127,7 +128,7 @@ class OperatorTests(unittest.TestCase):
     def client(self, transport: RecordingTransport) -> MupotOperatorClient:
         return MupotOperatorClient(
             self.settings,
-            token="mupot_test_agent_token",
+            secret_reader=lambda _name: "mupot_test_agent_token",
             transport=transport,
         )
 
@@ -163,7 +164,11 @@ class OperatorTests(unittest.TestCase):
     def test_client_never_returns_or_places_token_in_request_body(self) -> None:
         transport = RecordingTransport()
         token = "mupot_secret_agent_token"
-        client = MupotOperatorClient(self.settings, token=token, transport=transport)
+        client = MupotOperatorClient(
+            self.settings,
+            secret_reader=lambda _name: token,
+            transport=transport,
+        )
         result = client.call("task_board", {"limit": 20})
         self.assertTrue(result["ok"])
         self.assertNotIn(token, json.dumps(result))
@@ -172,6 +177,87 @@ class OperatorTests(unittest.TestCase):
         )
         self.assertTrue(
             all(call["headers"]["Authorization"] == f"Bearer {token}" for call in transport.calls)
+        )
+
+    def test_client_reads_token_before_each_transport_and_fails_after_revocation(
+        self,
+    ) -> None:
+        transport = RecordingTransport()
+        secrets = {"MUPOT_AGENT_TOKEN": "first-request-token"}
+
+        def read_secret(name: str) -> str:
+            value = secrets.get(name)
+            if value is None:
+                raise RuntimeError("profile secret is unavailable")
+            return value
+
+        client = MupotOperatorClient(
+            self.settings,
+            secret_reader=read_secret,
+            transport=transport,
+        )
+        self.assertTrue(client.status()["ok"])
+        secrets["MUPOT_AGENT_TOKEN"] = "rotated-request-token"
+        self.assertTrue(client.status()["ok"])
+        self.assertEqual(
+            [call["headers"]["Authorization"] for call in transport.calls],
+            ["Bearer first-request-token", "Bearer rotated-request-token"],
+        )
+
+        calls_before_revocation = len(transport.calls)
+        secrets.clear()
+        denied = client.status()
+
+        self.assertEqual(denied, {"ok": False, "error": "credential_unavailable"})
+        self.assertEqual(len(transport.calls), calls_before_revocation)
+
+    def test_client_refreshes_token_before_waf_mcp_fallback(self) -> None:
+        secrets = {"MUPOT_AGENT_TOKEN": "rest-request-token"}
+        calls: list[dict[str, Any]] = []
+
+        def read_secret(name: str) -> str:
+            return secrets[name]
+
+        def transport(
+            url: str,
+            headers: dict[str, str],
+            payload: dict[str, Any],
+            timeout: float,
+        ) -> dict[str, Any]:
+            calls.append(
+                {"url": url, "headers": headers, "payload": payload, "timeout": timeout}
+            )
+            if url.endswith("/actions/status"):
+                secrets["MUPOT_AGENT_TOKEN"] = "mcp-request-token"
+                return {
+                    "ok": False,
+                    "error": "http_error",
+                    "status": 403,
+                    "detail": "waf 1010",
+                }
+            return {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "structuredContent": {
+                        "tenant": "tenant-test",
+                        "role": "member",
+                        "bound_agent_id": "hermes-tenant-test",
+                        "capabilities": [],
+                    }
+                },
+            }
+
+        client = MupotOperatorClient(
+            self.settings,
+            secret_reader=read_secret,
+            transport=transport,
+        )
+
+        self.assertTrue(client.status()["ok"])
+        self.assertEqual(
+            [call["headers"]["Authorization"] for call in calls],
+            ["Bearer rest-request-token", "Bearer mcp-request-token"],
         )
 
     def test_client_fails_closed_when_token_is_not_welded(self) -> None:
@@ -441,7 +527,11 @@ class OperatorTests(unittest.TestCase):
     def test_manager_tools_register_with_explicit_setting_and_fixed_squad(self) -> None:
         settings = replace(self.settings, agent_manager_enabled=True)
         transport = RecordingTransport(surface_capabilities=("agents:manage",))
-        client = MupotOperatorClient(settings, token="mupot_test_agent_token", transport=transport)
+        client = MupotOperatorClient(
+            settings,
+            secret_reader=lambda _name: "mupot_test_agent_token",
+            transport=transport,
+        )
 
         class Context:
             def __init__(self) -> None:
@@ -481,7 +571,11 @@ class OperatorTests(unittest.TestCase):
     def test_manager_action_fails_closed_without_surface_capability(self) -> None:
         settings = replace(self.settings, agent_manager_enabled=True)
         transport = RecordingTransport(surface_capabilities=())
-        client = MupotOperatorClient(settings, token="mupot_test_agent_token", transport=transport)
+        client = MupotOperatorClient(
+            settings,
+            secret_reader=lambda _name: "mupot_test_agent_token",
+            transport=transport,
+        )
 
         result = client.call("agent_manager_list", {"squad_id": "squad-tenant-test"})
 
@@ -499,7 +593,11 @@ class OperatorTests(unittest.TestCase):
             agent_manager_credentials_enabled=True,
         )
         transport = RecordingTransport(surface_capabilities=("agents:manage",))
-        client = MupotOperatorClient(settings, token="mupot_test_agent_token", transport=transport)
+        client = MupotOperatorClient(
+            settings,
+            secret_reader=lambda _name: "mupot_test_agent_token",
+            transport=transport,
+        )
 
         result = client.call("agent_manager_revoke_token", {"token_id": "token-test-1"})
 
@@ -542,7 +640,11 @@ class OperatorTests(unittest.TestCase):
         transport = MintTransport(
             surface_capabilities=("agents:manage", "agents:credentials")
         )
-        client = MupotOperatorClient(settings, token="mupot_test_agent_token", transport=transport)
+        client = MupotOperatorClient(
+            settings,
+            secret_reader=lambda _name: "mupot_test_agent_token",
+            transport=transport,
+        )
         result = decoded(
             build_operator_handlers(client)["mupot_agent_manager_mint_token"],
             {"agent_id": "worker-2", "operation_id": "worker-2-runtime-001"},
@@ -586,7 +688,11 @@ class OperatorTests(unittest.TestCase):
         transport = MintTransport(
             surface_capabilities=("agents:manage", "agents:credentials")
         )
-        client = MupotOperatorClient(settings, token="mupot_test_agent_token", transport=transport)
+        client = MupotOperatorClient(
+            settings,
+            secret_reader=lambda _name: "mupot_test_agent_token",
+            transport=transport,
+        )
 
         result = decoded(
             build_operator_handlers(client)["mupot_agent_manager_mint_token"],
@@ -652,7 +758,13 @@ class OperatorTests(unittest.TestCase):
             },
         }
         ctx = Context()
-        with patch("plugin._load_plugin_settings", return_value=config), patch.dict(
+        secret_owner = type("SecretOwner", (), {
+            "activate": staticmethod(nullcontext),
+            "read_secret": staticmethod(lambda _name: "mupot_test_agent_token"),
+        })()
+        with patch("plugin._load_plugin_settings", return_value=config), patch(
+            "plugin.ProfileSecretOwner.from_context", return_value=secret_owner
+        ), patch.dict(
             "os.environ", {"MUPOT_AGENT_TOKEN": "mupot_test_agent_token"}, clear=False
         ):
             register(ctx)

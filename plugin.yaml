@@ -2,7 +2,7 @@
 # Production agents must use operator mode with an agent-bound MUPOT_AGENT_TOKEN.
 
 name: mupot
-version: "0.3.0"
+version: "0.4.0"
 kind: backend
 description: >
   Integrate Hermes with Mupot in one of two isolated modes. Provisioner mode exposes
@@ -10,6 +10,10 @@ description: >
   agent-bound task, finding, presence and approval-request surface. A separately
   authorized, explicitly enabled manager extension can manage member agents only
   within the configured squad.
+  An optional native gateway receiver connects Mupot mail and correlated receipts
+  to the operator's existing private human conversations.
+  Optional deterministic Telegram project-control handlers relay only five scoped
+  commands to Mupot without starting an LLM turn.
 
 provides_tools:
   - name: mupot_provision
@@ -48,6 +52,12 @@ provides_tools:
     description: Mint a show-once member credential welded to a configured-squad agent.
   - name: mupot_agent_manager_revoke_token
     description: Revoke a credential welded to a configured-squad agent.
+  - name: mupot_gateway_status
+    description: >
+      Report native Mupot gateway health that nothing else surfaces, including
+      notifications stranded in activation_unknown or transport_unknown
+      (interrupted mid-flight; require operator reconciliation). Only
+      registered when native_gateway_enabled is set.
 
 provides_hooks:
   - name: on_session_start
@@ -69,6 +79,9 @@ optional_env:
     secret: true
   - name: MUPOT_PLUGIN_MODE
     description: Compatibility override; prefer plugins.entries.mupot.settings.mode.
+  - name: IM_WEBHOOK_SECRET
+    description: Shared Mupot IM webhook secret used only when deterministic Telegram project control is explicitly enabled.
+    secret: true
   - name: MUPOT_SLUG
     description: Default pot slug for provisioner workflows.
   - name: MUPOT_BRAND

@@ -21,6 +21,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 JsonObject = dict[str, Any]
 Transport = Callable[[str, dict[str, str], JsonObject, float], JsonObject]
+SecretReader = Callable[[str], str]
 
 OPERATOR_ACTIONS = frozenset(
     {
@@ -252,14 +253,14 @@ class MupotOperatorClient:
         self,
         settings: OperatorSettings,
         *,
-        token: str,
+        secret_reader: SecretReader,
         transport: Transport = _urllib_transport,
     ) -> None:
         settings.validate()
-        if not isinstance(token, str) or not token.strip():
-            raise ValueError("MUPOT_AGENT_TOKEN is required in operator mode")
+        if not callable(secret_reader):
+            raise ValueError("operator secret reader is required")
         self.settings = settings
-        self._token = token.strip()
+        self._secret_reader = secret_reader
         self._transport = transport
 
     def call(self, action: str, args: Mapping[str, Any]) -> JsonObject:
@@ -352,24 +353,32 @@ class MupotOperatorClient:
         return {"ok": True, "tool": "status", "result": merged}
 
     def _invoke(self, action: str, args: JsonObject) -> JsonObject:
+        try:
+            token = self._read_token()
+        except RuntimeError:
+            return {"ok": False, "error": "credential_unavailable"}
         base_url = self.settings.base_url.rstrip("/") + "/"
         rest_url = urljoin(base_url, f"actions/{action}")
         headers = {
             "Accept": "application/json",
-            "Authorization": f"Bearer {self._token}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "User-Agent": "hermes-mupot-operator/0.3",
         }
         try:
             response = self._transport(rest_url, headers, dict(args), self.settings.timeout)
         except Exception as exc:  # tool boundary: never crash the Hermes session
-            detail = _redact(str(exc), self._token)[:240]
+            detail = _redact(str(exc), token)[:240]
             return {"ok": False, "error": "transport_error", "detail": detail}
         if response.get("ok") is True:
-            return _sanitize_response(response, self._token)
+            return _sanitize_response(response, token)
         # REST surface blocked (e.g. Cloudflare WAF on some pots) — retry over MCP.
         if not self._is_waf_block(response):
-            return _sanitize_response(response, self._token)
+            return _sanitize_response(response, token)
+        try:
+            token = self._read_token()
+        except RuntimeError:
+            return {"ok": False, "error": "credential_unavailable"}
         mcp_url = urljoin(base_url, "mcp")
         rid = 1
         if action == "status":
@@ -423,16 +432,25 @@ class MupotOperatorClient:
             }
         mcp_headers = {
             "Accept": "application/json, text/event-stream",
-            "Authorization": f"Bearer {self._token}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "User-Agent": "hermes-mupot-operator/0.3",
         }
         try:
             raw_response = self._transport(mcp_url, mcp_headers, payload, self.settings.timeout)
         except Exception as exc:  # tool boundary: never crash the Hermes session
-            detail = _redact(str(exc), self._token)[:240]
+            detail = _redact(str(exc), token)[:240]
             return {"ok": False, "error": "transport_error", "detail": detail}
-        return _sanitize_mcp_response(raw_response, self._token)
+        return _sanitize_mcp_response(raw_response, token)
+
+    def _read_token(self) -> str:
+        try:
+            token = self._secret_reader("MUPOT_AGENT_TOKEN")
+        except Exception:
+            raise RuntimeError("operator credential is unavailable") from None
+        if not isinstance(token, str) or not token.strip():
+            raise RuntimeError("operator credential is unavailable")
+        return token.strip()
 
     @staticmethod
     def _is_waf_block(response: JsonObject) -> bool:
@@ -450,22 +468,27 @@ class MupotOperatorClient:
     def _validate_identity(self, response: JsonObject) -> JsonObject | None:
         if response.get("ok") is not True:
             return response
-        result = response.get("result")
-        if not isinstance(result, dict):
-            return {"ok": False, "error": "identity_unverifiable"}
-        if result.get("tenant") != self.settings.expected_tenant:
-            return {"ok": False, "error": "tenant_mismatch"}
-        if result.get("bound_agent_id") != self.settings.agent_id:
-            return {"ok": False, "error": "identity_mismatch"}
-        if result.get("role") != "member":
+        return validate_operator_identity(response.get("result"),
+            expected_tenant=self.settings.expected_tenant, agent_id=self.settings.agent_id)
+
+
+def validate_operator_identity(result: Any, *, expected_tenant: str, agent_id: str) -> JsonObject | None:
+    """Shared identity/privilege fence for operator tools and native receive."""
+    if not isinstance(result, dict):
+        return {"ok": False, "error": "identity_unverifiable"}
+    if result.get("tenant") != expected_tenant:
+        return {"ok": False, "error": "tenant_mismatch"}
+    if result.get("bound_agent_id") != agent_id:
+        return {"ok": False, "error": "identity_mismatch"}
+    if result.get("role") != "member":
+        return {"ok": False, "error": "overprivileged_identity"}
+    capabilities = result.get("capabilities")
+    if not isinstance(capabilities, list):
+        return {"ok": False, "error": "identity_unverifiable"}
+    for grant in capabilities:
+        if isinstance(grant, dict) and grant.get("capability") in _OVERPRIVILEGED_CAPABILITIES:
             return {"ok": False, "error": "overprivileged_identity"}
-        capabilities = result.get("capabilities")
-        if not isinstance(capabilities, list):
-            return {"ok": False, "error": "identity_unverifiable"}
-        for grant in capabilities:
-            if isinstance(grant, dict) and grant.get("capability") in _OVERPRIVILEGED_CAPABILITIES:
-                return {"ok": False, "error": "overprivileged_identity"}
-        return None
+    return None
 
 
 def _sanitize_response(value: Any, token: str) -> JsonObject:
@@ -936,7 +959,7 @@ _TOOL_DEFINITIONS: dict[str, tuple[str, JsonObject]] = {
 
 def register_operator_tools(ctx: PluginContextLike, client: MupotOperatorClient) -> None:
     handlers = build_operator_handlers(client)
-    names = OPERATOR_TOOL_NAMES
+    names: tuple[str, ...] = OPERATOR_TOOL_NAMES
     if client.settings.agent_manager_enabled:
         names += MANAGER_LIFECYCLE_TOOL_NAMES
     if client.settings.agent_manager_credentials_enabled:

@@ -1,0 +1,54 @@
+# Merge into a dedicated operator profile; replace all placeholders.
+# Credentials stay in its protected environment, never in this YAML.
+plugins:
+  enabled: [mupot]
+  disabled: [platforms/mupot, mupot-platform]
+  entries:
+    mupot:
+      allow_gateway_injection: true
+      settings:
+        mode: operator
+        operator:
+          native_gateway_enabled: true
+          inbox_watch_enabled: false
+          # Hosted production Mupot. Keep this credential-free HTTPS origin exact.
+          base_url: https://mupot.mumega.com
+          telegram_control_enabled: true
+          telegram_control_webhook_secret_env: IM_WEBHOOK_SECRET
+          expected_tenant: <TENANT_SLUG>
+          squad_id: <SQUAD_ID>
+          agent_id: <HERMES_AGENT_ID>
+          approval_owner: <HUMAN_APPROVAL_OWNER_ID>
+          pubsub_peer_agent_ids: [<ALLOWED_PEER_AGENT_ID>]
+          timeout: 20
+
+mcp_servers:
+  mupot:
+    url: https://mupot.mumega.com/mcp
+    headers:
+      Authorization: Bearer ${MUPOT_AGENT_TOKEN}
+
+mupot:
+  enabled: true
+  mcp_server: mupot
+  # Dedicated synthetic Routine human-wait receiver; this does not widen allowed_agents.
+  routine_events_enabled: true
+  # During migration, use the exact existing path; do not start a new empty ledger.
+  # Fresh installations may omit this and use the profile-aware default.
+  state_path: <ABSOLUTE_PATH_TO_EXISTING_MUPOT_STATE_JSON>
+  # Comma-separated string or a list; each entry is lowercased and has one leading
+  # "agent:" prefix stripped before comparison. An explicit empty value ([] or "")
+  # means deny-all and is honored as written. Only a genuinely ABSENT key falls back
+  # to the default four-agent roster (hadi-codex,hadi-codex-cli,kasra,hermes) -- set
+  # this explicitly for a real deployment rather than relying on that default.
+  allowed_agents: [<ALLOWED_PEER_AGENT_ID>]
+  notification_recipients:
+    telegram: '<IMMUTABLE_TELEGRAM_USER_ID>'
+  notification_activate: true
+
+# Configure exactly one Telegram bot in this profile. This one Mupot plugin owns
+# the one native receiver and the deterministic Telegram handlers; do not install
+# a second Mupot receiver or attach another Telegram bot to the same profile.
+# Configure the bot's human allowlist in this same profile.
+# Start a private conversation once so Hermes has an authenticated session origin.
+# Group destinations and unlinked users are not selected by this notification route.

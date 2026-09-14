@@ -178,6 +178,58 @@ async def test_transmit_final_reply_choke_point_logs_once_and_send_result_names_
 
 
 @pytest.mark.asyncio
+async def test_refused_final_reply_also_warns_once_per_pause_window_naming_request_id(
+    tmp_path, caplog
+):
+    """F5/F6 (kasra-review re-gate #5, 2026-09-14): a refused FINAL reply
+    used to surface only at INFO (the choke point's own "refusing peer send"
+    line) -- the old WARNING at `send()`'s generic `except Exception` is
+    unreachable once `_EstopDeferred` is caught separately, so a refused
+    final reply (the human/peer never gets an answer at all) looked exactly
+    like routine INFO chatter in most log setups, with no WARNING anywhere.
+    Proves: `send()`'s own `except _EstopDeferred` now ALSO emits one
+    WARNING per pause window, naming the request id, in addition to (not
+    instead of) the existing choke-point INFO."""
+    import hermes_constants
+    from agent import estop as real_estop
+
+    token = hermes_constants.set_hermes_home_override(str(tmp_path / "hh"))
+    (tmp_path / "hh").mkdir()
+    adapter_module._clear_estop_pause_log_sites()
+    try:
+        assert real_estop.is_engaged() is False
+        client = rp.ProtocolClient()
+        adapter = rp.adapter_at(tmp_path, client)
+        await rp.bind_delivery(adapter, rp.source_message())
+
+        real_estop.engage(reason="obs-final-reply-warn")
+        with caplog.at_level(logging.INFO, logger="plugin.mupot_gateway.adapter"):
+            r1 = await adapter.send("sender", "Exact prepared final.")
+            r2 = await adapter.send("sender", "Exact prepared final, again.")
+        assert r1.success is False and r2.success is False
+
+        info_records = [r for r in caplog.records if "refusing peer send" in r.message]
+        assert len(info_records) == 1, "choke-point INFO regressed"
+
+        warn_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "refusing final reply" in r.message
+        ]
+        assert len(warn_records) == 1, (
+            "expected exactly one WARNING for the pause window, not "
+            f"{len(warn_records)}"
+        )
+        assert "request_id=request-1" in warn_records[0].message, (
+            "WARNING did not name the request id"
+        )
+    finally:
+        real_estop.disengage()
+        adapter_module._clear_estop_pause_log_sites()
+        hermes_constants.reset_hermes_home_override(token)
+
+
+@pytest.mark.asyncio
 async def test_send_interim_choke_point_logs_once_and_send_result_names_the_pause(
     tmp_path, caplog
 ):
@@ -316,6 +368,75 @@ async def test_sender_policy_dlq_append_is_idempotent_across_a_pause_before_the_
         ]
         assert len(dlq_rows) == 1, "duplicate DLQ row after redelivery following a pause"
         assert "m-evil" in st2.get("processed", [])
+    finally:
+        real_estop.disengage()
+        adapter_module._clear_estop_pause_log_sites()
+        hermes_constants.reset_hermes_home_override(token)
+
+
+@pytest.mark.asyncio
+async def test_invalid_ack_envelope_dlq_append_is_idempotent_across_a_pause_before_the_ack(
+    tmp_path,
+):
+    """D9 / F4 (kasra-review re-gate #5, 2026-09-14): re-gate #4's sender-policy
+    DLQ dedup test above (D8) only covers `_process_leased_message`'s
+    sender_policy branch; `_handle_ack_envelope`'s sibling `invalid_ack_envelope`
+    DLQ write at adapter.py's `if not is_terminal_ack(message):` branch has the
+    exact same "write DLQ row, then ack" shape and the exact same
+    already-present dedup guard, but no test pinned it -- round 5's own probe
+    (2 rows without the guard, 1 with it on head) found it unpinned: a
+    mutation deleting the `if not any(...)` guard survived the full 346/346
+    suite. Proves: a pause landing between the DLQ write and the ack
+    (`_ack_expected`'s own `_refuse_ack_if_estop_engaged` choke point) followed
+    by Mupot's own redelivery of the same unacked message produces exactly one
+    DLQ row, not two."""
+    import hermes_constants
+    from agent import estop as real_estop
+
+    token = hermes_constants.set_hermes_home_override(str(tmp_path / "hh"))
+    (tmp_path / "hh").mkdir()
+    adapter_module._clear_estop_pause_log_sites()
+    try:
+        assert real_estop.is_engaged() is False
+        adapter = _adapter_at(tmp_path, AckOnlyClient())
+        # expects_reply=True (not False) makes is_terminal_ack() False, so
+        # this is an incomplete/invalid ACK envelope -- the exact class the
+        # "invalid_ack_envelope" DLQ branch quarantines.
+        incomplete_ack = dict(PEER_MSG, id="m-incomplete-ack", kind="ack", expects_reply=True)
+
+        real_save = adapter.store.save
+        engaged_once = {"done": False}
+
+        def save_then_engage_once(value):
+            real_save(value)
+            if not engaged_once["done"]:
+                engaged_once["done"] = True
+                real_estop.engage(reason="obs-invalid-ack-dlq-race")
+
+        adapter.store.save = save_then_engage_once  # type: ignore[method-assign]
+
+        with pytest.raises(_EstopDeferred):
+            await adapter._handle_ack_envelope(incomplete_ack)
+
+        st = adapter.store.load()
+        assert len(st.get("dlq") or []) == 1, "DLQ write did not happen before the pause"
+        assert real_estop.is_engaged() is True
+
+        # Resume, restore the real save, and simulate Mupot's own
+        # redelivery of the same unacked message.
+        real_estop.disengage()
+        assert adapter_module._estop_engaged() is False
+        adapter.store.save = real_save  # type: ignore[method-assign]
+        await adapter._handle_ack_envelope(incomplete_ack)
+
+        st2 = adapter.store.load()
+        dlq_rows = [
+            entry
+            for entry in (st2.get("dlq") or [])
+            if str((entry.get("message") or {}).get("id") or "") == "m-incomplete-ack"
+        ]
+        assert len(dlq_rows) == 1, "duplicate DLQ row after redelivery following a pause"
+        assert "m-incomplete-ack" in st2.get("processed", [])
     finally:
         real_estop.disengage()
         adapter_module._clear_estop_pause_log_sites()

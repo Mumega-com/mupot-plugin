@@ -34,17 +34,24 @@ logger = logging.getLogger(__name__)
 # one process; each Hermes home runs its own process.
 _ACTIVE_WATCHERS: dict[str, Any] = {}
 
-# Set once a paused-window log line has been emitted for the legacy inbox
-# stream's inject_message choke point (see deliver() in
-# _maybe_start_inbox_stream); cleared the next time a delivery observes the
-# pause lifted, so a NEW pause logs again -- once per window, not once per
-# dropped batch.
-_LEGACY_INBOX_STREAM_PAUSE_LOGGED = False
+# Identity (agent.estop's own `engaged_at`/`reason`, whichever a given
+# sentinel body carries) of the last pause window deliver() has logged for
+# the legacy inbox stream's inject_message choke point (see deliver() in
+# _maybe_start_inbox_stream). Deliver() only runs when a batch actually
+# arrives (event-driven SSE, no idle tick), so a boolean "logged until a
+# disengage is OBSERVED" flag (round-4's original fix) misses a pause that
+# starts and ends with no batch in between: the disengage is never observed,
+# so the next pause's drop looks like a continuation of the first and never
+# re-logs (kasra-review re-gate #5 F3, 2026-09-14). Comparing identities
+# instead of a boolean fixes this without needing a periodic checker: two
+# calls during the SAME pause carry the same engaged_at and log once; a NEW
+# `hermes pause` always writes a fresh engaged_at, so it logs again the next
+# time deliver() runs, batch-gap or not.
+_LEGACY_INBOX_STREAM_LAST_LOGGED_PAUSE_ID: str | None = None
 
-# Set once deliver() has warned that mupot_gateway.adapter (and therefore the
-# e-stop check) is not importable in this process; never reset, mirroring
-# adapter.py's own _ESTOP_IMPORT_WARNED (this is an environment property, not
-# a per-pause-window one).
+# Set once deliver() has warned that agent.estop is not importable in this
+# process; never reset, mirroring adapter.py's own _ESTOP_IMPORT_WARNED (this
+# is an environment property, not a per-pause-window one).
 _LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED = False
 
 
@@ -173,19 +180,19 @@ def _maybe_start_inbox_stream(
         return  # already running in this process (e.g. forced plugin reload)
 
     def deliver(text: str) -> bool:
-        global _LEGACY_INBOX_STREAM_PAUSE_LOGGED, _LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED
+        global _LEGACY_INBOX_STREAM_LAST_LOGGED_PAUSE_ID, _LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED
         inject = getattr(ctx, "inject_message", None)
         if not callable(inject):
             return False
         # P2 (kasra-review re-gate #4, 2026-09-14): this was the one inject
         # choke point in the whole plugin the round-4 e-stop gating pass
-        # missed -- it has the fence (below) but had no _estop_engaged()
-        # check, even though _EstopDeferred's docstring claimed plugin-wide
-        # coverage of every inject/consume/egress primitive in this plugin.
-        # This path is config-exclusive with the native gateway (register()
-        # raises if both native_gateway_enabled and inbox_watch_enabled are
-        # set), so it needed its own gate rather than inheriting the native
-        # module's choke points.
+        # missed -- it has the fence (below) but had no e-stop check, even
+        # though _EstopDeferred's docstring (see mupot_gateway/adapter.py)
+        # claimed plugin-wide coverage. This path is config-exclusive with
+        # the native gateway (register() raises if both
+        # native_gateway_enabled and inbox_watch_enabled are set), so it
+        # needed its own gate rather than inheriting the native module's
+        # choke points.
         #
         # Unlike the native gateway's inject/consume/egress primitives (which
         # defer via _EstopDeferred and rely on Mupot's own inbox lease to
@@ -198,40 +205,98 @@ def _maybe_start_inbox_stream(
         # this legacy, non-native path: log it (once per pause window, not
         # once per dropped batch, so a long pause does not flood the log)
         # rather than silently lose it.
+        #
+        # F1 (kasra-review re-gate #5, 2026-09-14): this used to reach the
+        # sentinel via `.mupot_gateway.adapter._estop_engaged`, a module-level
+        # `import httpx` + the full Hermes-core `gateway.config` chain, and
+        # failed OPEN (not paused) whenever THAT chain wasn't importable --
+        # which happens for any reason the gateway module fails to import,
+        # not only "no native Hermes runtime here". Reach the actual
+        # authority directly instead: `agent.estop` is the smallest module
+        # that carries it (imports only `agent.file_safety`), so there is no
+        # gateway/httpx dependency to go missing underneath a real e-stop
+        # check.
+        #
+        # Two distinct ImportError causes still need two distinct answers:
+        #   - The `agent` package itself is entirely absent -- this is NOT a
+        #     real Hermes runtime at all, e.g. this plugin's own plain,
+        #     non-native scripts/test.sh suite (which deliberately has no
+        #     `agent` package on the path, by design: it tests the plugin
+        #     standalone). Fail OPEN here, exactly like the native gateway's
+        #     own _estop_engaged() ImportError handling for the identical,
+        #     expected-outside-native case -- there is nothing to pause.
+        #   - `agent` IS present (this genuinely is a native Hermes runtime)
+        #     but `agent.estop` specifically is not importable -- there is no
+        #     benign reading of that: the e-stop authority has gone missing
+        #     underneath a runtime that otherwise has it. Fail CLOSED (drop
+        #     this batch, exactly like a real pause) rather than silently let
+        #     content through unpaused. A genuine `is_engaged()` failure
+        #     (module present, call itself raises) fails SAFE the same way,
+        #     mirroring the native gateway's own _estop_engaged().
         try:
-            from .mupot_gateway.adapter import _estop_engaged
-
-            engaged = _estop_engaged()
+            from agent.estop import get_state, is_engaged
         except ImportError:
-            # mupot_gateway.adapter imports Hermes-core `gateway.config` (and
-            # friends) at module level -- always present in a real native
-            # Hermes runtime regardless of whether THIS plugin's own
-            # native_gateway feature is enabled, but deliberately absent from
-            # the plain, non-native scripts/test.sh suite. Fail OPEN here
-            # exactly like _estop_engaged()'s own agent.estop ImportError
-            # handling: treat the pause as NOT engaged rather than crash a
-            # legacy path that has nothing to do with the native gateway.
-            if not _LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED:
-                _LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED = True
-                logger.warning(
-                    "[mupot] legacy inbox stream: mupot_gateway.adapter is "
-                    "not importable; failing OPEN (treating Hermes's global "
-                    "emergency stop as NOT engaged) until it becomes "
-                    "importable again. Expected outside a native Hermes "
-                    "runtime (e.g. scripts/test.sh)."
-                )
-            engaged = False
+            try:
+                import agent  # noqa: F401 -- presence probe only, see above
+            except ImportError:
+                if not _LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED:
+                    _LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED = True
+                    logger.warning(
+                        "[mupot] legacy inbox stream: no `agent` package on "
+                        "this path at all; failing OPEN (treating Hermes's "
+                        "global emergency stop as NOT engaged) until it "
+                        "becomes importable again. Expected outside a native "
+                        "Hermes runtime (e.g. scripts/test.sh)."
+                    )
+                engaged = False
+            else:
+                if not _LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED:
+                    _LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED = True
+                    logger.warning(
+                        "[mupot] legacy inbox stream: agent.estop is not "
+                        "importable even though the `agent` package is "
+                        "present; failing CLOSED (treating Hermes's global "
+                        "emergency stop as ENGAGED) and dropping this batch "
+                        "until it becomes importable again -- a missing "
+                        "e-stop module must not be read as 'not paused'."
+                    )
+                return False
+        else:
+            try:
+                engaged = bool(is_engaged())
+            except Exception:
+                # Genuine check failure, not a missing module: fail SAFE
+                # exactly like the native gateway's own _estop_engaged() --
+                # treat as paused rather than risk injecting while a pause
+                # cannot be confirmed lifted.
+                engaged = True
 
         if engaged:
-            if not _LEGACY_INBOX_STREAM_PAUSE_LOGGED:
-                _LEGACY_INBOX_STREAM_PAUSE_LOGGED = True
+            # F3 (kasra-review re-gate #5, 2026-09-14): deliver() only runs
+            # when InboxStream actually has a batch (event-driven SSE, no
+            # idle tick) -- comparing against a plain "logged until a
+            # disengage is OBSERVED" boolean therefore misses a pause that
+            # both starts and ends with no batch arriving in between: the
+            # disengage is never observed, so the NEXT pause's drop looks
+            # like a continuation of the first and never re-logs. Compare
+            # pause IDENTITY instead: `agent.estop.engage()` writes a fresh
+            # engaged_at on every call, so a genuinely new pause always
+            # produces a new identity here and logs again, whether or not
+            # any batch arrived during the resumed window in between.
+            try:
+                state = get_state() or {}
+            except Exception:
+                state = {}
+            pause_id = str(state.get("engaged_at") or state.get("reason") or "unknown")
+            if pause_id != _LEGACY_INBOX_STREAM_LAST_LOGGED_PAUSE_ID:
+                _LEGACY_INBOX_STREAM_LAST_LOGGED_PAUSE_ID = pause_id
                 logger.info(
                     "[mupot] legacy inbox stream: refusing inject_message and "
                     "dropping this batch, Hermes global emergency stop is "
                     "engaged (no redelivery surface in this legacy path)"
                 )
             return False
-        _LEGACY_INBOX_STREAM_PAUSE_LOGGED = False
+        _LEGACY_INBOX_STREAM_LAST_LOGGED_PAUSE_ID = None
         # This batch summary embeds one or more raw mupot message bodies
         # (InboxStream._format_batch), which are exactly as attacker-reachable
         # as the bodies notifications.py fences before activation. Route

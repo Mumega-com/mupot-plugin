@@ -339,7 +339,7 @@ def test_legacy_inbox_stream_deliver_refuses_inject_while_real_estop_engaged(
         def register_hook(self, *_a, **_kw):
             pass
 
-    plugin._LEGACY_INBOX_STREAM_PAUSE_LOGGED = False
+    plugin._LEGACY_INBOX_STREAM_LAST_LOGGED_PAUSE_ID = None
     try:
         assert real_estop.is_engaged() is False
         with patch("plugin.inbox_stream.InboxStream", FakeInboxStream):
@@ -385,5 +385,195 @@ def test_legacy_inbox_stream_deliver_refuses_inject_while_real_estop_engaged(
     finally:
         real_estop.disengage()
         plugin._ACTIVE_WATCHERS.clear()
-        plugin._LEGACY_INBOX_STREAM_PAUSE_LOGGED = False
+        plugin._LEGACY_INBOX_STREAM_LAST_LOGGED_PAUSE_ID = None
+        hermes_constants.reset_hermes_home_override(token)
+
+
+def test_legacy_inbox_stream_deliver_fails_closed_when_agent_estop_unimportable(
+    tmp_path, caplog, monkeypatch
+):
+    """F1 (kasra-review re-gate #5, 2026-09-14): before this fix, deliver()
+    reached the sentinel via `.mupot_gateway.adapter._estop_engaged` -- a
+    module-level `import httpx` + the full Hermes-core `gateway.config`
+    chain -- and failed OPEN (treated the pause as NOT engaged) on ANY
+    ImportError anywhere in that chain, not just "no native Hermes runtime
+    here". Executed: sentinel engaged + that import broken -> attacker body
+    injected into the human session.
+
+    The fix reaches `agent.estop` directly (the smallest module carrying the
+    authority) and fails CLOSED when THAT itself is not importable --
+    regardless of the sentinel's actual on-disk state, because a missing
+    e-stop module means there is no way to confirm "not paused" at all.
+    Proves the negative case is now handled independent of the sentinel:
+    the real sentinel here is genuinely NOT engaged, and the batch is still
+    dropped, because the authority module cannot be reached."""
+    import hermes_constants
+    from agent import estop as real_estop
+    import plugin
+    import logging
+    import sys
+    from unittest.mock import patch
+
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    token = hermes_constants.set_hermes_home_override(str(home))
+
+    captured: dict[str, object] = {}
+
+    class FakeInboxStream:
+        def __init__(self, settings, deliver, state_path=None):
+            captured["deliver"] = deliver
+
+        def set_session_key(self, *_a, **_kw):
+            pass
+
+        def start(self):
+            pass
+
+    injected: list[str] = []
+
+    class Ctx:
+        def inject_message(self, text):
+            injected.append(text)
+            return True
+
+        def register_hook(self, *_a, **_kw):
+            pass
+
+    plugin._LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED = False
+    try:
+        assert real_estop.is_engaged() is False
+        with patch("plugin.inbox_stream.InboxStream", FakeInboxStream):
+            plugin._maybe_start_inbox_stream(
+                Ctx(),
+                {
+                    "inbox_watch_enabled": True,
+                    "inbox_watch_sources": ["mupot"],
+                    "inbox_watch_state_file": str(tmp_path / "inbox-stream-state-f1.json"),
+                },
+            )
+            deliver = captured["deliver"]
+
+            # Break `agent.estop` itself -- the module F1 now imports
+            # directly -- rather than `mupot_gateway.adapter` (the module the
+            # OLD, pre-fix code imported and whose own ImportError handling
+            # fails OPEN by design for the plain scripts/test.sh suite).
+            # `sys.modules[name] = None` is the standard way to force
+            # `ImportError` on a specific already-imported submodule without
+            # touching its parent package or any other module.
+            monkeypatch.setitem(sys.modules, "agent.estop", None)
+
+            with caplog.at_level(logging.WARNING, logger="plugin"):
+                assert deliver("batch one") is False
+            assert injected == [], (
+                "inject_message was reached while agent.estop was "
+                "unimportable -- a missing e-stop module must not be read "
+                "as 'not paused'"
+            )
+            warn_records = [r for r in caplog.records if "failing CLOSED" in r.message]
+            assert len(warn_records) == 1
+
+            # A second call within the same ImportError window does not
+            # re-warn (mirrors adapter.py's own _ESTOP_IMPORT_WARNED: an
+            # environment property, not a per-pause-window one).
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="plugin"):
+                assert deliver("batch two") is False
+            assert injected == []
+            assert not [r for r in caplog.records if "failing CLOSED" in r.message]
+    finally:
+        real_estop.disengage()
+        plugin._ACTIVE_WATCHERS.clear()
+        plugin._LEGACY_INBOX_STREAM_LAST_LOGGED_PAUSE_ID = None
+        plugin._LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED = False
+        hermes_constants.reset_hermes_home_override(token)
+
+
+def test_legacy_inbox_stream_deliver_logs_a_new_pause_with_no_intervening_batch(
+    tmp_path, caplog
+):
+    """F3 (kasra-review re-gate #5, 2026-09-14): deliver() only runs when
+    InboxStream actually has a batch to hand it (event-driven SSE, no idle
+    tick) -- round 4's fix cleared `_LEGACY_INBOX_STREAM_PAUSE_LOGGED` only
+    from INSIDE deliver()'s own "not engaged" check, so a resume with no
+    batch arriving before the NEXT pause never observes the disengage and
+    the second pause's drop looks like a continuation of the first: only 1
+    log record for 2 separate pause windows. Proves: pause -> drop ->
+    resume (no batch delivered in between) -> pause -> drop produces 2 log
+    records, by comparing pause IDENTITY (agent.estop's own engaged_at) each
+    time deliver() checks, rather than relying on having witnessed the
+    disengage."""
+    import hermes_constants
+    from agent import estop as real_estop
+    import plugin
+    import logging
+    from unittest.mock import patch
+
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    token = hermes_constants.set_hermes_home_override(str(home))
+
+    captured: dict[str, object] = {}
+
+    class FakeInboxStream:
+        def __init__(self, settings, deliver, state_path=None):
+            captured["deliver"] = deliver
+
+        def set_session_key(self, *_a, **_kw):
+            pass
+
+        def start(self):
+            pass
+
+    injected: list[str] = []
+
+    class Ctx:
+        def inject_message(self, text):
+            injected.append(text)
+            return True
+
+        def register_hook(self, *_a, **_kw):
+            pass
+
+    plugin._LEGACY_INBOX_STREAM_LAST_LOGGED_PAUSE_ID = None
+    try:
+        assert real_estop.is_engaged() is False
+        with patch("plugin.inbox_stream.InboxStream", FakeInboxStream):
+            plugin._maybe_start_inbox_stream(
+                Ctx(),
+                {
+                    "inbox_watch_enabled": True,
+                    "inbox_watch_sources": ["mupot"],
+                    "inbox_watch_state_file": str(tmp_path / "inbox-stream-state-f3.json"),
+                },
+            )
+            deliver = captured["deliver"]
+
+            with caplog.at_level(logging.INFO, logger="plugin"):
+                # Window 1: pause -> drop.
+                real_estop.engage(reason="k5-f3-window-one")
+                assert deliver("batch one") is False
+
+                # Resume with NO intervening batch -- deliver() is never
+                # called while disengaged, so the module never "observes"
+                # the disengage.
+                real_estop.disengage()
+                assert real_estop.is_engaged() is False
+
+                # Window 2: a genuinely NEW pause -> drop.
+                real_estop.engage(reason="k5-f3-window-two")
+                assert deliver("batch two") is False
+
+        assert injected == [], "inject_message was reached during a pause"
+        paused_records = [
+            r for r in caplog.records if "emergency stop is engaged" in r.message
+        ]
+        assert len(paused_records) == 2, (
+            "a new pause window with no intervening batch did not log again "
+            f"(got {len(paused_records)} records)"
+        )
+    finally:
+        real_estop.disengage()
+        plugin._ACTIVE_WATCHERS.clear()
+        plugin._LEGACY_INBOX_STREAM_LAST_LOGGED_PAUSE_ID = None
         hermes_constants.reset_hermes_home_override(token)

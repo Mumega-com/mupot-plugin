@@ -155,8 +155,10 @@ class _EstopDeferred(Exception):
     `inbox_consumer_status`/`inbox_lease_reconcile` may still be issued --
     those never consume or ship anything). As of round 5 (kasra-review
     re-gate #4, 2026-09-14 -- see `_maybe_start_inbox_stream`'s `deliver()`
-    in plugin/__init__.py) this covers every inject/consume/egress primitive
-    in this plugin, not just this module:
+    in plugin/__init__.py) this covers every choke point on the two NATIVE
+    receive/reply surfaces this class was built for -- the native gateway's
+    own inbox lease consume/ack/commit and peer `send`, plus the legacy
+    inbox-stream `deliver()`'s inject_message:
       - `_deliver`, `_handle_routine_event`, `_handle_ack_envelope` (unchanged
         from round 3 -- still needed for the mid-lease race and for tests that
         call them directly).
@@ -174,6 +176,31 @@ class _EstopDeferred(Exception):
         `_replay_reply_outbox` and the live `send()` interim path).
       - `notifications.flush()`, at each of its three sinks (activation
         injector, `deliver_text`, `mirror_text`) independently.
+      - `plugin/__init__.py`'s legacy inbox-stream `deliver()` closure, its
+        own choke point (config-exclusive with this module, see that
+        function's docstring for why it drops rather than defers).
+
+    (F2, kasra-review re-gate #5, 2026-09-14: this docstring previously said
+    "every inject/consume/egress primitive in this plugin", which overstated
+    the boundary. Explicitly NOT gated by any of the above, and not required
+    to be:
+      - `mupot_operator.py`'s `send` and `inbox` (with `consume=True`) tool
+        handlers -- these are ordinary MCP tool calls a human's live session
+        invokes directly, the same class of thing Hermes's own global e-stop
+        does not stop for an ALREADY-RUNNING session (`hermes pause` blocks
+        NEW cron/kanban/gateway-turn dispatch, per `agent/estop.py`'s module
+        docstring; it was never a kill switch for tool calls mid-session).
+        Gating a human-invoked tool call here would make `hermes pause` do
+        something Hermes itself does not do anywhere else.
+      - `plugin/__init__.py`'s provisioner `on_session_start` reminder
+        (around line 129) -- a static, non-attacker-influenced string with no
+        untrusted body in it, injected at most once per session; there is
+        nothing here for a pause to defer.
+      - Human `/approve` control traffic while paused is Hermes's own
+        concern, not this plugin's: `agent/estop.py`'s `check_paused()` /
+        the gateway's own turn dispatch gate the human's next turn, this
+        class only gates the native-receive/legacy-inbox-stream surfaces
+        listed above.)
     Every caller of `_process_leased_message` (the live poll loop and
     `reconcile_inbox_polling`) recognises this exception as "deferred by
     pause" and releases the lease to expire for natural redelivery, rather
@@ -639,8 +666,8 @@ _ESTOP_CHECK_FAILSAFE_WARNED = False
 _ESTOP_PAUSE_LOG_SITES: set[str] = set()
 
 
-def _note_estop_pause_once(site: str, message: str) -> None:
-    """Log `message` at INFO the first time `site` refuses within this pause.
+def _note_estop_pause_once(site: str, message: str, level: int = logging.INFO) -> None:
+    """Log `message` at `level` the first time `site` refuses within this pause.
 
     A pause is one shared, global sentinel (`agent.estop`): a single paused
     window can refuse many messages across many choke points before it
@@ -648,11 +675,17 @@ def _note_estop_pause_once(site: str, message: str) -> None:
     moment a burst of traffic (or a long pause) hits; logging nothing at all
     is what re-gate #4 flagged as 4 of 12 choke points refusing silently.
     This is the middle ground: once per site per pause window.
+
+    `level` defaults to INFO (the original round-4 behaviour); F5/F6
+    (kasra-review re-gate #5, 2026-09-14) added the WARNING call in `send()`
+    for a refused FINAL reply specifically -- pass a distinct `site` for that
+    call so it tracks its own once-per-window state independent of any INFO
+    already logged for the same pause by another choke point.
     """
     if site in _ESTOP_PAUSE_LOG_SITES:
         return
     _ESTOP_PAUSE_LOG_SITES.add(site)
-    logger.info(message)
+    logger.log(level, message)
 
 
 def _clear_estop_pause_log_sites() -> None:
@@ -2830,8 +2863,31 @@ class MupotAdapter(BasePlatformAdapter):
             # refused send gave no clue why. The choke point that raised
             # this (this function's own interim-send gate, or
             # `_transmit_final_reply`'s "prepared" gate for the non-interim
-            # branch) already logged the pause once per pause window; this
-            # is just the SendResult surface, retryable once resumed.
+            # branch) already logged the pause once per pause window at
+            # INFO; this is just the SendResult surface, retryable once
+            # resumed.
+            #
+            # F5/F6 (kasra-review re-gate #5, 2026-09-14): that INFO line is
+            # easy to miss for a FINAL reply specifically -- landing at
+            # `response send failed ... error=src-final` with no mention of
+            # a pause was the OLD (pre-round-4) behaviour, and the WARNING
+            # this except clause used to fall through to at
+            # `except Exception` below is now unreachable for the pause
+            # case. A refused interim progress-ACK is low-stakes (Hermes
+            # gets no update, but nothing was ever waiting on it); a refused
+            # FINAL reply means the human/peer never gets an answer at all.
+            # Emit one additional WARNING per pause window, naming the
+            # request id, for that case -- a distinct site so it tracks its
+            # own once-per-window state independent of the INFO above.
+            if not interim:
+                _note_estop_pause_once(
+                    "send_final_reply_deferred_warn",
+                    f"[mupot] refusing final reply request_id={context.request_id}: "
+                    "Hermes global emergency stop is engaged -- this plugin "
+                    "schedules no retry; the reply surfaces to Hermes only as "
+                    "a retryable SendResult failure",
+                    level=logging.WARNING,
+                )
             return SendResult(
                 success=False,
                 error=f"estop_paused: Hermes global emergency stop is engaged (message={exc})",

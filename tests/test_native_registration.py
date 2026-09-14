@@ -168,14 +168,19 @@ def test_maybe_start_inbox_stream_routes_deliver_through_shared_fence_helper(tmp
 def test_maybe_start_inbox_stream_deliver_fails_open_when_adapter_is_not_importable(
     tmp_path, caplog
 ):
-    """`deliver()`'s new `_estop_engaged()` check (kasra-review re-gate #4,
-    2026-09-14 -- see the native-suite test for the real gating behavior)
-    imports `mupot_gateway.adapter`, which imports Hermes-core `gateway.*`
-    modules at module level. Those are absent from this plain, non-native
-    suite by design (this suite tests the plugin standalone). Proves the
-    ImportError is caught and failed OPEN -- exactly like `_estop_engaged()`'s
-    own `agent.estop` ImportError handling -- rather than crashing a legacy
-    path that has nothing to do with the native gateway feature."""
+    """`deliver()`'s e-stop check (kasra-review re-gate #4/#5, 2026-09-14 --
+    see the native-suite tests for the real gating behavior) imports
+    `agent.estop` directly. That whole `agent` package is absent from this
+    plain, non-native suite by design (this suite tests the plugin
+    standalone). Proves this specific case -- no `agent` package on the path
+    AT ALL -- is caught and failed OPEN, exactly like the native gateway's
+    own `_estop_engaged()` ImportError handling for the identical case.
+    (Contrast: if `agent` were present but `agent.estop` specifically were
+    not, F1's fix fails CLOSED instead -- see
+    tests/native/test_estop_egress_gate.py's
+    test_legacy_inbox_stream_deliver_fails_closed_when_agent_estop_unimportable,
+    which can only be exercised in the native suite since it requires a real
+    `agent` package to be present.)"""
     captured: dict[str, object] = {}
 
     class FakeInboxStream:
@@ -198,7 +203,7 @@ def test_maybe_start_inbox_stream_deliver_fails_open_when_adapter_is_not_importa
         def register_hook(self, *_a, **_kw):
             pass
 
-    plugin._LEGACY_INBOX_STREAM_PAUSE_LOGGED = False
+    plugin._LEGACY_INBOX_STREAM_LAST_LOGGED_PAUSE_ID = None
     plugin._LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED = False
     try:
         with patch("plugin.inbox_stream.InboxStream", FakeInboxStream):
@@ -215,10 +220,10 @@ def test_maybe_start_inbox_stream_deliver_fails_open_when_adapter_is_not_importa
                 assert deliver("batch one") is True
             assert len(injected) == 1, "delivery was dropped instead of failing open"
             assert any(
-                "not importable; failing OPEN" in r.message for r in caplog.records
+                "no `agent` package on this path at all; failing OPEN" in r.message
+                for r in caplog.records
             )
     finally:
         plugin._ACTIVE_WATCHERS.clear()
-        plugin._LEGACY_INBOX_STREAM_PAUSE_LOGGED = False
+        plugin._LEGACY_INBOX_STREAM_LAST_LOGGED_PAUSE_ID = None
         plugin._LEGACY_INBOX_STREAM_ADAPTER_IMPORT_WARNED = False
-        plugin._LEGACY_INBOX_STREAM_PAUSE_LOGGED = False

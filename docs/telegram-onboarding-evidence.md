@@ -323,3 +323,149 @@ empty (clean tree) before the first mutation and after the last restore.
   round's does) quarantines the adapter instead of benignly deferring. Stated plainly rather
   than silently assumed safe: this is a real open question for a future pass, not a fixed and
   verified property.
+
+## Kasra re-gate #2 repair, round 3 (2026-09-14)
+
+Round 2 closed the fence-escape and gated all three e-stop call sites, but re-gate #2 (head
+`936baa61`) BLOCKed again: exactly the open question flagged at the end of round 2's section
+above turned out to be a real, live P0 — proven through the real `_poll_loop`, not a direct
+call to a gated method — plus a new P1 (fencing was never shared across `flush()`'s three
+sinks). This round's fixes are in the `fix(security):` commit following `936baa61`.
+
+### What was actually wrong (re-gate #2 verdict on head `936baa61`)
+
+1. **P0 — a pause durably quarantines the inbox.** `adapter.py`'s `_poll_loop`: after
+   `_process_leased_message` returns, `if message_id not in self._state.get("processed", []):
+   raise _protocol_error()`. All three e-stop gates (`_handle_routine_event`,
+   `_handle_ack_envelope`, `_deliver`) returned bare on pause without marking the message
+   processed, so every one of them hit this branch, which then called
+   `_quarantine_inbox_polling()` — a durable state that: sets `_lease_quarantined = True`,
+   persists `lease_reconciliation` to `state.json`, and makes the poll task `return` (exit).
+   `connect()` then refuses (`if self._lease_quarantined: return False`), and
+   `reconcile_inbox_polling()` itself fails while still paused. Proven live: engaging the REAL
+   `agent/estop.py` sentinel and driving a message through the REAL `_poll_loop` (not a direct
+   call) gave zero activations, a dead poll task, and a refused reconnect after `hermes
+   resume`. Round 2's own two doc-comments (`adapter.py`'s `_handle_routine_event` gate,
+   `notifications.py`'s `flush()` choke-point comment) both asserted "no reconciliation state
+   is recorded" — falsified by this exact mechanism.
+2. **P1 — `flush()` fenced only the activation branch.** `deliver_text` (Telegram) and
+   `mirror_text` (conversation mirror) shipped `notice["text"]` completely raw — no fence, no
+   caveat. `mirror_to_session` was called with no `role` kwarg, defaulting to `"assistant"`;
+   Hermes's own `gateway/mirror.py:34-38` documents that non-agent text mirrored at that
+   default role replays as a genuine agent turn, not a quoted inbound message.
+3. **P3 (cheap):** `routine_events._SOURCE_ID_RE` admitted backtick/`[`/`]` (defense-in-depth
+   only — mupot generates ids via `crypto.randomUUID`, so not attacker-reachable today);
+   `allowed_agents` list entries that were not strings (e.g. `[123, "kasra"]`) silently
+   stringified through `normalize_agent`'s `str(value or "")` instead of failing loudly.
+
+### Fix shape (class fix, not repro-shaped)
+
+- **P0**: a pause is a temporal condition, never a state transition, enforced at two points:
+  (a) `_poll_loop` now checks `_estop_engaged()` at the top of every iteration, BEFORE
+  `inbox_lease` is ever called — nothing is leased, acked, injected, or written while paused,
+  which also means the `routine_events_disabled`-quarantine and sender-policy-DLQ branches
+  inside `_process_leased_message` can never fire while paused (neither can run without a
+  lease first — verified directly, see mutation table). (b) For the narrow race where the
+  e-stop engages AFTER the pre-lease check but BEFORE the leased message is handled,
+  `_deliver`/`_handle_routine_event`/`_handle_ack_envelope` now `raise` a new `_EstopDeferred`
+  exception (not a bare `return`). Both `_poll_loop` and `reconcile_inbox_polling`'s own copy
+  of the same "process then check processed then `_protocol_error()`" pattern catch
+  `_EstopDeferred` specifically, release the lease fence, and let the caller continue/retry —
+  never raising `_protocol_error()` or calling `_quarantine_inbox_polling()` for a pause.
+  Corrected the two falsified comments.
+- **P1**: `flush()` now builds one `fenced_text = _fenced_untrusted_block(notice["text"]) +
+  _UNTRUSTED_CAVEAT` per notice, ONCE, before branching into activation vs. deliver/mirror —
+  all three sinks consume the identical string. `_UNTRUSTED_CAVEAT` is a new, lighter,
+  human-readable caveat (distinct from `_fenced_untrusted_block` itself, which stays
+  fence-only and unit-test-pinned) appended after the real closing fence, so Telegram/mirror
+  recipients get a caveat too, not just the activation branch's longer agent-facing prose.
+  `mirror_text` now passes `role="user"` to `mirror_to_session`.
+- **P3**: `_SOURCE_ID_RE` tightened to `^[^\s`\[\]]{1,128}$`; `allowed_agents` list
+  construction now raises `ValueError` for any non-string entry before it ever reaches
+  `normalize_agent`.
+
+### Mutation table (round 3, this session)
+
+Every row: temporary in-place edit (assert occurrence count == 1 before writing) on a clean,
+already-committed tree (commit `40f8a10`), real pytest run (native suite against the
+pinned-rev-matching `hermes-runtime-testcopy` clone, or the plain suite as appropriate),
+`git checkout -- <file>` to restore, `git status --short` confirmed empty before moving to
+the next row. Kasra-review's own private numbering (F/E/I/L/V/M) for the guards it asked to
+be re-verified could not be recovered exactly (not documented anywhere retrievable in this
+repo, same limitation noted in round 2's own table) — mapped here to the closest-matching
+guard by content, and the actual line/behavior mutated is stated plainly for each row instead
+of asserted from the label alone.
+
+| # | Guard (best-effort label) | File:line | Mutation | Result |
+|---|---|---|---|---|
+| F1 | Fence escape (run-length class, carried from round 2) | `notifications.py` `_fenced_untrusted_block`: `safe = text.replace(...)` → `safe = text` | **RED** — 8 tests failed: all 5 `test_fenced_untrusted_block_escapes_every_backtick_run_length` cases, `..._ansi_prefixed_run`, `..._mixed_cr_lf_zwsp_body`, and the new `test_flush_fences_and_shares_one_string_across_deliver_and_mirror` | **GREEN** |
+| F2 | One fenced string shared by all 3 `flush()` sinks (NEW, P1) | `notifications.py` `flush()`: `fenced_text = _fenced_untrusted_block(...) + _UNTRUSTED_CAVEAT` → `fenced_text = notice["text"]` (raw) | **RED** — `test_activation_queues_existing_human_conversation_instead_of_passive_send` (pre-existing) AND `test_flush_fences_and_shares_one_string_across_deliver_and_mirror` (new) both failed | **GREEN** |
+| — | Mirror role (NEW, P1) | `notifications.py` `mirror_text`: dropped `role="user"` from the `mirror_to_session` call (defaults to `"assistant"`) | **RED** — `test_flush_fences_and_shares_one_string_across_deliver_and_mirror` failed (`mirrored["role"] == "assistant"`) | **GREEN** |
+| — | Pre-lease pause check (NEW, P0 part a) | `adapter.py` `_poll_loop`: `if _estop_engaged():` (before `inbox_lease`) → `if False:` | **RED** — both new real-poll-loop tests (`test_real_poll_loop_pauses_before_lease_then_resumes` [routine] and `..._deliver` [peer]) failed: `inbox_lease` was called while paused | **GREEN** |
+| — | `_protocol_error` restored on the pause path (NEW, P0 part b/c — the exact mutation the brief named) | `adapter.py` `_poll_loop`: `except _EstopDeferred:` (mid-message handler) → `except KeyError:` (bypasses the defer handling, `_EstopDeferred` falls through to the outer `except Exception: self._quarantine_inbox_polling(); return`) | **RED** — both new mid-message tests (`test_real_poll_loop_defers_mid_message_then_resumes_without_quarantine` [routine] and `..._deliver`) failed: poll task ended, `[mupot] inbox polling quarantined; reconciliation required` logged | **GREEN** |
+| E1 | `_handle_routine_event` e-stop gate | `adapter.py`: `if _estop_engaged():` (routine) → `if False:` | **RED** — `test_real_estop_sentinel_blocks_routine_ack_and_injection_then_resumes` (real sentinel, direct call) AND `test_real_poll_loop_defers_mid_message_then_resumes_without_quarantine` (real poll loop) both failed | **GREEN** |
+| E2 | `_handle_ack_envelope` e-stop gate | `adapter.py`: `if _estop_engaged():` (ack-envelope) → `if False:` | **RED** — `test_estop_engaged_defers_ack_envelope_before_any_state_mutation` (faked sentinel) AND `test_real_estop_sentinel_blocks_ack_envelope_injection_then_resumes` (real sentinel) both failed | **GREEN** |
+| E3 | `_deliver` e-stop gate | `adapter.py`: `if _estop_engaged():` (deliver) → `if False:` | **RED** — `test_estop_engaged_blocks_dispatch_before_any_state_mutation` (faked sentinel) AND `test_real_poll_loop_defers_mid_message_deliver_then_resumes_without_quarantine` (real poll loop) both failed | **GREEN** |
+| E4 | `flush()` single choke point e-stop gate | `notifications.py` `flush()`: `if _estop_engaged():` (before `activate`) → `if False:` | **RED** — `test_flush_real_estop_sentinel_blocks_activation_at_the_single_choke_point` failed (`activations` had 1 entry) | **GREEN** |
+| V1 | P1 residual: fail-open branch body is non-vacuous | `adapter.py` `_estop_engaged`'s `except ImportError: ...; return False` → `...; raise AssertionError(...)` | **RED** — `test_estop_engaged_fails_open_to_false_when_hermes_estop_is_unimportable` failed with the injected `AssertionError`, proving the branch actually executes | **GREEN** |
+| M1 | Peer allowlist gate (no-regression) | `adapter.py` `_process_leased_message`: `if should_accept_message(...)` → `if True:` | **RED** — `test_unlisted_sender_is_quarantined_never_delivered` failed (attacker body reached the handler) | **GREEN** |
+| I1 | `allowed_agents` non-iterable type check | `adapter.py`: `elif not isinstance(allowed, (list, tuple, set, frozenset)):` → `elif False:` | **RED** — all 6 `test_allowed_agents_non_iterable_value_raises_clear_config_error` cases failed (`DID NOT RAISE`) | **GREEN** |
+| I2 / M16 | `allowed_agents` fail-open regression | `adapter.py` `__init__`: `allowed = extra.get("allowed_agents")` → `... or "hadi-codex,hadi-codex-cli,kasra,hermes"` (the original round-1 defect) | **RED** — both `test_explicit_empty_allowed_agents_denies_everyone` cases AND 2 of `test_allowed_agents_non_iterable_value_raises_clear_config_error` (`0`, `False`) failed | **GREEN** |
+| I3 | `allowed_agents` non-string list entry (NEW, P3) | `adapter.py`: removed the `for item in allowed: if not isinstance(item, str): raise ValueError(...)` block | **RED** — all 7 `test_allowed_agents_non_string_list_entry_raises_clear_config_error` cases failed (`DID NOT RAISE`) | **GREEN** |
+| — | `_SOURCE_ID_RE` backtick/bracket exclusion (NEW, P3) | `routine_events.py`: `_SOURCE_ID_RE` reverted to `^[^\s]{1,128}$` (no backtick/`[`/`]` exclusion) | **RED** — all 4 `test_source_id_regex_rejects_backtick_and_bracket_characters` cases failed (`DID NOT RAISE`) | **GREEN** |
+| M7 | Competing-receiver guard | `__init__.py`: `if native_gateway and _ACTIVE_WATCHERS:` → `if False:` | **RED** — `test_switching_to_native_receive_with_an_active_legacy_stream_is_refused` failed | **GREEN** |
+| M12 | Telegram command allowlist | `telegram_control.py`: `if command not in {...}:` → `if False:` | **RED** — both `test_relay_refuses_an_unsupported_command_before_network` and `test_native_callback_replies_with_refusal_for_an_unsupported_command` failed | **GREEN** |
+| M17 | Lease attempt_id format check | `lease_ownership.py`: `or _ATTEMPT_ID_RE.fullmatch(attempt_id) is None` → `or False` | **RED** — 9 `tests/test_lease_ownership.py` cases failed | **GREEN** |
+| M18 | `_NoRedirect` refuses a redirect | `telegram_control.py`: `redirect_request` → follows the redirect via `super()` | **RED** — `test_no_redirect_refuses_a_real_302_and_never_forwards_the_secret_header` failed (real local HTTP redirector; request actually forwarded, wrong-method 501 instead of the refusal) | **GREEN** |
+| L1 | Legacy `_maybe_start_inbox_stream` shares the fence helper | `__init__.py`: `fenced = (...)` (fence-wrapped) → `fenced = text` (raw) | **RED** — `test_maybe_start_inbox_stream_routes_deliver_through_shared_fence_helper` failed | **GREEN** |
+| L2 | `_live_adapter` cleared on disconnect | `adapter.py` `register()`: dropped the `instance.disconnect = _disconnect_and_clear_live_adapter` reassignment | **RED** — `test_gateway_status_clears_to_disconnected_after_adapter_disconnect` failed | **GREEN** |
+| — | `allow_from` dead-line regression | `adapter.py` `__init__`: re-added `extra["allow_from"] = sorted(self.allowed_agents)` | **RED** — `test_allow_from_is_not_derived_on_the_internal_true_path` failed | **GREEN** |
+
+21 rows above, all executed directly this session (temporary in-place edit, real pytest run,
+restore, confirmed clean). This covers: both fence-sharing guards (F1/F2) plus the mirror-role
+guard; the new pause/liveness class in full (pre-lease check, the `_protocol_error`-restored
+mutation the brief explicitly named, and all 4 individual e-stop call-site gates E1-E4); the
+P1 vacuous-test-fix guard (V1); the peer allowlist no-regression guard (M1); all `allowed_agents`
+validation guards (I1/I2/I3, including the new P3 fix); the new `_SOURCE_ID_RE` P3 guard; and
+the four round-1 guards this round's diff does not touch but the brief named explicitly
+(M7/M12/M17/M18), each individually re-mutated rather than inferred safe from a green suite.
+
+### Real test counts (round 3, this session)
+
+- `scripts/test.sh`: **240 passed, 12 subtests passed** (pytest, unchanged from round 2 — this
+  round's new tests are all in `tests/native/`, which this script explicitly skips) +
+  **27/27** (`unittest` `test_operator`), 0 failures.
+- `scripts/test-native.sh` (fresh `HERMES_SOURCE`/`HERMES_PYTHON` pointed at the same pinned
+  `233757037df1f03f9fe1cfddc097acd5ad7f7510` clone used for verification, not the read-only
+  reference checkout): **319 tests passed, 0 failed**, across all 9 files in `tests/native/`
+  (up from round 2's 302 — 17 net-new tests: 2 real-poll-loop routine tests + 5 `_SOURCE_ID_RE`
+  cases in `test_routine_events.py`; 2 real-poll-loop `_deliver` tests + 7 `allowed_agents`
+  non-string-entry cases in `test_adapter.py`; 1 fencing/role test in `test_notifications.py`).
+
+### Not done / could not verify (round 3)
+
+- `scripts/test-integration.sh` still not run this round for the same reason as rounds 1-2 (no
+  provisioned `MUPOT_SERVER_SOURCE`).
+- `ruff`/`mypy` were not re-run this round; `py_compile` on every changed `.py` file plus both
+  test scripts (each run to completion, clean, both before mutation testing and after every
+  restore) gated this commit.
+- Kasra-review's own private guard numbering (F/E/I/L/V/M as literally used in the brief) could
+  not be recovered from any document in this repo — the mapping above is by content, stated
+  plainly rather than asserted from the label. If the exact numbering matters for a future
+  audit, it lives only in the reviewing arm's own working notes, not in this repository.
+- The `_reconcile_inbox_polling_with_active_scope` copy of the same "process then check
+  processed then `_protocol_error()`" pattern was given the same `_EstopDeferred` handling as
+  `_poll_loop` (so an e-stop engaging mid-reconciliation returns `False` instead of compounding
+  the existing quarantine into a fresh one), but this was NOT independently mutation-tested
+  this round — it shares the same `_EstopDeferred` class as the two mutations above, and no new
+  test drives `reconcile_inbox_polling()` under a live pause. Stated plainly as an open item,
+  not silently assumed safe.
+- `notifications.py`'s `flush()` gates the injector (`activate`) call only; a plain
+  (non-activation) Telegram/mirror notification — e.g. a peer terminal-ACK notice when
+  `notification_activate` is False, the default — is NOT gated by `_estop_engaged()` at all and
+  will still send/mirror while paused. This is out of scope for both findings in this round's
+  brief (P0 was specifically about the poll loop's quarantine bookkeeping; P1 was specifically
+  about fencing) and is a pre-existing shape, not a new regression — but it is a real,
+  previously-undocumented question worth a future pass: should e-stop pause plain human
+  notifications too, or is that a deliberate "notifications keep flowing, only autonomous
+  agent action pauses" design choice? Not decided here.

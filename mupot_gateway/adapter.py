@@ -3003,7 +3003,12 @@ def register(
         ),
     )
 
-    def gateway_status(args: dict[str, Any]) -> str:
+    def gateway_status(args: dict[str, Any], **_metadata: Any) -> str:
+        # tools/registry.py's dispatch() always calls entry.handler(args, **kwargs)
+        # with task_id/session_id/user_task (see model_tools.py's _execute_tool
+        # dispatch_kwargs) — **_metadata absorbs those the same way
+        # mupot_operator.py's build_operator_handlers wrapper does; without it any
+        # real Hermes dispatch raises "unexpected keyword argument 'task_id'".
         adapter = _live_adapter[0] if _live_adapter else None
         if adapter is None:
             value = {"ok": False, "error": "native_gateway_not_connected"}

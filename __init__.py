@@ -82,16 +82,23 @@ def _result(value: Any) -> str:
 def _register_provisioner_tools(ctx: Any) -> None:
     """Register the legacy human-controlled setup surface using the current API."""
 
-    def provision(args: dict[str, Any]) -> str:
+    # **_metadata absorbs the task_id/session_id/user_task kwargs that
+    # tools/registry.py's dispatch() always passes to entry.handler(args, **kwargs)
+    # on a real Hermes call (see model_tools.py's _execute_tool dispatch_kwargs) —
+    # same convention as mupot_operator.py's build_operator_handlers wrapper and
+    # mupot_gateway/adapter.py's gateway_status. Without it, dispatch raises
+    # "unexpected keyword argument 'task_id'".
+
+    def provision(args: dict[str, Any], **_metadata: Any) -> str:
         values = dict(args)
         values.setdefault("cf_account_id", os.environ.get("MUPOT_CF_ACCOUNT_ID", ""))
         values.setdefault("cf_api_token", os.environ.get("MUPOT_CF_API_TOKEN", ""))
         return _result(mupot_provision(**values))
 
-    def status(args: dict[str, Any]) -> str:
+    def status(args: dict[str, Any], **_metadata: Any) -> str:
         return _result(mupot_status(**args))
 
-    def brain_enable(args: dict[str, Any]) -> str:
+    def brain_enable(args: dict[str, Any], **_metadata: Any) -> str:
         return _result(mupot_brain_enable(**args))
 
     registrations = (

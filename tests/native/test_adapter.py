@@ -1870,3 +1870,49 @@ async def test_gateway_status_clears_to_disconnected_after_adapter_disconnect(
 
     disconnected = json.loads(tools["mupot_gateway_status"]({}))
     assert disconnected == {"ok": False, "error": "native_gateway_not_connected"}
+
+
+def test_gateway_status_survives_real_hermes_registry_dispatch(tmp_path: Path) -> None:
+    """Live-defect regression (kayhermes gateway journal, 2026-09-14, plugin 0.4.0):
+    ``TypeError: register.<locals>.gateway_status() got an unexpected keyword argument
+    'task_id'``. The two tests above call the captured handler directly with a bare
+    ``{}`` — that can never reproduce this, because a *real* Hermes turn never calls a
+    tool handler that way. ``tools/registry.py``'s ``dispatch()`` always calls
+    ``entry.handler(args, **kwargs)`` with ``task_id``/``session_id``/``user_task``
+    (``model_tools.py``'s ``_execute_tool`` builds those into ``dispatch_kwargs`` for
+    every tool call), so this routes through the actual registry the way a live gateway
+    turn does."""
+    from plugin.mupot_gateway.adapter import register as register_native_gateway
+    from tools.registry import registry
+
+    tool_name = "mupot_gateway_status"
+
+    class Ctx:
+        def inject_message(self, *_a, **_kw):
+            return True
+
+        def register_platform(self, **kwargs):
+            self.adapter_factory = kwargs["adapter_factory"]
+
+        def register_tool(self, **kwargs):
+            registry.register(
+                name=kwargs["name"], toolset=kwargs["toolset"],
+                schema=kwargs["schema"], handler=kwargs["handler"],
+            )
+
+    registry.deregister(tool_name)  # no-op if nothing is registered yet
+    try:
+        ctx = Ctx()
+        register_native_gateway(ctx)
+        ctx.adapter_factory(
+            PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "state.json")})
+        )
+
+        raw = registry.dispatch(
+            tool_name, {}, task_id="task-native-1", session_id="session-native-1",
+            user_task="probe mupot_gateway_status",
+        )
+        result = json.loads(raw)
+        assert result == {"ok": True, "stranded_notifications": []}
+    finally:
+        registry.deregister(tool_name)

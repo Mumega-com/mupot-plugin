@@ -65,6 +65,13 @@ _STRANDED_NOTIFICATION_STATUSES = frozenset({"activation_unknown", "transport_un
 _LEASE_ATTEMPT_STATES = frozenset(
     {"leased", "empty", "cancelled", "expired", "acked"}
 )
+# BLOCK-2 (adversarial gate, PR #11 round 5): a well-formed `inbox_lease_ack`
+# response reporting one of these -- the attempt is no longer live -- is a
+# resolved, unambiguous outcome, not a transport failure: the server is
+# telling us plainly that this exact attempt cannot be acked anymore, not
+# "try again, we don't know what happened". `leased` is deliberately EXCLUDED
+# (a genuinely confusing response to an ack call -- stays a protocol error).
+_DEAD_ATTEMPT_ACK_STATES = frozenset({"expired", "cancelled", "empty"})
 _IMMUTABLE_REPLY_SOURCE_FIELDS = (
     "id",
     "seq",
@@ -1385,6 +1392,15 @@ class MupotAdapter(BasePlatformAdapter):
                     self._reply_state_invalid = True
             except MupotProtocolError:
                 self._reply_state_invalid = True
+        # BLOCK-1 (adversarial gate, PR #11 round 5): non-persisted, reset to
+        # 0 the next time `_replay_reply_outbox` succeeds -- the only signal
+        # that a specific staged reply is stuck retrying every tick (see
+        # `_poll_loop`'s bare-`Exception` clause, which no longer starves
+        # `inbox_lease` for this but also has nowhere durable to record it;
+        # deriving this from `self._state` alone is impossible since the
+        # underlying failure -- e.g. the peer `send` transport being down --
+        # never gets persisted at all).
+        self._reply_replay_failure_streak = 0
         self._log_stranded_notifications_at_startup()
 
     def _profile_scope(self):
@@ -1454,6 +1470,21 @@ class MupotAdapter(BasePlatformAdapter):
         log line.
         """
         return self._reply_reconciliation_required
+
+    def reply_replay_failures(self) -> int:
+        """Consecutive `_replay_reply_outbox` failures this process has seen.
+
+        BLOCK-1 (adversarial gate, PR #11 round 5): a failing replay (e.g. a
+        peer `send` transport that is down) no longer starves `inbox_lease`
+        (see `_poll_loop`), which fixes the stall but removes the only thing
+        that used to make it visible (`_poll_loop` dying and `is_connected`
+        going false). This is the replacement signal: non-zero means the
+        SAME staged reply is failing to transmit every tick. Never persisted
+        -- there is no durable state to derive it from (the failure itself,
+        e.g. a transport exception, is never written to `reply_outbox`) --
+        and resets to 0 the moment a replay attempt succeeds.
+        """
+        return self._reply_replay_failure_streak
 
     def _log_stranded_notifications_at_startup(self) -> None:
         stranded = self.stranded_notifications()
@@ -1675,7 +1706,9 @@ class MupotAdapter(BasePlatformAdapter):
                 ownership["attempt_id"],
                 ownership,
             )
-            if receipt["state"] != "acked" or receipt["consumed"] is not True:
+            if receipt["state"] == "acked" and receipt["consumed"] is True:
+                return
+            if receipt["state"] not in _DEAD_ATTEMPT_ACK_STATES:
                 raise _protocol_error()
         except asyncio.CancelledError:
             raise
@@ -1687,6 +1720,38 @@ class MupotAdapter(BasePlatformAdapter):
                 retryable=False,
             )
             raise
+        # BLOCK-2 P1 (adversarial gate, PR #11 round 5): the "restart flap"
+        # -- a custodied reply whose attempt died mid-turn (e.g.
+        # `disconnect()` before this ack ran) used to durably quarantine
+        # HERE every time it was retried, and because the quarantine flag
+        # this branch used to set is never persisted, a fresh restart always
+        # reported `connect() -> True` and then died identically on the very
+        # first tick that replayed this same record -- an infinite "looks
+        # healthy, dies immediately" flap invisible to anything that only
+        # checks `connect()`'s return value. Every caller of this function
+        # reaches it only after proving human custody already exists
+        # (`_deliver`'s SUCCESS branch, `_replay_reply_outbox`'s own custody
+        # check just above its call) -- a well-formed non-`acked` state
+        # (`receipt["state"] in _DEAD_ATTEMPT_ACK_STATES`, checked above) is
+        # the server plainly saying this exact attempt cannot be acked
+        # anymore, not an ambiguous transport failure. Returning normally
+        # here (no exception, no quarantine) lets the caller commit locally
+        # exactly as it would after a real ack: `processed` already dedups a
+        # future redelivery of this same message through
+        # `_process_leased_message`'s own "already processed" branch, which
+        # acks under whatever attempt is CURRENT at that time via
+        # `_ack_expected` -- no new state key, this is the existing
+        # self-heal.
+        logger.warning(
+            "[mupot] ack for source=%s deferred; attempt=%s is no longer "
+            "live (state=%s) -- reply already reached human custody, "
+            "committing locally; any future redelivery of this message "
+            "re-acks under its own fresh attempt via the existing "
+            "processed-set dedup",
+            expected_id,
+            ownership["attempt_id"],
+            receipt["state"],
+        )
 
     async def _preflight_persisted_ownership(
         self,
@@ -2599,6 +2664,7 @@ class MupotAdapter(BasePlatformAdapter):
                 return
             try:
                 await self._replay_reply_outbox()
+                self._reply_replay_failure_streak = 0
             except _EstopDeferred:
                 # Same class, for `_replay_reply_outbox`'s peer `send` choke
                 # point (`_transmit_final_reply`). Without this explicit clause
@@ -2625,11 +2691,33 @@ class MupotAdapter(BasePlatformAdapter):
                 logger.error("[mupot] reply replay requires reconciliation")
                 return
             except Exception as exc:
-                # The exact immutable envelope remains durable. Do not lease
-                # new work while its terminal response is unresolved.
-                logger.warning("[mupot] reply replay deferred: %s", exc)
-                await asyncio.sleep(self.poll_interval)
-                continue
+                # BLOCK-1 P0 (adversarial gate, PR #11 round 5): this used to
+                # `continue` here -- skipping `inbox_lease` for the rest of
+                # this tick. If the SAME record keeps failing to transmit
+                # (e.g. the peer's `send` transport is down), it never
+                # recovers on its own: every tick replays the same failing
+                # record and NEVER reaches `inbox_lease` again, so no other
+                # message is ever leased either -- with `poll_running`/
+                # `is_connected` both staying green and no fence, no field
+                # naming the stall (worse than the loud brick this class of
+                # fix otherwise replaces). The exact immutable envelope
+                # remains durable either way; what changes is that this tick
+                # now still falls through to `_flush_notifications` and
+                # `inbox_lease` below instead of returning early -- leasing
+                # message N+1 has never depended on message N's reply having
+                # transmitted (records are independent, keyed by their own
+                # source_id). This record's own retry stays bounded to at
+                # most once per tick: `_replay_reply_outbox` calls
+                # `_transmit_final_reply` for it at most once per call, and
+                # this function itself runs at most once per tick -- no
+                # separate rate limit is needed on top of that.
+                self._reply_replay_failure_streak += 1
+                logger.warning(
+                    "[mupot] reply replay deferred (consecutive failures=%d): "
+                    "%s; still leasing other work this tick",
+                    self._reply_replay_failure_streak,
+                    exc,
+                )
             try:
                 await self._flush_notifications()
             except asyncio.CancelledError:
@@ -3466,6 +3554,7 @@ def register(
                 "lease_reconciliation": adapter.lease_reconciliation_status(),
                 "invalid_reply_receipts": adapter.invalid_reply_receipts(),
                 "reply_reconciliation_required": adapter.reply_reconciliation_required(),
+                "reply_replay_failures": adapter.reply_replay_failures(),
             }
         return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
 

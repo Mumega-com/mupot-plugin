@@ -1444,16 +1444,20 @@ async def test_routine_restart_expired_attempt_a_never_generic_acks_live_attempt
 
     client = AttemptRoutineClient(attempt_state="expired", consumed=False)
     restarted = adapter_at(tmp_path, client)
-    with pytest.raises(RuntimeError, match="Mupot MCP request failed"):
-        await restarted._replay_routine_events()
+    # BLOCK-2 P1 (adversarial gate, PR #11 round 5): a well-formed `expired`
+    # ack response for the dead attempt A no longer durably quarantines --
+    # custody was already achieved, so this commits locally instead of
+    # raising (the "restart flap"). ATTEMPT_B (a live, unrelated attempt) is
+    # still never touched, asserted below same as before.
+    await restarted._replay_routine_events()
 
     assert ("inbox_lease_ack", {"attempt_id": ATTEMPT_A}) in client.calls
     assert not any(tool == "inbox_ack" for tool, _arguments in client.calls)
     assert client.attempts[ATTEMPT_B] == "leased"
     assert client.message_read[ATTEMPT_B] is False
     state = StateStore(tmp_path / "state.json").load()
-    assert "routine-message-1" not in state.get("processed", [])
-    assert state["routine_event_receipts"]["routine-message-1"]["status"] == "custody"
+    assert "routine-message-1" in state.get("processed", [])
+    assert state["routine_event_receipts"]["routine-message-1"]["status"] == "processed"
 
 
 @pytest.mark.asyncio

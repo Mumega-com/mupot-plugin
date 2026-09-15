@@ -502,6 +502,16 @@ async def test_prepared_attempt_valid_preflight_sends_then_custodies_then_acks_o
 async def test_peer_restart_expired_attempt_a_never_generic_acks_live_attempt_b(
     tmp_path: Path,
 ) -> None:
+    """BLOCK-2 P1 (adversarial gate, PR #11 round 5): a restart whose only
+    live attempt for this custodied reply has since expired server-side no
+    longer durably quarantines (the "restart flap" -- `connect()` used to
+    report `True` and then die identically, every restart, on this exact
+    replay). `_ack_persisted_ownership` now treats a well-formed `expired`
+    ack response as a deferral: the reply already reached human custody, so
+    it commits locally instead. The safety property this test's name
+    describes -- ATTEMPT_B (a live, unrelated attempt) is never
+    generic-acked as a side effect -- is unchanged and still asserted below.
+    """
     first = adapter_at(tmp_path, ProtocolClient())
     await bind_attempt_delivery(first)
     result = await first.send("sender", "Durable exact final.")
@@ -520,16 +530,17 @@ async def test_peer_restart_expired_attempt_a_never_generic_acks_live_attempt_b(
 
     client = AttemptReplayClient(attempt_state="expired", consumed=False)
     restarted = adapter_at(tmp_path, client)
-    with pytest.raises(RuntimeError, match="Mupot MCP request failed"):
-        await restarted._replay_reply_outbox()
+    await restarted._replay_reply_outbox()  # no longer raises -- see docstring
 
     assert ("inbox_lease_ack", {"attempt_id": ATTEMPT_A}) in client.calls
     assert not any(tool == "inbox_ack" for tool, _arguments in client.calls)
-    assert client.attempts[ATTEMPT_B] == "leased"
+    assert client.attempts[ATTEMPT_B] == "leased"  # never touched
     assert client.message_read[ATTEMPT_B] is False
     state = StateStore(tmp_path / "state.json").load()
-    assert "source-1" not in state.get("processed", [])
-    assert state["reply_outbox"]["source-1"]["status"] == "custodied"
+    assert "source-1" in state.get("processed", [])
+    assert state["reply_outbox"]["source-1"]["status"] == "complete"
+    assert restarted._lease_quarantined is False
+    assert restarted._reply_reconciliation_required is False
 
 
 @pytest.mark.asyncio

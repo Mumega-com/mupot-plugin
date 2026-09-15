@@ -528,8 +528,20 @@ async def test_mark_reply_complete_refuses_a_prepared_record_without_a_receipt(
     fresh = make_adapter(state_path, object())
     assert fresh._reply_state_invalid is False
 
-    # F6: a second replay must not re-walk (and re-log) the same refusal.
+    # F6: a second replay must not re-walk this record at all -- spy on the
+    # persistence call so an idempotent re-write of the same status (which
+    # a status-only assertion cannot distinguish from "never re-entered")
+    # still fails this test.
+    persist_calls: list[str] = []
+    original_persist = adapter._persist_reply_record
+
+    def _spy_persist(source_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        persist_calls.append(source_id)
+        return original_persist(source_id, record)
+
+    adapter._persist_reply_record = _spy_persist  # type: ignore[method-assign]
     await adapter._replay_reply_outbox()
+    assert persist_calls == []  # never re-walked -> never re-persisted
     assert (
         StateStore(state_path).load()["reply_outbox"]["msg-1"]["status"]
         == "invalid_receipt"

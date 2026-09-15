@@ -4,6 +4,7 @@ import asyncio
 import copy
 import os
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -948,6 +949,222 @@ def test_fenced_untrusted_block_no_backticks_is_unchanged_modulo_fence() -> None
     payload = "plain human-readable status update, no code fences here"
     result = _fenced_untrusted_block(payload)
     assert result == "```mupot-notice\n" + payload + "\n```"
+
+
+# ── Definite activation refusal must be retryable (kayhermes live defect,
+# 2026-09-15T02:19:09Z, source 00b6daa0-23a1-4ad4-af30-152a8b026fb5,
+# plugin@6c86c2b0) ──
+
+
+@pytest.mark.asyncio
+async def test_definite_activation_refusal_is_retryable_not_activation_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LIVE DEFECT: source 00b6daa0-23a1-4ad4-af30-152a8b026fb5 was durably
+    ACKed, then `activate(...)` returned a DEFINITE False (the Telegram
+    adapter was still connecting right after a gateway restart) -- and
+    flush()'s `if not accepted:` branch only logged and broke, leaving the
+    notice parked at the pre-written "activation_unknown" state forever
+    (that status is in flush()'s own skip-set at the top of the loop, so it
+    is never retried without operator reconciliation). A definite False is
+    NOT the same kind of unknown as an exception or a crash mid-call: Hermes
+    reached a verdict and said no. It must be retryable, the same way every
+    other transient flush() failure already is (reusing RetryLater's
+    existing attempts/backoff bookkeeping, not a new state machine)."""
+    from plugin.mupot_gateway import notifications
+    monkeypatch.setattr(notifications, "active_sessions", lambda: [
+        {"id": "human", "session_key": "agent:main:telegram:dm:123", "source": "telegram",
+         "user_id": "owner", "chat_id": "123", "chat_type": "dm", "last_active": 1}])
+    calls: list[tuple[str, dict]] = []
+
+    def flaky_injector(content, **kw):
+        calls.append((content, kw))
+        return len(calls) > 1  # False on the first call, True after.
+
+    adapter = adapter_at(tmp_path)
+    adapter.notification_activate = True
+    adapter.message_injector = flaky_injector
+    await bind_delivery(adapter, {"id": "retry-1", "from_agent": "kasra"})
+    await adapter.send("kasra", "Gateway is still connecting.")
+
+    await adapter._flush_notifications()
+    assert len(calls) == 1
+
+    notice = StateStore(tmp_path / "inbox.json").load()["notification_outbox"]["retry-1"]
+    assert notice["status"] == "pending"
+    assert notice["activation_status"] == "not_started"
+    assert notice["attempts"] == 1
+    now = time.time()
+    assert now < notice["retry_at"] <= now + 300
+
+    # An immediate re-poll must not re-attempt before the backoff elapses.
+    await adapter._flush_notifications()
+    assert len(calls) == 1
+
+    # Simulate "later" deterministically (same technique as the e-stop
+    # choke-point test below) rather than sleeping in a test.
+    state = StateStore(tmp_path / "inbox.json").load()
+    state["notification_outbox"]["retry-1"]["retry_at"] = 0
+    StateStore(tmp_path / "inbox.json").save(state)
+    adapter._state = state
+
+    await adapter._flush_notifications()
+    assert len(calls) == 2
+    notice = StateStore(tmp_path / "inbox.json").load()["notification_outbox"]["retry-1"]
+    assert notice["status"] == "activation_queued"
+    assert notice["activation_status"] == "queued"
+
+    # Delivered exactly once: an already-queued notice is never re-activated.
+    await adapter._flush_notifications()
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_activation_exception_still_leaves_activation_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Countercase for the fix above: an EXCEPTION raised out of `activate`
+    itself (as opposed to a definite False return) is genuinely ambiguous --
+    Hermes may or may not have received/processed the call -- and must keep
+    landing on "activation_unknown" for operator reconciliation, unchanged."""
+    from plugin.mupot_gateway import notifications
+    monkeypatch.setattr(notifications, "active_sessions", lambda: [
+        {"id": "human", "session_key": "agent:main:telegram:dm:123", "source": "telegram",
+         "user_id": "owner", "chat_id": "123", "chat_type": "dm", "last_active": 1}])
+    calls: list[tuple[str, dict]] = []
+
+    def raising_injector(content, **kw):
+        calls.append((content, kw))
+        raise RuntimeError("session transport dropped mid-call")
+
+    adapter = adapter_at(tmp_path)
+    adapter.notification_activate = True
+    adapter.message_injector = raising_injector
+    await bind_delivery(adapter, {"id": "unknown-1", "from_agent": "kasra"})
+    await adapter.send("kasra", "Status update.")
+
+    await adapter._flush_notifications()
+    assert len(calls) == 1
+
+    notice = StateStore(tmp_path / "inbox.json").load()["notification_outbox"]["unknown-1"]
+    assert notice["status"] == "activation_unknown"
+    assert notice["activation_status"] == "unknown"
+    assert notice["last_error"] == "ActivationOutcomeUnknown"
+
+    # Never auto-retried: activation_unknown is in flush()'s skip-set.
+    await adapter._flush_notifications()
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_crash_between_activation_accept_and_persist_leaves_activation_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Countercase for the fix above: `activate` returns True, but the
+    durable write that records "activation_queued" itself fails (process
+    interruption between accept and persist). This must still leave the
+    notice at "activation_unknown" (the last state actually committed to
+    disk, restored via `_restore_durable_state`) for reconciliation -- an
+    accepted-but-unpersisted activation is exactly as ambiguous as an
+    exception from `activate` itself, and neither is the definite-False case
+    this PR makes retryable."""
+    from plugin.mupot_gateway import notifications
+    monkeypatch.setattr(notifications, "active_sessions", lambda: [
+        {"id": "human", "session_key": "agent:main:telegram:dm:123", "source": "telegram",
+         "user_id": "owner", "chat_id": "123", "chat_type": "dm", "last_active": 1}])
+    calls: list[tuple[str, dict]] = []
+
+    def accepting_injector(content, **kw):
+        calls.append((content, kw))
+        return True
+
+    adapter = adapter_at(tmp_path)
+    adapter.notification_activate = True
+    adapter.message_injector = accepting_injector
+    await bind_delivery(adapter, {"id": "crash-1", "from_agent": "kasra"})
+    await adapter.send("kasra", "Status update.")
+
+    real_persist_notice = notifications._persist_notice
+
+    def flaky_persist(state, store, candidate, source_id, expected):
+        if expected.get("status") == "activation_queued":
+            raise OSError("simulated crash between accept and persist")
+        return real_persist_notice(state, store, candidate, source_id, expected)
+
+    monkeypatch.setattr(notifications, "_persist_notice", flaky_persist)
+
+    await adapter._flush_notifications()
+    assert len(calls) == 1
+
+    notice = StateStore(tmp_path / "inbox.json").load()["notification_outbox"]["crash-1"]
+    assert notice["status"] == "activation_unknown"
+    assert notice["activation_status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_definite_false_during_engaged_estop_is_deferred_not_an_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Countercase for the fix above: e-stop can engage in the window between
+    flush()'s own pre-call `_estop_engaged()` check and `activate` returning
+    False (a race, not a genuine rejection). This must still be retried, but
+    it must NOT consume one of the notice's real retry attempts or run the
+    normal exponential backoff -- it is a deferral like every other
+    `_estop_engaged()` gate in this function, not a rejection Hermes actually
+    reasoned about."""
+    import hermes_constants
+    from agent import estop as real_estop
+    from plugin.mupot_gateway import notifications
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    token = hermes_constants.set_hermes_home_override(str(hermes_home))
+    try:
+        monkeypatch.setattr(notifications, "active_sessions", lambda: [
+            {"id": "human", "session_key": "agent:main:telegram:dm:123", "source": "telegram",
+             "user_id": "owner", "chat_id": "123", "chat_type": "dm", "last_active": 1}])
+        calls: list[tuple[str, dict]] = []
+
+        def racing_injector(content, **kw):
+            calls.append((content, kw))
+            if len(calls) == 1:
+                # Simulate e-stop engaging in the exact window between
+                # flush()'s earlier pre-call check and this call returning.
+                real_estop.engage(reason="kasra-activation-race-test")
+            return False
+
+        adapter = adapter_at(tmp_path)
+        adapter.notification_activate = True
+        adapter.message_injector = racing_injector
+        await bind_delivery(adapter, {"id": "race-1", "from_agent": "kasra"})
+        await adapter.send("kasra", "Status update.")
+
+        assert real_estop.is_engaged() is False
+        await adapter._flush_notifications()
+        assert real_estop.is_engaged() is True
+        assert len(calls) == 1
+
+        notice = StateStore(tmp_path / "inbox.json").load()["notification_outbox"]["race-1"]
+        assert notice["status"] == "pending"
+        assert notice["activation_status"] == "not_started"
+        assert notice.get("attempts", 0) == 0
+
+        real_estop.disengage()
+        assert real_estop.is_engaged() is False
+        state = StateStore(tmp_path / "inbox.json").load()
+        state["notification_outbox"]["race-1"]["retry_at"] = 0
+        StateStore(tmp_path / "inbox.json").save(state)
+        adapter._state = state
+
+        await adapter._flush_notifications()
+        assert len(calls) == 2
+        notice = StateStore(tmp_path / "inbox.json").load()["notification_outbox"]["race-1"]
+        assert notice["status"] == "pending"
+        assert notice["activation_status"] == "not_started"
+        assert notice.get("attempts", 0) == 1
+    finally:
+        real_estop.disengage()
+        hermes_constants.reset_hermes_home_override(token)
 
 
 @pytest.mark.asyncio

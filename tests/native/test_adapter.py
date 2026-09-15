@@ -23,6 +23,7 @@ from plugin.mupot_gateway.adapter import (  # noqa: E402
     MupotAdapter,
     StateStore,
     _EstopDeferred,
+    _LeaseExpiredDeferred,
     build_mupot_event,
     is_ack_envelope,
     is_terminal_ack,
@@ -449,7 +450,12 @@ async def test_expired_leased_event_never_starts_model_work(tmp_path: Path) -> N
     adapter.set_message_handler(handler)
     expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
 
-    await adapter._deliver(delivery_message("expired", lease_expires_at=expired))
+    # Class fix (2026-09-15, see _LeaseExpiredDeferred): an already-expired
+    # lease is a deferral, not a silent no-op -- _deliver raises so callers
+    # (the poll loop, reconcile_inbox_polling) release the lease instead of
+    # quarantining.
+    with pytest.raises(_LeaseExpiredDeferred):
+        await adapter._deliver(delivery_message("expired", lease_expires_at=expired))
 
     assert handled == []
     assert client.sent == []
@@ -479,7 +485,11 @@ async def test_queued_event_expiry_cancels_session_before_model_start(tmp_path: 
     adapter._session_tasks[session_key] = blocker
     adapter._background_tasks.add(blocker)
     try:
-        await adapter._deliver(message)
+        # Class fix (2026-09-15, see _LeaseExpiredDeferred): the queued
+        # message's own runtime expires (via the turn-timeout wait) before
+        # the handler ever runs -- a deferral, not a silent no-op.
+        with pytest.raises(_LeaseExpiredDeferred):
+            await adapter._deliver(message)
         assert handled == []
         assert session_key not in adapter._pending_messages
         assert blocker.cancelled()
@@ -513,7 +523,13 @@ async def test_timeout_invalidates_generation_before_bounded_cancellation(
     adapter.set_message_handler(handler)
     adapter.cancel_session_processing = stuck_cancel
     started = time.monotonic()
-    await adapter._deliver(delivery_message("bounded-timeout"))
+    # Class fix (2026-09-15, see _LeaseExpiredDeferred): a genuine turn
+    # timeout is a deferral, not a silent no-op -- _deliver raises instead
+    # of returning. `pending` below is still preserved unchanged (this test
+    # is exactly what pins that: dropping it here would be a NEW behavior
+    # change this fix does not make).
+    with pytest.raises(_LeaseExpiredDeferred):
+        await adapter._deliver(delivery_message("bounded-timeout"))
     elapsed = time.monotonic() - started
 
     assert cancellation_started.is_set()
@@ -631,7 +647,12 @@ async def test_timed_out_thread_callback_cannot_send_with_next_delivery_context(
     a = delivery_message("source-a", sender="hadi-codex", project="project-a")
     b = delivery_message("source-b", sender="kasra", project="project-b")
     try:
-        await adapter._deliver(a)
+        # Class fix (2026-09-15, see _LeaseExpiredDeferred): source-a's
+        # turn_timeout (0.05) is exhausted while its late thread callback is
+        # still blocked on `release_thread` -- a genuine turn timeout, now a
+        # deferral rather than a silent no-op.
+        with pytest.raises(_LeaseExpiredDeferred):
+            await adapter._deliver(a)
         assert thread_ready.wait(1)
         adapter.turn_timeout = 1.0
         b_delivery = asyncio.create_task(adapter._deliver(b))
@@ -705,7 +726,12 @@ async def test_late_same_source_redelivery_cannot_complete_new_generation(
         body="same body",
     )
     try:
-        await adapter._deliver(message)
+        # Class fix (2026-09-15, see _LeaseExpiredDeferred): the first
+        # delivery's turn_timeout (0.05) expires while its handler is still
+        # blocked -- a genuine turn timeout, now a deferral rather than a
+        # silent no-op.
+        with pytest.raises(_LeaseExpiredDeferred):
+            await adapter._deliver(message)
         adapter.turn_timeout = 1.0
         b_delivery = asyncio.create_task(adapter._deliver(dict(message)))
         await asyncio.wait_for(b_started.wait(), 1)
@@ -961,10 +987,25 @@ async def test_poll_loop_retries_only_classified_safe_before_send_failure(
 
 
 @pytest.mark.asyncio
-async def test_reconstructed_adapter_stays_fenced_without_network(
+async def test_reconstructed_adapter_self_heals_via_connect_on_clean_tombstone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Class fix (2026-09-15, see connect()'s `self._lease_quarantined` handling).
+
+    Before this fix, `connect()` never attempted `reconcile_inbox_polling()` on its
+    own -- a `required: true` marker blocked every future `connect()` call forever,
+    across every operator restart, unless a human noticed and reconciled manually
+    (this is what made the live kayhermes incident, 2026-09-15, survive three
+    restarts). This test (renamed from
+    `test_reconstructed_adapter_stays_fenced_without_network`, which asserted the
+    OLD "zero network calls" behavior this fix intentionally changes) proves the
+    self-heal: a matching-scope marker whose attempt reconciles as a clean,
+    unconsumed tombstone (`"cancelled"`, `ReconciliationClient`'s default
+    `inbox_lease_reconcile` response, with no `pending`/`reply_outbox` residue)
+    now clears automatically and `connect()` proceeds -- real network calls
+    happen, and no operator action is required.
+    """
     state_path = await persist_ambiguous_lease_quarantine(tmp_path, monkeypatch)
     marker = StateStore(state_path).load().get("lease_reconciliation")
     assert isinstance(marker, dict)
@@ -985,10 +1026,14 @@ async def test_reconstructed_adapter_stays_fenced_without_network(
         client_factory=lambda *_: client,
     )
 
-    assert await reconstructed.connect() is False
-    assert client.connect_calls == 0
-    assert client.tools == []
-    assert client.lease_calls == 0
+    try:
+        assert await reconstructed.connect() is True
+    finally:
+        await reconstructed.disconnect()
+    assert client.connect_calls >= 1
+    assert client.tools[:2] == ["inbox_consumer_status", "inbox_lease_reconcile"]
+    assert StateStore(state_path).load().get("lease_reconciliation") is None
+    assert getattr(reconstructed, "_lease_quarantined", True) is False
 
 
 @pytest.mark.asyncio
@@ -1079,9 +1124,14 @@ async def test_postlease_save_failure_leaves_prelease_fence_for_restart(
         PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
         client_factory=lambda *_: reconstructed_client,
     )
+    # Class fix (2026-09-15): connect() now attempts reconcile_inbox_polling()
+    # once before refusing (see the self-heal test above) -- an empty status
+    # response has no matching mode/generation, so the readback mismatches
+    # and this marker stays fenced exactly as before, but no longer "without
+    # network": one real inbox_consumer_status readback attempt happens.
     assert await reconstructed.connect() is False
-    assert reconstructed_client.connect_calls == 0
-    assert reconstructed_client.tools == []
+    assert reconstructed_client.connect_calls == 1
+    assert reconstructed_client.tools == ["inbox_consumer_status"]
     assert reconstructed_client.lease_calls == 0
 
 
@@ -1184,8 +1234,12 @@ async def test_failed_reconciliation_readback_remains_durably_fenced(
     assert await reconcile() is False
     assert isinstance(StateStore(state_path).load().get("lease_reconciliation"), dict)
     assert getattr(reconstructed, "_lease_quarantined", False) is True
+    # Class fix (2026-09-15): connect() now attempts reconcile_inbox_polling()
+    # once before refusing, so this generation mismatch is rediscovered a
+    # second time (one more `inbox_consumer_status` readback) rather than
+    # zero times -- the marker still stays durably fenced either way.
     assert await reconstructed.connect() is False
-    assert client.tools == ["inbox_consumer_status"]
+    assert client.tools == ["inbox_consumer_status", "inbox_consumer_status"]
 
 
 @pytest.mark.asyncio
@@ -1913,6 +1967,14 @@ def test_gateway_status_survives_real_hermes_registry_dispatch(tmp_path: Path) -
             user_task="probe mupot_gateway_status",
         )
         result = json.loads(raw)
-        assert result == {"ok": True, "stranded_notifications": []}
+        # `connected`/`lease_reconciliation` added 2026-09-15 (see
+        # lease_reconciliation_status()) so an operator can see a durable
+        # quarantine here instead of only in state.json.
+        assert result == {
+            "ok": True,
+            "connected": False,
+            "lease_reconciliation": None,
+            "stranded_notifications": [],
+        }
     finally:
         registry.deregister(tool_name)

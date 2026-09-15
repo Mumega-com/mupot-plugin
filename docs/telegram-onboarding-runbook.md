@@ -280,9 +280,10 @@ it lets the in-flight visibility lease run out naturally so the exact same
 message is redelivered once resumed. This means the worst-case redelivery
 latency after `hermes resume` is bounded by whatever `lease_seconds` was in
 effect for that lease, not by how quickly the pause is lifted: `lease_seconds`
-defaults to `turn_timeout + 60s` and is clamped to `[1, 3600]` seconds
-(`mupot_gateway/adapter.py` — the config's `lease_seconds` extra can override
-the default within that range). A message leased immediately before
+defaults to `turn_timeout + mcp_tool_timeout + 60s` (as of 2026-09-15 — see
+below; it was `turn_timeout + 60s` before that) and is clamped to `[1, 3600]`
+seconds (`mupot_gateway/adapter.py` — the config's `lease_seconds` extra can
+override the default within that range). A message leased immediately before
 `hermes pause` can take up to that many seconds to redeliver after
 `hermes resume`, even though the pause itself may have lasted only moments.
 This is a deliberate trade — avoiding a second, more invasive release-path
@@ -295,6 +296,81 @@ it returns `False` without ACKing anything and without clearing the durable
 lease-quarantine marker that required reconciliation in the first place —
 the marker is left exactly as it was so the same reconciliation can be
 retried once `hermes resume` lifts the pause.
+
+### Lease expiry is a deferral, not a violation (2026-09-15)
+
+A turn's real maximum duration is not just `turn_timeout` — a single MCP tool
+call inside that turn can legitimately block for up to Hermes's own
+`mcp.tool_call` timeout budget before the turn can even react. Before
+2026-09-15, `lease_seconds` was sized as `turn_timeout + 60s` alone, so any
+turn that ran past that (a slow tool call, ordinary turn overhead pushing
+past a tight margin) reached its own message's `lease_expires_at` before it
+could ACK. The receiver folded that ordinary, expected expiry into
+`_protocol_error()` → `_quarantine_inbox_polling()` — a **durable**,
+`connect()`-refusing state, exactly the same failure shape as the e-stop bug
+fixed on 2026-09-14, now recurring for lease expiry. A gateway hitting this
+stayed refused across every subsequent operator restart, because nothing
+ever called `reconcile_inbox_polling()` automatically.
+
+Two changes close this as a class (`_LeaseExpiredDeferred` in
+`mupot_gateway/adapter.py`):
+
+1. **A message's own lease expiring mid-turn is now a deferral, never a
+   violation.** `_deliver` raises `_LeaseExpiredDeferred` instead of
+   returning silently, both when the lease was already gone before the turn
+   started and when the turn's own wait against `runtime.expires_at` times
+   out. `_poll_loop` and `reconcile_inbox_polling` release the lease fence
+   and let the server redeliver, exactly as they already did for an engaged
+   pause — no quarantine, no ack, no "message not marked processed" error.
+2. **Lease sizing now accounts for the real ceiling.** `lease_seconds`
+   defaults to `turn_timeout + mcp_tool_timeout + 60s`. `mcp_tool_timeout`
+   (default 300s) has no way to read Hermes's actual configured
+   `mcp.tool_call` timeout — set it explicitly in the `mupot` platform's
+   `extra` config to match whatever your deployment configures there (the
+   2026-09-15 incident this closes ran with `mcp.tool_call` at 180s).
+
+**`connect()` now self-heals a genuinely-empty quarantine automatically.**
+When a durable `lease_reconciliation` marker (`required: true`) is present,
+`connect()` attempts `reconcile_inbox_polling()` once, before refusing. If
+the reconcile call proves the attempt is a terminal tombstone
+(empty/cancelled/expired) with nothing consumed and nothing staged in
+`reply_outbox` for whatever source it may have held, the marker clears and
+`connect()` proceeds normally — no operator action needed. `connect()`
+refuses, exactly as before, only for a genuine countercase: a reply is still
+staged for the pending source, the marker predates v3 or belongs to a
+different profile owner, the tenant/agent/seat readback no longer matches,
+or the reconciliation RPC itself fails (network, malformed response). Those
+still require the manual procedure below.
+
+**`mupot_gateway_status` now reports the marker.** Its payload gained
+`connected` (whether the adapter is actually polling right now) and
+`lease_reconciliation` (`null` when no marker is present; otherwise
+`{required, version, attempt_id, connect_will_attempt_auto_reconcile}`) —
+before this, a fully-quarantined adapter that could never `connect()` still
+reported `{"ok": true}` with no way to see why nothing was being received.
+
+**Manual procedure, when the marker survives an automatic `connect()`
+attempt (or you need to clear it without restarting):**
+
+1. Call `mupot_gateway_status`. If `lease_reconciliation` is non-null, note
+   its `attempt_id` and whether `connect_will_attempt_auto_reconcile` is
+   `true` (that field mirrors `_lease_quarantined`; a `false` here alongside
+   a non-null marker means the marker predates v3 or fails an owner check
+   and will never self-heal — skip straight to restoring a known-good
+   `state.json` for that case).
+2. If `connect_will_attempt_auto_reconcile` is `true`, the next
+   `connect()` (a normal gateway restart, or however your deployment
+   triggers a reconnect) will attempt reconciliation on its own — try that
+   first before anything more invasive.
+3. If it still does not clear (logged as `"inbox reconciliation preserved"`
+   or `"inbox attempt reconciliation failed"`), a real countercase holds.
+   Read the log line: a preserved reply means a reply is genuinely still
+   staged for the pending source and needs human review of the retained
+   `state.json`'s `reply_outbox`/`pending` entries before anything is
+   discarded; a failed readback means the current `inbox_consumer_status`
+   no longer matches what the marker recorded (profile/tenant/seat/mode
+   changed) and needs an operator to confirm which is authoritative before
+   editing state by hand.
 
 ## Suspension, revocation, and rollback
 

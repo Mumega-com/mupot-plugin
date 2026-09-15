@@ -371,6 +371,89 @@ async def test_terminal_attempt_tombstone_clears_without_processing_or_ack(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["empty", "cancelled", "expired"])
+async def test_terminal_attempt_tombstone_drops_stale_unstaged_pending(
+    tmp_path: Path,
+    state: str,
+) -> None:
+    """Class fix (2026-09-15, see _LeaseExpiredDeferred): a terminal, unconsumed
+    tombstone whose local `pending` points at a source with NO reply_outbox
+    record (the clean case -- nothing was ever staged for it) clears the fence
+    AND drops the stale `pending`, exactly as the genuinely-empty case above.
+    `pending` can never resume once the attempt tombstones server-side, so
+    leaving it would fence an unrelated future crash as ambiguous for no reason.
+    """
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    saved = StateStore(state_path).load()
+    saved["pending"] = {"message": {"id": "orphaned-source"}}
+    StateStore(state_path).save(saved)
+    client = AttemptClient(
+        reconcile_outcome=attempt_result(attempt_id, state),
+    )
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "allowed_agents": "hadi-codex",
+                "lease_seconds": 30,
+                "poll_interval": 0.01,
+                "state_path": str(state_path),
+            },
+        ),
+        client_factory=lambda *_: client,
+    )
+
+    assert await adapter.reconcile_inbox_polling() is True
+    final = StateStore(state_path).load()
+    assert final.get("lease_reconciliation") is None
+    assert final.get("pending") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["empty", "cancelled", "expired"])
+async def test_terminal_attempt_tombstone_preserves_fence_when_reply_staged(
+    tmp_path: Path,
+    state: str,
+) -> None:
+    """Countercase for the class fix above: when `reply_outbox` still holds a
+    record for the source the local `pending` points at, the attempt itself
+    may be gone, but the reply's fate is not provably safe to abandon -- a
+    later `_replay_reply_outbox` could transmit or ack using ownership tied
+    to an attempt this call just tombstoned. This MUST stay fail-closed:
+    `reconcile_inbox_polling()` returns False and the marker survives.
+    """
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    saved = StateStore(state_path).load()
+    saved["pending"] = {"message": {"id": "staged-source"}}
+    saved["reply_outbox"] = {"staged-source": {"status": "prepared"}}
+    StateStore(state_path).save(saved)
+    client = AttemptClient(
+        reconcile_outcome=attempt_result(attempt_id, state),
+    )
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "allowed_agents": "hadi-codex",
+                "lease_seconds": 30,
+                "poll_interval": 0.01,
+                "state_path": str(state_path),
+            },
+        ),
+        client_factory=lambda *_: client,
+    )
+
+    assert await adapter.reconcile_inbox_polling() is False
+    final = StateStore(state_path).load()
+    assert isinstance(final.get("lease_reconciliation"), dict)
+    assert final["lease_reconciliation"]["attempt_id"] == attempt_id
+    assert final.get("pending") == {"message": {"id": "staged-source"}}
+    assert final.get("reply_outbox") == {"staged-source": {"status": "prepared"}}
+
+
+@pytest.mark.asyncio
 async def test_exact_leased_attempt_is_processed_and_acked_before_clear(
     tmp_path: Path,
 ) -> None:

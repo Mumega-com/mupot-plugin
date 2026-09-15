@@ -190,7 +190,8 @@ class _DeliveryDeferred(Exception):
     | --- | --- | --- | --- |
     | **Delivered** | Handler succeeds with human custody -- OR a `handler_error` whose error reply already reached the human WITH custody (`reply_outbox[id]` staged, non-`"complete"`, when `_resolve_turn_failure` runs -- Hermes's own crash handler calls `send()` before the outcome is known) | `processed` list + `reply_outbox[id].status="complete"`; `pending: null` once `_replay_reply_outbox` completes it on the NEXT tick (see `_TurnFailureDeferred`'s custody guard: `pending` is deliberately left set for exactly one more tick so that replay can match it) | `_process_leased_message`'s "already processed" short-circuit; operator via `processed`/`terminal_receipts` |
     | **Deferred** | Message's own lease expired before ACK (turn not at fault) | `pending: null` (cleared -- nothing here was ever candidate reply-outbox custody); no `lease_reconciliation` marker | Poll loop releases the lease and continues; server redelivers. `connect()`'s `_legacy_pending_ambiguous` check confirms `pending` is clean on restart |
-    | **Failed-bounded** | Turn exceeds `turn_timeout` with the lease still live; handler returns no custody; handler raises WITHOUT the error reply ever reaching custody (`no_custody`/`handler_error`-without-custody, see the Delivered row for the custody case); a successful handler whose reply `send` itself fails and never reaches custody (`reply_send_failed`, bounded independently of the message's own `delivery_attempts` -- see `_bound_reply_send_failure`) | Below `max_delivery_attempts` (default `_SERVER_MAX_DELIVERY_ATTEMPTS`): `pending` cleared (round 5: held ONLY by genuine custody -- `self._reply_outbox_has_custody`, never by a merely non-`"complete"` status), `_TurnFailureDeferred` raised, no ack. At the cap: `dlq` entry `{message, reason}` appended ONLY when custody was never achieved (idempotent; round 5, Athena MED 3a -- a custodied reply at the cap is Delivered, not DLQ'd), `pending` cleared (same custody guard), source is **NOT acked** -- an ack sets `read_at`, which the pot's own reaper requires `NULL` to ever set `dead_lettered_at` -- `_TurnFailureDeferred(terminal=True)` raised instead so the lease is left to expire naturally and the pot's own reaper (which runs on every subsequent `inbox_lease` call for this agent, before leasing) dead-letters it server-side. `_process_leased_message` skips (no turn, no ack) any message id already carrying one of this class's `dlq` rows, bounding local re-execution even against a server that never reaps (round 5, Athena MED 3b/3c) | `adapter.turn_failure_dlq_summary()` (excludes ids already in `processed`) / `mupot_gateway_status`'s `turn_failure_dlq` field; poll loop releases the lease and continues exactly like any other deferral -- it never blocks on this class |
+    | **Failed-bounded** | Turn exceeds `turn_timeout` with the lease still live; handler returns no custody; handler raises WITHOUT the error reply ever reaching custody (`no_custody`/`handler_error`-without-custody, see the Delivered row for the custody case) | Below `max_delivery_attempts` (default `_SERVER_MAX_DELIVERY_ATTEMPTS`): `pending` cleared (round 5: held ONLY by genuine custody -- `self._reply_outbox_has_custody`, never by a merely non-`"complete"` status), `_TurnFailureDeferred` raised, no ack. At the cap: `dlq` entry `{message, reason}` appended ONLY when custody was never achieved (idempotent; round 5, Athena MED 3a -- a custodied reply at the cap is Delivered, not DLQ'd), `pending` cleared (same custody guard), source is **NOT acked** -- an ack sets `read_at`, which the pot's own reaper requires `NULL` to ever set `dead_lettered_at` -- `_TurnFailureDeferred(terminal=True)` raised instead so the lease is left to expire naturally and the pot's own reaper (which runs on every subsequent `inbox_lease` call for this agent, before leasing) dead-letters it server-side. `_process_leased_message` skips (no turn, no ack) any message id already carrying one of this class's `dlq` rows (`reason="already_dead_lettered"` if a non-conforming server keeps re-leasing it anyway), bounding local re-execution even against a server that never reaps (round 5, Athena MED 3b/3c; round 6: this skip's own evidence is a dedicated, independently-capped `turn_failure_ids` set, not the tail of the shared `dlq[-100:]` window, so 100+ unrelated later DLQ rows cannot evict it -- see `_has_local_turn_failure_dlq`) | `adapter.turn_failure_dlq_summary()` (excludes ids already in `processed`) / `mupot_gateway_status`'s `turn_failure_dlq` field; poll loop releases the lease and continues exactly like any other deferral -- it never blocks on this class |
+    | **Stuck reply** (round 6) | A successful handler whose reply the peer `send` call itself could never deliver -- zero custody, bounded by `_bound_reply_send_failure`'s own local `send_attempts` counter on the `reply_outbox` record itself, independent of the message's `delivery_attempts` (the server never re-leases a message this process still holds) | Below the cap: record stays `"prepared"`, `send_attempts` incremented via `_persist_reply_record` (load_checked + readback), next `_replay_reply_outbox` tick retries. At the cap: status transitions to `"send_failed"` IN PLACE -- receipt untouched (always `None`, it never reached the peer), record KEPT (never popped, never DLQ'd) so an operator can see and reconcile it by hand; `pending` cleared if it still names this source. `_replay_reply_outbox` never auto-retries a `"send_failed"` record (skipped outright) -- this is the one outcome in this table an operator, not a bounded retry, resolves | `mupot_gateway_status`'s `stuck_replies` field; poll loop never blocks on this class either (`_replay_reply_outbox` attempts at most one send per `"prepared"` record per tick, then always proceeds to `_flush_notifications`/`inbox_lease` the same tick) |
     | **Violation** | Owner fingerprint mismatch, attempt/tenant conflict, tampered state, "processed" never set despite a successful ack (`_protocol_error()`) | `lease_reconciliation` marker (`required: true`, version 1/2/3) | `adapter.lease_reconciliation_status()` / `mupot_gateway_status`'s `lease_reconciliation` field; `connect()` refuses (self-heals once via `reconcile_inbox_polling()` for a genuine tombstone, else needs the manual runbook procedure) |
     """
 
@@ -418,12 +419,12 @@ class _TurnFailureDeferred(_DeliveryDeferred):
     quarantine, no DLQ, no operator signal, just one lease ever and
     `mupot_gateway_status` reporting fully healthy. Fix: the ONLY thing
     that may hold `pending` here is genuine custody --
-    `self._reply_outbox_has_custody(message_id)` (status `"custodied"`/
-    `"complete"` with a receipt -- deliberately narrower than
-    `_reply_has_human_custody`, which also requires a durable
-    notification record; see that helper's docstring for why the extra
-    condition does not belong in THIS guard). A `"prepared"` reply that
-    cannot be sent is therefore always
+    `self._reply_outbox_has_custody(message_id)` (status `"sent"`/
+    `"custodied"`/`"complete"` with a receipt -- ONE definition, round 6;
+    see that method's docstring for why the round-5 version of this
+    predicate, and the separate `_reply_has_human_custody` it has since
+    been merged into and replaced, were too narrow). A `"prepared"` reply
+    that cannot be sent is therefore always
     Failed-bounded, same as any other no-custody turn failure: below
     `max_delivery_attempts`, `pending` clears and the lease is left to
     expire for natural redelivery, same as before. What is new is
@@ -432,19 +433,21 @@ class _TurnFailureDeferred(_DeliveryDeferred):
     message's own `delivery_attempts` never moves (the server cannot
     re-lease a message this process is still holding) -- see
     `_bound_reply_send_failure` for that local counter, capped at the same
-    `max_delivery_attempts` semantics, DLQ'd as `reply_send_failed` and its
-    orphaned `reply_outbox` record dropped once exhausted, so the poll loop
-    resumes leasing instead of quarantining or looping forever on a reply
-    that will never gain custody through this attempt.
+    `max_delivery_attempts` semantics. Round 6: at the cap, the record now
+    transitions to `"send_failed"` IN PLACE (never dropped, never DLQ'd --
+    see that method) so the poll loop resumes leasing instead of
+    quarantining or looping forever on a reply that will never gain
+    custody through this attempt.
 
     `no_custody`/`turn_timeout` cannot reach `_notify_turn_error` (Hermes
     only calls it from its own handler-exception catch), and `no_custody`
-    can by construction never BE custodied (`_reply_has_human_custody`
-    false -- which `_reply_outbox_has_custody` false always implies -- is
-    exactly how `_deliver` decides to classify it `no_custody` in the
-    first place) -- so the custody guard is a genuine no-op for those
+    can by construction never BE custodied (`_reply_outbox_has_custody`
+    false is exactly how `_deliver` decides to classify it `no_custody` in
+    the first place) -- so the custody guard is a genuine no-op for those
     `kind`s under this predicate: it can only ever hold `pending` for the
-    `handler_error`-with-custody race the round-4 fix targeted, never mask
+    `handler_error`-with-custody race the round-4 fix targeted (and, round
+    6, the `"sent"`-but-not-yet-`"custodied"` race the Athena gate addendum
+    on head e0556d61 closed -- see `_reply_outbox_has_custody`), never mask
     a real crash-ambiguity case and never hold for an unsent reply.
 
     At the cap, `_deliver` still does not retry, but (round 4, MED "cap
@@ -1672,6 +1675,14 @@ class MupotAdapter(BasePlatformAdapter):
             "pending": pending,
             "processed": list(loaded.get("processed") or [])[-1000:],
             "dlq": list(loaded.get("dlq") or [])[-100:],
+            # Round 6 NEW-4 (kasra gate): dedicated, independently-capped
+            # evidence for `_has_local_turn_failure_dlq`'s skip -- see that
+            # method. Larger and separate from `dlq[-100:]` so 100+ later,
+            # unrelated DLQ rows (sender_policy, invalid_ack_envelope, a
+            # different message's own turn failure) can never evict a
+            # message id this adapter has already decided never to run
+            # locally again.
+            "turn_failure_ids": list(loaded.get("turn_failure_ids") or [])[-1000:],
             "terminal_receipts": list(loaded.get("terminal_receipts") or [])[-100:],
             "notification_outbox": dict(loaded.get("notification_outbox") or {}),
             "routine_event_receipts": copy.deepcopy(loaded_routine_receipts)
@@ -1711,6 +1722,10 @@ class MupotAdapter(BasePlatformAdapter):
         # connected; `mupot_gateway_status` surfaces this flag for exactly
         # that gap.
         self._reconciling = False
+        # Round 6 NEW-5: per-(site, key) last-logged monotonic timestamp for
+        # `_warn_rate_limited` -- per-instance, never persisted, cleared by
+        # process restart same as any other in-memory log-noise throttle.
+        self._warn_rate_limit: dict[str, float] = {}
         self._reply_state_invalid = not state_valid or not reply_outbox_valid
         self._routine_state_invalid = not state_valid or not routine_state_valid
         pending_routine_records: list[dict[str, Any]] = []
@@ -1766,6 +1781,52 @@ class MupotAdapter(BasePlatformAdapter):
         if self._secret_owner is None:
             return nullcontext()
         return self._secret_owner.activate()
+
+    def _warn_rate_limited(
+        self,
+        key: str,
+        message: str,
+        *args: Any,
+        window: float = 30.0,
+    ) -> None:
+        """Log `message` at WARNING at most once per `window` seconds per `key`.
+
+        Round 6 NEW-5 (kasra gate, LOW from the round-5 gate: ~1,226 WARNING
+        lines in 6 seconds against a non-reaping fake peer that keeps
+        re-leasing the same terminal message every poll tick). This changes
+        nothing about delivery, ack, DLQ, or custody -- purely how often the
+        SAME already-known fact is re-logged. Per-instance (not module-
+        level, unlike `_note_estop_pause_once`'s pause-window tracking):
+        several adapters can share this process in tests, and there is no
+        shared "window" concept to synchronize across them the way a single
+        global e-stop sentinel has.
+        """
+        now = time.monotonic()
+        last = self._warn_rate_limit.get(key)
+        if last is not None and now - last < window:
+            return
+        self._warn_rate_limit[key] = now
+        logger.warning(message, *args)
+
+    def stuck_replies(self) -> list[dict[str, Any]]:
+        """Operator-facing view of the Stuck-reply outcome (`send_failed`).
+
+        Round 6 NEW-1: `_bound_reply_send_failure` transitions a reply
+        that exhausted `max_delivery_attempts` peer `send` failures to
+        `"send_failed"` IN PLACE -- receipt untouched (always `None`, it
+        never reached the peer), record KEPT (never popped, never DLQ'd).
+        `_replay_reply_outbox` never auto-retries this status; an operator
+        finds it here and reconciles it by hand (see
+        `docs/telegram-onboarding-runbook.md`'s "Stuck reply" entry).
+        """
+        stuck = []
+        for source_id, record in self._state.get("reply_outbox", {}).items():
+            if isinstance(record, dict) and record.get("status") == "send_failed":
+                stuck.append({
+                    "source_id": source_id,
+                    "send_attempts": record.get("send_attempts"),
+                })
+        return stuck
 
     def stranded_notifications(self) -> list[dict[str, Any]]:
         """Notices parked in a terminal state that nothing else ever reconciles.
@@ -2273,6 +2334,13 @@ class MupotAdapter(BasePlatformAdapter):
                 "custodied",
                 "complete",
                 "reconciliation_required",
+                # Round 6 NEW-1 (kasra gate, head e0556d61): a terminal,
+                # never-auto-retried disposition for a `"prepared"` reply
+                # whose peer `send` failed `max_delivery_attempts` times --
+                # see `_bound_reply_send_failure`. Zero receipt, same as
+                # `"prepared"` (it never reached the peer); distinct status
+                # so an operator can tell "never tried yet" from "gave up".
+                "send_failed",
             }
             or (receipt is not None and not isinstance(receipt, dict))
         ):
@@ -2292,7 +2360,7 @@ class MupotAdapter(BasePlatformAdapter):
         ):
             raise _protocol_error()
         status = record["status"]
-        if status == "prepared" and receipt is not None:
+        if status in {"prepared", "send_failed"} and receipt is not None:
             raise _protocol_error()
         if status in {"sent", "custodied", "complete"}:
             validate_send_receipt(
@@ -2379,6 +2447,17 @@ class MupotAdapter(BasePlatformAdapter):
         record = self._validated_reply_record(source_id, record)
         if record["status"] == "reconciliation_required":
             raise _protocol_error()
+        if record["status"] == "send_failed":
+            # Round 6 NEW-1: terminal by design, never auto-retried.
+            # `_replay_reply_outbox` never calls this method for a
+            # `"send_failed"` record (it skips them outright, see that
+            # method) -- this branch only guards the OTHER caller, the live
+            # interim `send()` path, when a message carrying an already-
+            # exhausted reply is redelivered and handled again. Refuse
+            # before any network call; `send()`'s own generic exception
+            # handling turns this into an ordinary failed `SendResult`
+            # without touching the peer or this record.
+            raise _protocol_error()
         if record["status"] == "prepared":
             # Choke point for the peer `send` MCP tool (kasra-review re-gate
             # #3, 2026-09-14): `_replay_reply_outbox` calls this for a reply
@@ -2425,63 +2504,88 @@ class MupotAdapter(BasePlatformAdapter):
         if record["status"] == "sent":
             from .notifications import enqueue
 
-            enqueue(
-                self._state,
-                self.store,
-                record["source"],
-                record["arguments"]["body"],
-            )
-            # enqueue performs its own durable readback. Persisting this status
-            # after it means source consumption can require both custody proofs.
-            durable_record = self._state.get("reply_outbox", {}).get(source_id)
-            record = self._validated_reply_record(source_id, durable_record)
-            record = self._update_reply_record(
-                source_id,
-                record,
-                status="custodied",
-            )
+            # Athena gate addendum (head e0556d61, folded into round 6): the
+            # peer already CONFIRMED this reply (validated receipt on file,
+            # status already `"sent"`) -- only the local notification-
+            # durability tail runs here. A failure in it (e.g.
+            # `NotificationConflict` on an old `source_fingerprint_version`,
+            # live-reachable on kayhermes state) is a bounded local retry of
+            # the NOTIFICATION only, never a reply-state regression: this
+            # method does not raise for it, so neither `_replay_reply_
+            # outbox`'s per-tick call nor a live interim `send()` call ever
+            # sees an exception here, and the record simply stays `"sent"`
+            # for `_reply_outbox_has_custody` (which already treats `"sent"`
+            # as custody) until a later tick's `enqueue()` call succeeds.
+            try:
+                enqueue(
+                    self._state,
+                    self.store,
+                    record["source"],
+                    record["arguments"]["body"],
+                )
+            except Exception as exc:
+                self._warn_rate_limited(
+                    f"notification_enqueue:{source_id}",
+                    "[mupot] notification enqueue deferred for message=%s "
+                    "(reply already delivered to peer, receipt on file): %s",
+                    source_id,
+                    exc,
+                )
+            else:
+                # enqueue performs its own durable readback. Persisting this
+                # status after it means source consumption can require both
+                # custody proofs.
+                durable_record = self._state.get("reply_outbox", {}).get(source_id)
+                record = self._validated_reply_record(source_id, durable_record)
+                record = self._update_reply_record(
+                    source_id,
+                    record,
+                    status="custodied",
+                )
         final_receipt = record.get("receipt")
         if not isinstance(final_receipt, dict):
             raise _protocol_error()
         return final_receipt
 
-    def _reply_has_human_custody(self, source_id: str) -> bool:
-        record = self._state.get("reply_outbox", {}).get(source_id)
-        notice = self._state.get("notification_outbox", {}).get(source_id)
-        return bool(
-            isinstance(record, dict)
-            and record.get("status") in {"custodied", "complete"}
-            and isinstance(record.get("receipt"), dict)
-            and isinstance(notice, dict)
-            and notice.get("custody_status") == "durable"
-        )
-
     def _reply_outbox_has_custody(self, source_id: str) -> bool:
-        """Has the staged reply reached remote custody (a validated receipt
-        from the peer's own `send` acknowledgement)?
+        """Has the staged reply reached remote custody?
 
-        Deliberately narrower than `_reply_has_human_custody` above, which
-        ALSO requires `notification_outbox[...].custody_status ==
-        "durable"` -- a separate, downstream, in-process notification
-        concern. `_resolve_turn_failure`'s custody guard (round 5,
-        kasra-review P0) only needs to know whether the reply itself is
-        `"custodied"`/`"complete"` with a receipt: once Mupot's own `send`
-        has acknowledged it, the reply is delivered from the PEER's point
-        of view regardless of what this process's own notification
-        bookkeeping does with it afterwards, and `_replay_reply_outbox`'s
-        next tick is what carries it the rest of the way to
-        `_reply_has_human_custody` (transmit is a no-op once already
-        custodied; only the ack/commit/notification-durability tail runs).
-        A `"prepared"` (never transmitted -- zero custody) or `"sent"`
-        (peer confirmed, local `enqueue()` not yet run) record returns
-        `False` here, same as `_reply_has_human_custody` -- the divergence
-        is only for `"custodied"`/`"complete"` without (yet, or ever, if a
-        crash intervenes) a durable notification record.
+        ONE custody definition (Athena gate addendum on head e0556d61,
+        folded into round 6): the record holds a validated peer `send`
+        receipt -- status `"sent"`, `"custodied"`, or `"complete"`, each of
+        which `_validated_reply_record` already requires to carry one.
+        Previously this was TWO different predicates: this method accepted
+        only `"custodied"`/`"complete"`, while the (now-removed)
+        `_reply_has_human_custody` additionally required
+        `notification_outbox[...].custody_status == "durable"` -- a
+        separate, downstream, in-process notification-durability concern.
+        That extra requirement was the bug: a handler that succeeded, whose
+        reply the peer's own `send` CONFIRMED (status advances to
+        `"sent"`), whose only failure was the local `notifications.enqueue`
+        call afterwards (e.g. `NotificationConflict` on an old
+        `source_fingerprint_version`, live-reachable on kayhermes state)
+        reported `False` here -- "no custody" -- for a reply the peer
+        already has. `_resolve_turn_failure`'s guard then cleared `pending`
+        for a message that DID have a receipt on file, and the very next
+        `_replay_reply_outbox` tick found `pending` not matching a
+        receipt-bearing record and escalated to `reconciliation_required`:
+        fatal, `connect()` refused on every subsequent restart.
+
+        Once Mupot's own `send` has acknowledged a reply, it is delivered
+        from the PEER's point of view regardless of what this process's own
+        notification bookkeeping does with it afterwards -- `_transmit_
+        final_reply` itself is what carries a `"sent"` record the rest of
+        the way to `"custodied"` (retrying the local `enqueue()` on each
+        call; see that method), and a failure there is now a bounded local
+        retry of the notification only, never a reply-state regression. A
+        `"prepared"` or `"send_failed"` record (zero custody, never
+        transmitted or permanently unsendable) returns `False`, as does any
+        record without a receipt.
         """
         record = self._state.get("reply_outbox", {}).get(source_id)
         return bool(
             isinstance(record, dict)
-            and record.get("status") in {"custodied", "complete"}
+            and record.get("status") in {"sent", "custodied", "complete"}
             and isinstance(record.get("receipt"), dict)
         )
 
@@ -2498,35 +2602,72 @@ class MupotAdapter(BasePlatformAdapter):
         exc: BaseException,
     ) -> None:
         """Bound repeated peer `send` failures for a `"prepared"` (zero
-        custody, never transmitted) reply -- round 5 (kasra-review P0).
+        custody, never transmitted) reply.
 
-        The message's own `delivery_attempts` cannot bound this: the server
-        never re-leases a message this process is still holding, so that
-        counter does not move between one `_replay_reply_outbox` tick and
-        the next. This uses a purely local counter persisted on the record
-        itself (`send_attempts`, seeded at 0 by `_prepare_final_reply`),
-        capped with the SAME semantics as `max_delivery_attempts` (reuses
-        the identical config value, not a separate knob).
+        Round 6 (kasra gate, head e0556d61, NEW-1 P0): the round-5 version of
+        this method took the CALLER's loop-top `record` snapshot and blind-
+        wrote `dict(record)` back over the durable row on ANY exception --
+        including one raised (by `notifications.enqueue`, inside
+        `_transmit_final_reply`'s `"sent"` branch) AFTER the peer `send`
+        already succeeded and this same method's caller (`_replay_reply_
+        outbox`) had already persisted `status="sent"` + a validated
+        receipt. That stale snapshot overwrite silently regressed a
+        genuinely delivered reply back to `"prepared"`/`receipt: None` --
+        the peer could then receive the exact same `send` call again on the
+        next replay tick (bounded only by the peer's own `request_id`
+        dedup, never verified here). Fix: re-read the DURABLE record before
+        touching anything. If it already advanced past `"prepared"` (the
+        transmit landed and only some later step, e.g. notification
+        enqueue, raised), do nothing here at all -- there is nothing to
+        bound, and every other read of this record already treats a
+        receipt-bearing status as custody.
 
-        Below the cap: log and leave the record `"prepared"` -- the next
-        tick tries again, same as any other bounded deferral. At the cap:
-        this reply will never gain custody through this attempt. DLQ it
-        (`reason: "reply_send_failed"`, idempotent by message id), DROP the
-        `reply_outbox` record entirely (there is nothing to reconcile for a
-        reply that never reached custody -- unlike a genuine crash-time
-        `"prepared"`/`"sent"` artifact, this one has a known, certain
-        outcome: we ourselves just watched the `send` call fail), and clear
-        `pending` if it still names this source (it should already be
-        clear -- see `_resolve_turn_failure`'s custody guard -- but a
-        crash-recovery replay of a `"prepared"` record left over from
-        BEFORE this fix could still hold it). Dropping the record, not just
-        clearing `pending`, is what lets the poll loop resume leasing
-        immediately: an orphaned `"prepared"` record with `pending` cleared
-        is exactly what the mismatch check just above would otherwise
-        escalate to `reconciliation_required`.
+        The message's own `delivery_attempts` cannot bound the ordinary
+        case (peer `send` itself failing): the server never re-leases a
+        message this process is still holding, so that counter does not
+        move between one `_replay_reply_outbox` tick and the next. This
+        uses a purely local counter persisted on the record itself
+        (`send_attempts`, seeded at 0 by `_prepare_final_reply`), capped
+        with the SAME semantics as `max_delivery_attempts` (reuses the
+        identical config value, not a separate knob).
+
+        Below the cap: log (rate-limited, NEW-5) and leave the record
+        `"prepared"` -- the next tick tries again, same as any other
+        bounded deferral. At the cap: transition status to `"send_failed"`
+        IN PLACE -- never a `dict(record)` write-back, never a pop. The
+        receipt stays `None` (this reply never reached the peer); the
+        record is KEPT, not dropped, so an operator can see and reconcile
+        it via `mupot_gateway_status`'s `stuck_replies` field and the
+        existing reconcile procedure, same spirit as `lease_reconciliation`
+        for the inbox-lease side. `_replay_reply_outbox` never auto-retries
+        a `"send_failed"` record (see that method) so this status change
+        alone is what lets the poll loop resume leasing -- no DLQ append,
+        no drop required for that purpose.
         """
-        attempts = int(record.get("send_attempts") or 0) + 1
-        logger.warning(
+        durable, valid = self.store.load_checked()
+        if not valid:
+            raise _protocol_error()
+        durable_outbox = durable.get("reply_outbox")
+        durable_record = (
+            durable_outbox.get(source_id) if isinstance(durable_outbox, dict) else None
+        )
+        if not isinstance(durable_record, dict):
+            # Already resolved and removed by some other path (e.g. the
+            # source showed up in `processed` and `_mark_reply_complete`/
+            # cleanup ran first) -- nothing left here to bound.
+            return
+        validated = self._validated_reply_record(source_id, durable_record)
+        if validated["status"] in {"sent", "custodied", "complete"}:
+            # The transmit landed -- whatever raised happened AFTER a
+            # validated receipt was already persisted (e.g. the local
+            # notification-enqueue tail). Not this method's concern; the
+            # next `_replay_reply_outbox` tick carries it the rest of the
+            # way.
+            return
+        self._state = durable
+        attempts = int(validated.get("send_attempts") or 0) + 1
+        self._warn_rate_limited(
+            f"reply_send_failure:{source_id}",
             "[mupot] reply send failed for staged message=%s attempt=%s/%s: %s",
             source_id,
             attempts,
@@ -2534,31 +2675,21 @@ class MupotAdapter(BasePlatformAdapter):
             exc,
         )
         if attempts < self.max_delivery_attempts:
-            updated = dict(record)
+            updated = dict(validated)
             updated["send_attempts"] = attempts
             self._persist_reply_record(source_id, updated)
             return
         logger.warning(
             "[mupot] staged reply for message=%s reached max_delivery_attempts=%s "
-            "with zero custody -- dead-lettering locally (reason=reply_send_failed) "
-            "and dropping the unsendable reply_outbox record",
+            "with zero custody -- marking send_failed IN PLACE (receipt "
+            "untouched, record kept for operator reconciliation)",
             source_id,
             self.max_delivery_attempts,
         )
-        dlq = list(self._state.get("dlq") or [])
-        if not any(
-            str((entry.get("message") or {}).get("id") or "") == source_id
-            for entry in dlq
-        ):
-            source = record.get("source")
-            dlq.append({
-                "message": dict(source) if isinstance(source, dict) else {"id": source_id},
-                "reason": "reply_send_failed",
-            })
-        self._state["dlq"] = dlq[-100:]
-        outbox = self._state.get("reply_outbox")
-        if isinstance(outbox, dict):
-            outbox.pop(source_id, None)
+        updated = dict(validated)
+        updated["send_attempts"] = attempts
+        updated["status"] = "send_failed"
+        self._persist_reply_record(source_id, updated)
         pending = self._state.get("pending")
         pending_message = pending.get("message") if isinstance(pending, dict) else None
         if (
@@ -2566,7 +2697,7 @@ class MupotAdapter(BasePlatformAdapter):
             and str(pending_message.get("id") or "").strip() == source_id
         ):
             self._state["pending"] = None
-        self.store.save(self._state)
+            self.store.save(self._state)
 
     async def _replay_reply_outbox(self) -> None:
         outbox = self._state.get("reply_outbox")
@@ -2575,6 +2706,16 @@ class MupotAdapter(BasePlatformAdapter):
         for source_id in list(outbox):
             record = self._validated_reply_record(source_id, outbox[source_id])
             if record["status"] == "complete":
+                continue
+            if record["status"] == "send_failed":
+                # Round 6 (kasra gate, item 2/NEW-1): terminal by design --
+                # never retried automatically. Operator reconciliation is
+                # via `mupot_gateway_status`'s `stuck_replies` field and the
+                # existing reconcile procedure, not this loop. Skipping here
+                # (rather than attempting `_transmit_final_reply`, which
+                # would just raise `_protocol_error()` for this status) is
+                # what keeps this method from ever raising/stalling the
+                # poll tick for one of these records.
                 continue
             if record["version"] == _LEGACY_REPLY_OUTBOX_VERSION:
                 self._reply_reconciliation_required = True
@@ -2585,14 +2726,6 @@ class MupotAdapter(BasePlatformAdapter):
             if source_id in self._state.get("processed", []):
                 self._mark_reply_complete(source_id)
                 continue
-            pending = self._state.get("pending")
-            pending_message = pending.get("message") if isinstance(pending, dict) else None
-            pending_matches = (
-                isinstance(pending_message, dict)
-                and str(pending_message.get("id") or "").strip() == source_id
-                and _reply_source_fingerprint(pending_message)
-                == record["source_fingerprint"]
-            )
             if record["status"] == "prepared":
                 # Round 5 (kasra-review P0): a `"prepared"` reply has zero
                 # custody. `_resolve_turn_failure` never holds `pending` for
@@ -2606,11 +2739,20 @@ class MupotAdapter(BasePlatformAdapter):
                 # on `request_id`), so bound OUR OWN retries locally instead
                 # of escalating a known-safe state to
                 # `reconciliation_required`.
-                if pending_matches:
-                    await self._preflight_persisted_ownership(
-                        record["ack_ownership"],
-                        require_attempt=True,
-                    )
+                #
+                # Round 6 NEW-3 (kasra gate, regression of round-4 commit
+                # 6547fd8): this preflight must run before EVERY transmit
+                # attempt, unconditionally -- round 5 gated it on
+                # `pending_matches`, so a reply whose ownership no longer
+                # checks out (profile/consumer-fence drift) transmitted to
+                # the peer BEFORE ownership validation whenever `pending`
+                # had already been cleared, which is the COMMON shape for a
+                # `"prepared"` retry (see above). Restored to its original,
+                # unconditional placement.
+                await self._preflight_persisted_ownership(
+                    record["ack_ownership"],
+                    require_attempt=True,
+                )
                 try:
                     await self._transmit_final_reply(record)
                 except (_EstopDeferred, MupotProtocolError):
@@ -2619,15 +2761,27 @@ class MupotAdapter(BasePlatformAdapter):
                     await self._bound_reply_send_failure(source_id, record, exc)
                     continue
             else:
-                if not pending_matches:
-                    self._update_reply_record(
-                        source_id,
-                        record,
-                        status="reconciliation_required",
-                    )
-                    raise _protocol_error()
+                # Athena gate addendum (head e0556d61): the ONLY statuses
+                # that reach this branch are `"sent"`/`"custodied"` (every
+                # other status is filtered out above), and
+                # `_validated_reply_record` already REQUIRES a validated
+                # receipt for both -- `self._reply_outbox_has_custody(
+                # source_id)` is therefore unconditionally true here by
+                # construction. Round 5's mismatched-`pending` escalation to
+                # `reconciliation_required` for this branch is removed: it
+                # was reachable only for a record that ALWAYS had custody
+                # (the peer already has it, regardless of what this
+                # process's own `pending` bookkeeping says), so it could
+                # only ever misfire -- exactly the live P0 the addendum
+                # closed (a confirmed `"sent"` reply, `pending` cleared by
+                # an unrelated no-custody classification, escalated to a
+                # fatal, `connect()`-refusing state on the next tick). Complete
+                # it via the ordinary replay below. This call must never
+                # raise/stall the tick: `_transmit_final_reply`'s own
+                # `"sent"` branch bounds the local notification `enqueue()`
+                # retry internally (see that method) instead of propagating.
                 await self._transmit_final_reply(record)
-            if not self._reply_has_human_custody(source_id):
+            if not self._reply_outbox_has_custody(source_id):
                 raise _protocol_error()
             await self._ack_persisted_ownership(
                 source_id,
@@ -3335,17 +3489,43 @@ class MupotAdapter(BasePlatformAdapter):
                 return
             await asyncio.sleep(self.poll_interval)
 
+    def _mark_local_turn_failure(self, message_id: str) -> None:
+        """Record `message_id` as non-evictable evidence for `_has_local_
+        turn_failure_dlq` -- round 6 NEW-4 (kasra gate).
+
+        The round-5 predicate scanned `self._state["dlq"]`, which every
+        write site truncates to its last 100 entries
+        (`dlq[-100:]`). A message dead-lettered here, followed by 100+
+        LATER, unrelated `dlq` rows (another message's own turn failure,
+        `sender_policy`, `invalid_ack_envelope`) evicted its row from that
+        window, silently reopening the exact unbounded local re-execution
+        this skip exists to close (measured pre-round-5: 258 turns). This
+        set is capped independently, at 1000 (10x the `dlq` window), and
+        nothing else ever trims it early -- an id added here stays until
+        the cap itself rolls it off, long after any realistic `dlq` churn
+        would have evicted the corresponding row.
+        """
+        ids = self._state.setdefault("turn_failure_ids", [])
+        if message_id not in ids:
+            ids.append(message_id)
+        self._state["turn_failure_ids"] = ids[-1000:]
+
     def _has_local_turn_failure_dlq(self, message_id: str) -> bool:
         """Does this id already carry a LOCAL turn-failure dead-letter row?
 
-        Deliberately scoped to `_TURN_FAILURE_DLQ_REASONS` only -- other
-        `dlq` reasons (`sender_policy`, `invalid_ack_envelope`) are
-        permanent local policy decisions that intentionally DO ack after
-        DLQ'ing (see their own call sites); this predicate exists solely to
-        bound re-execution for the class of dead-letter this plugin
-        deliberately leaves unacked for the pot's own reaper (see
-        `_resolve_turn_failure`/`_bound_reply_send_failure`).
+        Round 6 NEW-4: reads the dedicated `turn_failure_ids` set first (see
+        `_mark_local_turn_failure`) -- independently capped, so 100+ later
+        DLQ rows for OTHER messages can never evict this id's evidence the
+        way the round-5 `dlq[-100:]` scan could. Also still scans `dlq`
+        itself (scoped to `_TURN_FAILURE_DLQ_REASONS` -- other reasons,
+        `sender_policy`/`invalid_ack_envelope`, are permanent local policy
+        decisions that intentionally DO ack after DLQ'ing, see their own
+        call sites) as a fallback for state written by a pre-round-6
+        process that never populated the new set.
         """
+        turn_failure_ids = self._state.get("turn_failure_ids")
+        if isinstance(turn_failure_ids, list) and message_id in turn_failure_ids:
+            return True
         for entry in self._state.get("dlq") or []:
             if not isinstance(entry, dict) or entry.get("reason") not in _TURN_FAILURE_DLQ_REASONS:
                 continue
@@ -3385,21 +3565,48 @@ class MupotAdapter(BasePlatformAdapter):
                 "emergency stop is engaged",
             )
             raise _EstopDeferred(message_id)
+        if is_routine_event_candidate(message):
+            if self.routine_events_enabled:
+                await self._handle_routine_event(message, attempt_id=attempt_id)
+            else:
+                quarantine_routine_event(
+                    self._state, self.store, message, "routine_events_disabled"
+                )
+                await self._ack_expected(message_id, attempt_id=attempt_id)
+                self._commit(message_id)
+            return
+        if message_id in self._state["processed"]:
+            # Round 6 NEW-4 (kasra gate): this short-circuit MUST run before
+            # the local-turn-failure-dlq skip below. An id can end up in
+            # BOTH `processed` (it later completed through the ordinary
+            # reply-replay flow) AND carrying a stale turn-failure `dlq`/
+            # `turn_failure_ids` entry from an earlier attempt (`dlq` rows
+            # are not retroactively removed on later success -- see
+            # `turn_failure_dlq_summary`'s own defense-in-depth exclusion).
+            # With the skip checked first (as round 5 had it), such an id
+            # could NEVER be re-acked: every redelivery hit the skip branch
+            # below, which raises without acking, forever. Checking
+            # `processed` first means a message that later succeeded is
+            # always re-acked normally, regardless of what its `dlq`
+            # history says.
+            await self._ack_expected(message_id, attempt_id=attempt_id)
+            return
         if self._has_local_turn_failure_dlq(message_id):
             # Round 5 (Athena MED 3b/3c): `_resolve_turn_failure`'s at-cap
-            # branch and `_bound_reply_send_failure`'s own cap deliberately
-            # leave this row UNACKED for the pot's own reaper to
-            # dead-letter server-side (see both docstrings) -- this plugin
-            # trusts the server's `leasable` predicate to stop handing it
-            # out once the reaper marks it. A non-conforming server that
-            # keeps re-leasing this id anyway must not get another local
-            # turn: that would be unbounded local re-execution against a
-            # message we already know can never gain custody through this
-            # path (measured: 258 turns before this fix). Skip it entirely
-            # -- no new turn, no ack (acking is still not this process's
-            # call to make; it would set `read_at` and defeat the reaper's
-            # own `IS NULL` gate) -- and leave the lease to expire.
-            logger.warning(
+            # branch deliberately leaves this row UNACKED for the pot's own
+            # reaper to dead-letter server-side (see its docstring) -- this
+            # plugin trusts the server's `leasable` predicate to stop
+            # handing it out once the reaper marks it. A non-conforming
+            # server that keeps re-leasing this id anyway must not get
+            # another local turn: that would be unbounded local
+            # re-execution against a message we already know can never
+            # gain custody through this path (measured: 258 turns before
+            # this fix). Skip it entirely -- no new turn, no ack (acking is
+            # still not this process's call to make; it would set
+            # `read_at` and defeat the reaper's own `IS NULL` gate) -- and
+            # leave the lease to expire.
+            self._warn_rate_limited(
+                f"local_turn_failure_dlq_skip:{message_id}",
                 "[mupot] leased message=%s already carries a local turn-"
                 "failure dead-letter; skipping without ack, leaving it for "
                 "the pot's own reaper",
@@ -3416,19 +3623,6 @@ class MupotAdapter(BasePlatformAdapter):
             raise _TurnFailureDeferred(
                 message_id, "already_dead_lettered", terminal=True
             )
-        if is_routine_event_candidate(message):
-            if self.routine_events_enabled:
-                await self._handle_routine_event(message, attempt_id=attempt_id)
-            else:
-                quarantine_routine_event(
-                    self._state, self.store, message, "routine_events_disabled"
-                )
-                await self._ack_expected(message_id, attempt_id=attempt_id)
-                self._commit(message_id)
-            return
-        if message_id in self._state["processed"]:
-            await self._ack_expected(message_id, attempt_id=attempt_id)
-            return
         if is_ack_envelope(message) and should_accept_message(
             message, self.allowed_agents
         ):
@@ -3713,10 +3907,13 @@ class MupotAdapter(BasePlatformAdapter):
             runtime.outcome or ProcessingOutcome.FAILURE,
         )
         if runtime.outcome == ProcessingOutcome.SUCCESS:
-            if not self._reply_has_human_custody(message_id):
+            if not self._reply_outbox_has_custody(message_id):
                 # Hermes treats an empty response as a successful no-op. A
                 # peer request is not consumable until a terminal ACK has a
-                # concrete Mupot receipt and its human notice has custody.
+                # concrete Mupot receipt (the peer's own `send`
+                # acknowledgement -- see `_reply_outbox_has_custody`'s
+                # merged custody definition, Athena gate addendum on head
+                # e0556d61).
                 #
                 # Round 2 (kasra-review re-gate WARN): this used to be a bare
                 # `return` -- unacked, unprocessed, and NOT raised as a
@@ -3832,6 +4029,10 @@ class MupotAdapter(BasePlatformAdapter):
             ):
                 dlq.append({"message": dict(message), "reason": kind})
             self._state["dlq"] = dlq[-100:]
+            # Round 6 NEW-4: this id's local-turn-failure evidence must
+            # outlive `dlq[-100:]`'s own eviction window -- see
+            # `_mark_local_turn_failure`/`_has_local_turn_failure_dlq`.
+            self._mark_local_turn_failure(message_id)
             self._state["pending"] = None
         self.store.save(self._state)
         raise _TurnFailureDeferred(message_id, kind, terminal=True)
@@ -4230,6 +4431,9 @@ def register(
                 "lease_reconciliation": adapter.lease_reconciliation_status(),
                 "stranded_notifications": adapter.stranded_notifications(),
                 "turn_failure_dlq": adapter.turn_failure_dlq_summary(),
+                # Round 6 NEW-1: the Stuck-reply outcome (`send_failed`) --
+                # see `stuck_replies()` and the runbook's own entry for it.
+                "stuck_replies": adapter.stuck_replies(),
             }
         return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
 

@@ -2323,6 +2323,8 @@ def test_gateway_status_survives_real_hermes_registry_dispatch(tmp_path: Path) -
         # lease_reconciliation_status()) so an operator can see a durable
         # quarantine here instead of only in state.json. `reconciling`/
         # `turn_failure_dlq` added round 2, 2026-09-15 (items 6/2).
+        # `stuck_replies` added round 6, 2026-09-15 (NEW-1) -- the
+        # `"send_failed"` outcome's operator-facing surface.
         assert result == {
             "ok": True,
             "connected": False,
@@ -2330,6 +2332,7 @@ def test_gateway_status_survives_real_hermes_registry_dispatch(tmp_path: Path) -
             "lease_reconciliation": None,
             "stranded_notifications": [],
             "turn_failure_dlq": [],
+            "stuck_replies": [],
         }
     finally:
         registry.deregister(tool_name)

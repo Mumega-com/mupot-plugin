@@ -485,7 +485,29 @@ has happened yet".
   cap (round 4): this adapter does not ack, so the message is deliberately
   NOT `processed` locally — the pot's own reaper resolves the dead-letter
   server-side once the row's lease naturally expires; there is nothing in
-  `state.json` for an operator to safely touch here either way.
+  `state.json` for an operator to safely touch here either way. If the SAME
+  source id is later re-leased by a non-conforming server anyway, this
+  adapter's own local skip logs it (once per window) and dead-letters it
+  again as `already_dead_lettered` — that reason means "the pot re-sent a
+  row this process already gave up on," not a new failure kind. Because the
+  ack never happened, the pot's own record for this row still reads "never
+  read" while this adapter's local `dlq`/`turn_failure_dlq_summary()` shows
+  the turn actually RAN and failed — two true facts describing the same
+  row from two different systems, not a contradiction to reconcile away.
+- **Stuck reply (`send_failed`, round 6)** — distinct from Failed-bounded
+  above: a successful handler whose reply the peer `send` call itself could
+  never deliver, bounded by `_bound_reply_send_failure`'s own local
+  `send_attempts` counter (independent of the message's `delivery_attempts`
+  — the server never re-leases a message this process still holds). Call
+  `mupot_gateway_status`; read `stuck_replies` for `{source_id,
+  send_attempts}`. This status is **never retried automatically** —
+  `_replay_reply_outbox` skips it outright — so it stays visible until an
+  operator reconciles it by hand (confirm with the peer/human whether the
+  reply content is still needed, then either accept the loss or re-drive it
+  through the ordinary send path as a new message; there is no in-place
+  "retry" tool for a `send_failed` record by design, to avoid silently
+  reintroducing the exact bounded-retry loop this status exists to stop).
+  The receipt is always `null` for this status — it never reached the peer.
 - **Violation** — the manual procedure above; this is the ONLY class where
   reading (and, in the documented last-resort case, editing) `state.json`
   by hand is ever the correct next step.

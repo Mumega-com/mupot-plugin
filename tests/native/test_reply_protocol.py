@@ -16,6 +16,7 @@ from plugin.mupot_gateway.adapter import (
     MupotProtocolError,
     MupotTransportError,
     StateStore,
+    _TurnFailureDeferred,
 )
 
 
@@ -648,18 +649,33 @@ async def _record_model(seen: list[str], message_id: str) -> str:
 async def test_missing_final_receipt_and_empty_output_never_authorize_source_consume(
     tmp_path: Path,
 ) -> None:
-    """Hermes success alone is insufficient without a concrete final send receipt."""
+    """Hermes success alone is insufficient without a concrete final send receipt.
+
+    Round 2 (kasra-review re-gate BLOCK-2/WARN, 2026-09-15): both of these
+    used to be a bare, unacked `return` -- which `_poll_loop` would have
+    folded into `_protocol_error()` -> `_quarantine_inbox_polling()` (this
+    test drives `_deliver` directly, so it never saw that consequence, only
+    the "never authorize consume" half of the property). Both are now
+    `_TurnFailureDeferred`, bounded by `delivery_attempts`, never a durable
+    quarantine: a failed final send surfaces to `handle_message`'s own
+    caller as `ProcessingOutcome.FAILURE` (kind="handler_error"); an empty
+    response with nothing sent is `ProcessingOutcome.SUCCESS` with no
+    custody (kind="no_custody"). Neither acks the source either way."""
     malformed = ProtocolClient()
     malformed.malformed_receipt = True
     missing_receipt = adapter_at(tmp_path / "missing", malformed)
     missing_receipt.set_message_handler(lambda _event: _async_value("Final answer."))
-    await missing_receipt._deliver(source_message("missing-receipt"))
+    with pytest.raises(_TurnFailureDeferred) as excinfo:
+        await missing_receipt._deliver(source_message("missing-receipt"))
+    assert excinfo.value.kind == "handler_error"
     assert malformed.acked_ids == []
 
     empty_client = ProtocolClient()
     empty = adapter_at(tmp_path / "empty", empty_client)
     empty.set_message_handler(lambda _event: _async_value(""))
-    await empty._deliver(source_message("empty-output"))
+    with pytest.raises(_TurnFailureDeferred) as excinfo:
+        await empty._deliver(source_message("empty-output"))
+    assert excinfo.value.kind == "no_custody"
     assert empty_client.acked_ids == []
     assert empty_client.messages_by_key == {}
 

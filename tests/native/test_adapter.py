@@ -23,10 +23,14 @@ from plugin.mupot_gateway.adapter import (  # noqa: E402
     MupotAdapter,
     StateStore,
     _EstopDeferred,
+    _LeaseExpiredDeferred,
+    _TurnFailureDeferred,
+    _configured_mcp_tool_timeout,
     build_mupot_event,
     is_ack_envelope,
     is_terminal_ack,
 )
+import plugin.mupot_gateway.adapter as mupot_adapter_module
 
 
 FAKE_LEASE_EXPIRY = "2099-01-01T00:00:00.000Z"
@@ -365,6 +369,246 @@ def test_unscoped_message_gets_isolated_session() -> None:
     assert event.source.thread_id == "m-unscoped"
 
 
+def test_lease_seconds_defaults_to_turn_timeout_plus_mcp_tool_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Class fix (2026-09-15): before this, `lease_seconds` defaulted to
+    `turn_timeout + 60s` alone, smaller than `turn_timeout + mcp_tool_timeout`
+    whenever a real deployment's MCP tool budget exceeds 60s (the kayhermes
+    incident ran with it at 180s) -- a single slow-but-legitimate tool call
+    could then always outlive the lease. Pin the new formula and its knobs.
+
+    Item 7 (kasra-review re-gate round 2, 2026-09-15): `mcp_tool_timeout`'s
+    default now reads the mupot MCP server's own configured `timeout` (see
+    `_configured_mcp_tool_timeout`) instead of a hardcoded 300.0 -- pin that
+    with a monkeypatched reader so this test is deterministic regardless of
+    what a given test environment's own Hermes config happens to have for
+    the `mupot` MCP server (this repo's own dev config resolves it to 180.0,
+    confirmed by running this test unpatched).
+
+    OPEN-D (kasra re-gate round 3, 2026-09-15): also pins that an explicit
+    `lease_seconds` above the safe minimum is honored verbatim, while one
+    below it is clamped UP to the minimum (with a WARNING) rather than
+    honored -- see `explicit_lease_clamped` below."""
+    monkeypatch.setattr(
+        mupot_adapter_module, "_configured_mcp_tool_timeout", lambda _name: 300.0
+    )
+    default_adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "a.json")}),
+        client_factory=lambda *_: FakeMupotClient(),
+    )
+    assert default_adapter.turn_timeout == 300.0
+    assert default_adapter.mcp_tool_timeout == 300.0
+    assert default_adapter.lease_seconds == 300 + 300 + 60
+
+    monkeypatch.setattr(
+        mupot_adapter_module, "_configured_mcp_tool_timeout", lambda _name: 180.0
+    )
+    reads_configured_default = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "configured.json")}),
+        client_factory=lambda *_: FakeMupotClient(),
+    )
+    assert reads_configured_default.mcp_tool_timeout == 180.0
+    assert reads_configured_default.lease_seconds == 300 + 180 + 60
+
+    overridden = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "state_path": str(tmp_path / "b.json"),
+                "turn_timeout": 120,
+                "mcp_tool_timeout": 180,
+            },
+        ),
+        client_factory=lambda *_: FakeMupotClient(),
+    )
+    assert overridden.lease_seconds == 120 + 180 + 60
+
+    explicit_lease_honored = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "state_path": str(tmp_path / "c.json"),
+                "turn_timeout": 120,
+                "mcp_tool_timeout": 180,
+                # Above the safe minimum (120 + 180 + 60 = 360) -- must be
+                # honored exactly, not silently clamped to the minimum.
+                "lease_seconds": 500,
+            },
+        ),
+        client_factory=lambda *_: FakeMupotClient(),
+    )
+    assert explicit_lease_honored.lease_seconds == 500
+
+    # OPEN-D (kasra re-gate round 3, 2026-09-15): an explicit `lease_seconds`
+    # SMALLER than turn_timeout + mcp_tool_timeout + margin used to be
+    # honored verbatim -- a configuration that guarantees the message's own
+    # lease expires before a legitimately-slow turn can finish, on every
+    # single turn. Must clamp UP to the safe minimum instead, and log loudly
+    # about it (an operator who set it deliberately needs to know it didn't
+    # take effect).
+    with caplog.at_level(logging.WARNING, logger="plugin.mupot_gateway.adapter"):
+        explicit_lease_clamped = MupotAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "state_path": str(tmp_path / "d.json"),
+                    "turn_timeout": 120,
+                    "mcp_tool_timeout": 180,
+                    "lease_seconds": 42,
+                },
+            ),
+            client_factory=lambda *_: FakeMupotClient(),
+        )
+    assert explicit_lease_clamped.lease_seconds == 120 + 180 + 60
+    assert any(
+        "lease_seconds=42" in record.getMessage() and "clamping up" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_max_delivery_attempts_clamped_to_server_ceiling(tmp_path: Path) -> None:
+    """OPEN-D (kasra re-gate round 3, 2026-09-15): the server's own hard
+    ceiling on `delivery_attempts` before it stops redelivering entirely is
+    `MAX_DELIVERY_ATTEMPTS = 5` (mupot/src/agents/messages.ts:879). An
+    operator-configured `max_delivery_attempts` above that used to be
+    honored verbatim -- dead configuration past attempt 5, since the server
+    never delivers a 6th attempt for `_resolve_turn_failure` to see, leaving
+    it waiting forever for a `delivery_attempts` value that will never
+    arrive (no local DLQ row, no `mupot_gateway_status` visibility)."""
+    below_ceiling = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"state_path": str(tmp_path / "below.json"), "max_delivery_attempts": 4},
+        ),
+        client_factory=lambda *_: FakeMupotClient(),
+    )
+    assert below_ceiling.max_delivery_attempts == 4
+
+    above_ceiling = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"state_path": str(tmp_path / "above.json"), "max_delivery_attempts": 99},
+        ),
+        client_factory=lambda *_: FakeMupotClient(),
+    )
+    assert above_ceiling.max_delivery_attempts == 5
+    assert above_ceiling.max_delivery_attempts == mupot_adapter_module._SERVER_MAX_DELIVERY_ATTEMPTS
+
+
+def test_default_max_delivery_attempts_is_five_not_a_mutated_default(tmp_path: Path) -> None:
+    """M-A (kasra re-gate round 3, 2026-09-15): the unconfigured default for
+    `max_delivery_attempts` is a named-constant fallback
+    (`... or _SERVER_MAX_DELIVERY_ATTEMPTS`) inside the constructor -- a
+    mutation of that constant's value is invisible to any test that reads
+    the count back off `adapter.max_delivery_attempts` itself (both sides of
+    the assertion see the SAME mutated value) OR compares it against the
+    constant by name. Pin the literal directly instead.
+
+    Round 4 (Athena second eye, head c68e0839, MED "cap surface"): the
+    default changed from a bare `3` to `_SERVER_MAX_DELIVERY_ATTEMPTS`
+    (currently `5`) -- an operator-configured local cap smaller than the
+    server's own dead-letter ceiling let this adapter DLQ a message the
+    server would have redelivered for two more attempts, and (before the
+    at-cap no-ack fix, same round) acking at that smaller local cap
+    permanently prevented the server's own reaper from ever dead-lettering
+    the row itself."""
+    adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "state.json")}),
+        client_factory=lambda *_: FakeMupotClient(),
+    )
+    assert adapter.max_delivery_attempts == 5
+
+
+def test_lease_is_binding_boundary_classifies_as_turn_failure_not_lease_expiry() -> None:
+    """M-C / OPEN-D (kasra re-gate round 3, 2026-09-15): at an EXACT tie
+    between the turn's own deadline and its message's lease deadline,
+    `_lease_is_binding` must return `False` -- classified as a TURN failure
+    (`_TurnFailureDeferred`, bounded by `delivery_attempts` and DLQ'd at the
+    cap), not a lease expiry (`_LeaseExpiredDeferred`, retried unboundedly
+    by design). Neither reading is more "correct" at an exact tie; this
+    picks the side that fails BOUNDED rather than the side that fails OPEN
+    to unbounded redelivery. Pre-fix `<=` would have returned `True` here --
+    a pure boundary-value unit test on the static method itself, immune to
+    any floating-point/clock rounding an end-to-end `_deliver()` repro of
+    the same tie would be exposed to."""
+    assert MupotAdapter._lease_is_binding(100.0, 100.0) is False
+    assert MupotAdapter._lease_is_binding(100.0, 99.999999) is True
+    assert MupotAdapter._lease_is_binding(100.0, 100.000001) is False
+
+
+def test_configured_mcp_tool_timeout_reads_real_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OPEN-E (kasra re-gate round 3, 2026-09-15): this test used to assert
+    `_configured_mcp_tool_timeout("mupot") == 180.0` by reading THIS REPO'S
+    OWN ambient dev Hermes config (`~/.hermes/config.yaml` or equivalent) --
+    a real, silent CI hazard: any environment whose `mupot` MCP server
+    happens to be configured differently (or not configured at all --
+    `_DEFAULT_MCP_TOOL_TIMEOUT_SECONDS` is 300.0) fails this assertion for a
+    reason that has nothing to do with the code under test. Renamed (was
+    `..._reads_real_hermes_config`) and rewritten to inject its own config
+    via a monkeypatched `load_config`, matching the pattern already used by
+    `tests/native/test_mcp_transport.py`'s `install_transport` -- CI parity
+    with the ambient host is exactly what this fix rejects."""
+    from hermes_cli import config as config_module
+    from hermes_cli import mcp_config
+
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: {"mcp_servers": {"mupot": {"timeout": 180}}},
+    )
+    monkeypatch.setattr(mcp_config, "_resolve_mcp_server_config", lambda value: value)
+    assert _configured_mcp_tool_timeout("mupot") == 180.0
+
+
+def test_configured_mcp_tool_timeout_falls_back_when_server_unconfigured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Countercase: an MCP server name with no entry in `mcp_servers` must
+    not raise -- constructing an adapter must never fail just because
+    lease-sizing's default couldn't be read. Injects its own (empty) config,
+    same OPEN-E reasoning as the positive case above -- this must not depend
+    on whatever the host's ambient config happens to configure (or not)."""
+    from hermes_cli import config as config_module
+
+    monkeypatch.setattr(config_module, "load_config", lambda: {"mcp_servers": {}})
+    assert (
+        _configured_mcp_tool_timeout("a-server-name-nothing-configures")
+        == mupot_adapter_module._DEFAULT_MCP_TOOL_TIMEOUT_SECONDS
+        == 300.0
+    )
+
+
+def test_configured_mcp_tool_timeout_falls_back_when_configured_without_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OPEN-E: a server present in `mcp_servers` but missing an explicit
+    `timeout` key used to fall back to a DIFFERENT, smaller hardcoded number
+    (30.0) than the "server absent entirely" case (300.0) -- two unrelated
+    fallback values for two variants of the same "we don't actually know
+    this server's budget" situation, with the smaller one risking an
+    under-sized `lease_seconds` (see OPEN-D). Both fallbacks must now be the
+    SAME documented default."""
+    from hermes_cli import config as config_module
+    from hermes_cli import mcp_config
+
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: {"mcp_servers": {"mupot": {"url": "https://pot.example.invalid/mcp"}}},
+    )
+    monkeypatch.setattr(mcp_config, "_resolve_mcp_server_config", lambda value: value)
+    assert (
+        _configured_mcp_tool_timeout("mupot")
+        == mupot_adapter_module._DEFAULT_MCP_TOOL_TIMEOUT_SECONDS
+        == 300.0
+    )
+
+
 def test_terminal_ack_requires_no_explicit_reply_expectation() -> None:
     assert is_terminal_ack({"id": "ack-1", "kind": "ack", "expects_reply": False})
     assert not is_terminal_ack({"id": "ack-1", "kind": "ack"})
@@ -449,7 +693,12 @@ async def test_expired_leased_event_never_starts_model_work(tmp_path: Path) -> N
     adapter.set_message_handler(handler)
     expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
 
-    await adapter._deliver(delivery_message("expired", lease_expires_at=expired))
+    # Class fix (2026-09-15, see _LeaseExpiredDeferred): an already-expired
+    # lease is a deferral, not a silent no-op -- _deliver raises so callers
+    # (the poll loop, reconcile_inbox_polling) release the lease instead of
+    # quarantining.
+    with pytest.raises(_LeaseExpiredDeferred):
+        await adapter._deliver(delivery_message("expired", lease_expires_at=expired))
 
     assert handled == []
     assert client.sent == []
@@ -479,7 +728,19 @@ async def test_queued_event_expiry_cancels_session_before_model_start(tmp_path: 
     adapter._session_tasks[session_key] = blocker
     adapter._background_tasks.add(blocker)
     try:
-        await adapter._deliver(message)
+        # Class fix (2026-09-15, see _LeaseExpiredDeferred): the queued
+        # message's own runtime expires (via the turn-timeout wait) before
+        # the handler ever runs -- a deferral, not a silent no-op.
+        #
+        # Round 2 (kasra-review re-gate BLOCK-2, 2026-09-15): `message`
+        # carries no `lease_expires_at` at all (see `delivery_message`'s
+        # default), so `runtime.lease_deadline is None` -- the lease can
+        # never be the binding constraint here, only `turn_timeout` can be,
+        # so this is now `_TurnFailureDeferred(kind="turn_timeout")`, not a
+        # lease expiry (see `_lease_is_binding`).
+        with pytest.raises(_TurnFailureDeferred) as excinfo:
+            await adapter._deliver(message)
+        assert excinfo.value.kind == "turn_timeout"
         assert handled == []
         assert session_key not in adapter._pending_messages
         assert blocker.cancelled()
@@ -513,14 +774,39 @@ async def test_timeout_invalidates_generation_before_bounded_cancellation(
     adapter.set_message_handler(handler)
     adapter.cancel_session_processing = stuck_cancel
     started = time.monotonic()
-    await adapter._deliver(delivery_message("bounded-timeout"))
+    # Class fix (2026-09-15, see _LeaseExpiredDeferred): a genuine turn
+    # timeout is a deferral, not a silent no-op -- _deliver raises instead
+    # of returning.
+    #
+    # Round 2 (kasra-review re-gate BLOCK-2, 2026-09-15): `delivery_message`
+    # carries no `lease_expires_at`, so the lease can never be the binding
+    # constraint -- this is a turn that hung past its OWN `turn_timeout`
+    # with nothing to say about the lease at all, i.e. exactly the class
+    # `_TurnFailureDeferred` exists to name (kind="turn_timeout"), bounded
+    # by `delivery_attempts` rather than an unbounded `_LeaseExpiredDeferred`
+    # retry loop.
+    #
+    # Round 3 (kasra re-gate BLOCK-A, 2026-09-15): `pending` used to be
+    # pinned SET here on the theory that a hung handler might have taken
+    # real side effects worth fencing for a human as crash-ambiguity. That
+    # was itself the BLOCK-A defect: a below-cap `_TurnFailureDeferred` is
+    # not a crash -- it's this function returning cleanly enough to reach
+    # its own raise -- and leaving `pending` set reproduced the exact
+    # durable-brick shape this whole fix exists to close (next restart's
+    # `_legacy_pending_ambiguous` refusing `connect()` forever over a
+    # perfectly bounded, in-flight redelivery). `_resolve_turn_failure` now
+    # clears `pending` before raising, same as every other
+    # `_DeliveryDeferred` site; this test pins THAT invariant instead.
+    with pytest.raises(_TurnFailureDeferred) as excinfo:
+        await adapter._deliver(delivery_message("bounded-timeout"))
+    assert excinfo.value.kind == "turn_timeout"
     elapsed = time.monotonic() - started
 
     assert cancellation_started.is_set()
     assert registry_snapshots[0][1] == {}
     assert elapsed < 0.2
     pending = StateStore(tmp_path / "state.json").load()["pending"]
-    assert pending["message"]["id"] == "bounded-timeout"
+    assert pending is None
     await adapter.cancel_background_tasks()
 
 
@@ -631,7 +917,18 @@ async def test_timed_out_thread_callback_cannot_send_with_next_delivery_context(
     a = delivery_message("source-a", sender="hadi-codex", project="project-a")
     b = delivery_message("source-b", sender="kasra", project="project-b")
     try:
-        await adapter._deliver(a)
+        # Class fix (2026-09-15, see _LeaseExpiredDeferred): source-a's
+        # turn_timeout (0.05) is exhausted while its late thread callback is
+        # still blocked on `release_thread` -- a genuine turn timeout, now a
+        # deferral rather than a silent no-op.
+        #
+        # Round 2 (kasra-review re-gate BLOCK-2, 2026-09-15): `a` carries no
+        # `lease_expires_at`, so the lease can never be the binding
+        # constraint -- `turn_timeout` is, which is now
+        # `_TurnFailureDeferred(kind="turn_timeout")`, not a lease expiry.
+        with pytest.raises(_TurnFailureDeferred) as excinfo:
+            await adapter._deliver(a)
+        assert excinfo.value.kind == "turn_timeout"
         assert thread_ready.wait(1)
         adapter.turn_timeout = 1.0
         b_delivery = asyncio.create_task(adapter._deliver(b))
@@ -705,7 +1002,17 @@ async def test_late_same_source_redelivery_cannot_complete_new_generation(
         body="same body",
     )
     try:
-        await adapter._deliver(message)
+        # Class fix (2026-09-15, see _LeaseExpiredDeferred): the first
+        # delivery's turn_timeout (0.05) expires while its handler is still
+        # blocked -- a genuine turn timeout, now a deferral rather than a
+        # silent no-op.
+        #
+        # Round 2 (kasra-review re-gate BLOCK-2, 2026-09-15): `message`
+        # carries no `lease_expires_at`, so this is
+        # `_TurnFailureDeferred(kind="turn_timeout")`, not a lease expiry.
+        with pytest.raises(_TurnFailureDeferred) as excinfo:
+            await adapter._deliver(message)
+        assert excinfo.value.kind == "turn_timeout"
         adapter.turn_timeout = 1.0
         b_delivery = asyncio.create_task(adapter._deliver(dict(message)))
         await asyncio.wait_for(b_started.wait(), 1)
@@ -961,10 +1268,25 @@ async def test_poll_loop_retries_only_classified_safe_before_send_failure(
 
 
 @pytest.mark.asyncio
-async def test_reconstructed_adapter_stays_fenced_without_network(
+async def test_reconstructed_adapter_self_heals_via_connect_on_clean_tombstone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Class fix (2026-09-15, see connect()'s `self._lease_quarantined` handling).
+
+    Before this fix, `connect()` never attempted `reconcile_inbox_polling()` on its
+    own -- a `required: true` marker blocked every future `connect()` call forever,
+    across every operator restart, unless a human noticed and reconciled manually
+    (this is what made the live kayhermes incident, 2026-09-15, survive three
+    restarts). This test (renamed from
+    `test_reconstructed_adapter_stays_fenced_without_network`, which asserted the
+    OLD "zero network calls" behavior this fix intentionally changes) proves the
+    self-heal: a matching-scope marker whose attempt reconciles as a clean,
+    unconsumed tombstone (`"cancelled"`, `ReconciliationClient`'s default
+    `inbox_lease_reconcile` response, with no `pending`/`reply_outbox` residue)
+    now clears automatically and `connect()` proceeds -- real network calls
+    happen, and no operator action is required.
+    """
     state_path = await persist_ambiguous_lease_quarantine(tmp_path, monkeypatch)
     marker = StateStore(state_path).load().get("lease_reconciliation")
     assert isinstance(marker, dict)
@@ -985,10 +1307,85 @@ async def test_reconstructed_adapter_stays_fenced_without_network(
         client_factory=lambda *_: client,
     )
 
-    assert await reconstructed.connect() is False
-    assert client.connect_calls == 0
-    assert client.tools == []
-    assert client.lease_calls == 0
+    try:
+        assert await reconstructed.connect() is True
+    finally:
+        await reconstructed.disconnect()
+    assert client.connect_calls >= 1
+    assert client.tools[:2] == ["inbox_consumer_status", "inbox_lease_reconcile"]
+    assert StateStore(state_path).load().get("lease_reconciliation") is None
+    assert getattr(reconstructed, "_lease_quarantined", True) is False
+
+
+@pytest.mark.asyncio
+async def test_connect_reconciles_lease_marker_despite_ambiguous_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BLOCK-B (kasra re-gate round 3, 2026-09-15, head 7295e057): a restart
+    carrying BOTH a stale `pending` (ambiguous -- unrelated to any staged
+    reply) AND a v3 `lease_reconciliation` marker used to refuse at the
+    `_legacy_pending_ambiguous` check, which ran BEFORE the
+    `_lease_quarantined` auto-reconcile block in `_connect_with_active_scope`
+    -- so the marker's self-heal NEVER got a chance to run, even though
+    `lease_reconciliation_status()["connect_will_attempt_auto_reconcile"]`
+    reported `True`. Fixed two ways: (1) the reconcile attempt now runs
+    BEFORE the pending check, and (2) the pending check is re-evaluated live
+    (`_compute_legacy_pending_ambiguous()`) rather than off the stale
+    `__init__`-time snapshot, so it picks up
+    `_reconcile_inbox_polling_with_active_scope`'s own terminal-tombstone
+    branch dropping this exact unstaged `pending` as a side effect of the
+    SAME reconcile call. The result: this restart now self-heals BOTH
+    markers and `connect()` succeeds, in one call, with no operator action.
+    """
+    state_path = await persist_ambiguous_lease_quarantine(tmp_path, monkeypatch)
+    store = StateStore(state_path)
+    state = store.load()
+    assert state.get("lease_reconciliation") is not None
+    # An ambiguous `pending` unrelated to the marker's own attempt/source --
+    # no reply_outbox record exists for it, so nothing here is a candidate
+    # for custody the terminal-tombstone branch would need to preserve.
+    state["pending"] = {"message": {"id": "stray-crash-survivor"}}
+    store.save(state)
+
+    reconstructed_status = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
+        client_factory=lambda *_: ReconciliationClient(
+            {"agent_id": "agent-consumer", "mode": "bearer_only", "generation": 0,
+             "key_matches": True}
+        ),
+    )
+    assert reconstructed_status._legacy_pending_ambiguous is True, (
+        "constructor must still see the injected pending as ambiguous"
+    )
+    assert reconstructed_status._is_lease_reconcile_reachable() is True, (
+        "no other gate should block the reconcile attempt from being reachable"
+    )
+    status = reconstructed_status.lease_reconciliation_status()
+    assert status is not None
+    assert status["connect_will_attempt_auto_reconcile"] is True
+
+    client = ReconciliationClient(
+        {"agent_id": "agent-consumer", "mode": "bearer_only", "generation": 0,
+         "key_matches": True}
+    )
+    reconstructed = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
+        client_factory=lambda *_: client,
+    )
+    try:
+        assert await reconstructed.connect() is True, (
+            "BLOCK-B: the lease-marker self-heal must run (and the unstaged "
+            "pending must be dropped with it) despite the ambiguous pending "
+            "seen at construction"
+        )
+    finally:
+        await reconstructed.disconnect()
+    final = StateStore(state_path).load()
+    assert final.get("lease_reconciliation") is None
+    assert final.get("pending") is None
+    assert reconstructed._lease_quarantined is False
+    assert reconstructed._legacy_pending_ambiguous is False
 
 
 @pytest.mark.asyncio
@@ -1079,9 +1476,14 @@ async def test_postlease_save_failure_leaves_prelease_fence_for_restart(
         PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
         client_factory=lambda *_: reconstructed_client,
     )
+    # Class fix (2026-09-15): connect() now attempts reconcile_inbox_polling()
+    # once before refusing (see the self-heal test above) -- an empty status
+    # response has no matching mode/generation, so the readback mismatches
+    # and this marker stays fenced exactly as before, but no longer "without
+    # network": one real inbox_consumer_status readback attempt happens.
     assert await reconstructed.connect() is False
-    assert reconstructed_client.connect_calls == 0
-    assert reconstructed_client.tools == []
+    assert reconstructed_client.connect_calls == 1
+    assert reconstructed_client.tools == ["inbox_consumer_status"]
     assert reconstructed_client.lease_calls == 0
 
 
@@ -1184,8 +1586,12 @@ async def test_failed_reconciliation_readback_remains_durably_fenced(
     assert await reconcile() is False
     assert isinstance(StateStore(state_path).load().get("lease_reconciliation"), dict)
     assert getattr(reconstructed, "_lease_quarantined", False) is True
+    # Class fix (2026-09-15): connect() now attempts reconcile_inbox_polling()
+    # once before refusing, so this generation mismatch is rediscovered a
+    # second time (one more `inbox_consumer_status` readback) rather than
+    # zero times -- the marker still stays durably fenced either way.
     assert await reconstructed.connect() is False
-    assert client.tools == ["inbox_consumer_status"]
+    assert client.tools == ["inbox_consumer_status", "inbox_consumer_status"]
 
 
 @pytest.mark.asyncio
@@ -1913,6 +2319,20 @@ def test_gateway_status_survives_real_hermes_registry_dispatch(tmp_path: Path) -
             user_task="probe mupot_gateway_status",
         )
         result = json.loads(raw)
-        assert result == {"ok": True, "stranded_notifications": []}
+        # `connected`/`lease_reconciliation` added 2026-09-15 (see
+        # lease_reconciliation_status()) so an operator can see a durable
+        # quarantine here instead of only in state.json. `reconciling`/
+        # `turn_failure_dlq` added round 2, 2026-09-15 (items 6/2).
+        # `stuck_replies` added round 6, 2026-09-15 (NEW-1) -- the
+        # `"send_failed"` outcome's operator-facing surface.
+        assert result == {
+            "ok": True,
+            "connected": False,
+            "reconciling": False,
+            "lease_reconciliation": None,
+            "stranded_notifications": [],
+            "turn_failure_dlq": [],
+            "stuck_replies": [],
+        }
     finally:
         registry.deregister(tool_name)

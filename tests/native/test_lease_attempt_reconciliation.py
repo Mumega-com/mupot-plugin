@@ -157,7 +157,20 @@ def make_adapter(
             enabled=True,
             extra={
                 "allowed_agents": "hadi-codex",
-                "lease_seconds": 30,
+                # OPEN-D (kasra re-gate round 3, 2026-09-15): an explicit
+                # `lease_seconds` below turn_timeout + mcp_tool_timeout +
+                # margin is now clamped up (with a warning) rather than
+                # honored -- the old `"lease_seconds": 30` here (with
+                # turn_timeout/mcp_tool_timeout both left at their 300s
+                # defaults) always violated that, so it silently got
+                # clamped to 660s under the fix. This file is about lease-
+                # ATTEMPT reconciliation, not turn/tool timing, so pin
+                # turn_timeout/mcp_tool_timeout small and explicit instead
+                # (also sidesteps depending on whatever the ambient Hermes
+                # config resolves `mcp_tool_timeout` to -- see OPEN-E) and
+                # let `lease_seconds` default off them.
+                "turn_timeout": 1,
+                "mcp_tool_timeout": 1,
                 "poll_interval": 0.01,
                 "state_path": str(state_path),
             },
@@ -254,7 +267,10 @@ async def test_ambiguous_attempt_is_random_bounded_durable_and_reconciled_immedi
     assert first.calls[0] == ("inbox_consumer_status", {"strict_scope": True})
     assert first.calls[-1] == (
         "inbox_lease",
-        {"limit": 1, "lease_seconds": 30, "attempt_id": attempt_id},
+        # turn_timeout=1 floors to 10.0 (constructor's own hard floor),
+        # mcp_tool_timeout=1, + 60.0 margin (OPEN-D) = 71.0 -- see
+        # make_adapter's own comment for why this isn't 30 anymore.
+        {"limit": 1, "lease_seconds": 71, "attempt_id": attempt_id},
     )
 
     monkeypatch.setattr(time, "time", lambda: math.nan)
@@ -368,6 +384,101 @@ async def test_terminal_attempt_tombstone_clears_without_processing_or_ack(
     assert client.acked_ids == []
     assert not any(tool in {"inbox_ack", "inbox_lease_ack"} for tool, _ in client.calls)
     assert StateStore(state_path).load().get("lease_reconciliation") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["empty", "cancelled", "expired"])
+async def test_terminal_attempt_tombstone_drops_stale_unstaged_pending(
+    tmp_path: Path,
+    state: str,
+) -> None:
+    """Class fix (2026-09-15, see _LeaseExpiredDeferred): a terminal, unconsumed
+    tombstone whose local `pending` points at a source with NO reply_outbox
+    record (the clean case -- nothing was ever staged for it) clears the fence
+    AND drops the stale `pending`, exactly as the genuinely-empty case above.
+    `pending` can never resume once the attempt tombstones server-side, so
+    leaving it would fence an unrelated future crash as ambiguous for no reason.
+    """
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    saved = StateStore(state_path).load()
+    saved["pending"] = {"message": {"id": "orphaned-source"}}
+    StateStore(state_path).save(saved)
+    client = AttemptClient(
+        reconcile_outcome=attempt_result(attempt_id, state),
+    )
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "allowed_agents": "hadi-codex",
+                # OPEN-D (kasra re-gate round 3, 2026-09-15): see
+                # `make_adapter`'s own comment above -- pin turn_timeout/
+                # mcp_tool_timeout small and explicit and let lease_seconds
+                # default off them, rather than an explicit value the new
+                # safe-minimum clamp would silently override.
+                "turn_timeout": 1,
+                "mcp_tool_timeout": 1,
+                "poll_interval": 0.01,
+                "state_path": str(state_path),
+            },
+        ),
+        client_factory=lambda *_: client,
+    )
+
+    assert await adapter.reconcile_inbox_polling() is True
+    final = StateStore(state_path).load()
+    assert final.get("lease_reconciliation") is None
+    assert final.get("pending") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["empty", "cancelled", "expired"])
+async def test_terminal_attempt_tombstone_preserves_fence_when_reply_staged(
+    tmp_path: Path,
+    state: str,
+) -> None:
+    """Countercase for the class fix above: when `reply_outbox` still holds a
+    record for the source the local `pending` points at, the attempt itself
+    may be gone, but the reply's fate is not provably safe to abandon -- a
+    later `_replay_reply_outbox` could transmit or ack using ownership tied
+    to an attempt this call just tombstoned. This MUST stay fail-closed:
+    `reconcile_inbox_polling()` returns False and the marker survives.
+    """
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    saved = StateStore(state_path).load()
+    saved["pending"] = {"message": {"id": "staged-source"}}
+    saved["reply_outbox"] = {"staged-source": {"status": "prepared"}}
+    StateStore(state_path).save(saved)
+    client = AttemptClient(
+        reconcile_outcome=attempt_result(attempt_id, state),
+    )
+    adapter = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "allowed_agents": "hadi-codex",
+                # OPEN-D (kasra re-gate round 3, 2026-09-15): see
+                # `make_adapter`'s own comment above -- pin turn_timeout/
+                # mcp_tool_timeout small and explicit and let lease_seconds
+                # default off them, rather than an explicit value the new
+                # safe-minimum clamp would silently override.
+                "turn_timeout": 1,
+                "mcp_tool_timeout": 1,
+                "poll_interval": 0.01,
+                "state_path": str(state_path),
+            },
+        ),
+        client_factory=lambda *_: client,
+    )
+
+    assert await adapter.reconcile_inbox_polling() is False
+    final = StateStore(state_path).load()
+    assert isinstance(final.get("lease_reconciliation"), dict)
+    assert final["lease_reconciliation"]["attempt_id"] == attempt_id
+    assert final.get("pending") == {"message": {"id": "staged-source"}}
+    assert final.get("reply_outbox") == {"staged-source": {"status": "prepared"}}
 
 
 @pytest.mark.asyncio
@@ -563,7 +674,13 @@ async def test_same_server_scope_distinct_profile_owner_stays_fenced_without_net
             enabled=True,
             extra={
                 "allowed_agents": "hadi-codex",
-                "lease_seconds": 30,
+                # OPEN-D (kasra re-gate round 3, 2026-09-15): see
+                # `make_adapter`'s own comment above -- pin turn_timeout/
+                # mcp_tool_timeout small and explicit and let lease_seconds
+                # default off them, rather than an explicit value the new
+                # safe-minimum clamp would silently override.
+                "turn_timeout": 1,
+                "mcp_tool_timeout": 1,
                 "poll_interval": 0.01,
                 "state_path": str(state_path),
             },
@@ -689,7 +806,6 @@ async def test_reconciliation_uses_owning_profile_scope(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     owner = ScopeOwner()
     attempt_id, _first = await persist_v2_ambiguous(state_path, owner=owner)
-    owner.activations = 0
     client = ScopedAttemptClient(
         owner,
         reconcile_outcome=attempt_result(attempt_id, "cancelled"),
@@ -702,6 +818,13 @@ async def test_reconciliation_uses_owning_profile_scope(tmp_path: Path) -> None:
         client_factory=lambda *_: client,
         secret_owner=owner,  # type: ignore[arg-type]
     )
+    # BLOCK-C (kasra re-gate round 3, 2026-09-15): construction itself now
+    # activates the owning scope once too (to resolve `mcp_tool_timeout`
+    # inside it rather than the ambient environment -- see
+    # `_profile_scope()`'s own docstring). Reset AFTER construction so this
+    # test's counter isolates `reconcile_inbox_polling()`'s own activation
+    # specifically, which is what this test is actually about.
+    owner.activations = 0
 
     assert await adapter.reconcile_inbox_polling() is True
     assert owner.activations == 1
@@ -731,3 +854,72 @@ async def test_same_profile_token_rotation_may_reconcile_exact_scope(
 
     assert await adapter.reconcile_inbox_polling() is True
     assert StateStore(state_path).load().get("lease_reconciliation") is None
+
+
+@pytest.mark.asyncio
+async def test_status_reports_no_auto_reconcile_when_profile_owner_rotates(
+    tmp_path: Path,
+) -> None:
+    """B3 residual (Athena second eye, round 4, 2026-09-15, head c68e0839):
+    `_connect_with_active_scope`'s OWN first gate -- the constructor-time
+    `self._profile_owner_fingerprint` no longer matching a LIVE re-
+    validation of the SAME `secret_owner` object (e.g. an on-disk profile
+    rotated after this adapter was constructed) -- refuses `connect()`
+    before `_is_lease_reconcile_reachable()` is ever consulted. That
+    predicate did not account for it, so `mupot_gateway_status`'s
+    `connect_will_attempt_auto_reconcile` field still reported `true` for a
+    marker this exact adapter instance could never reach the reconcile
+    attempt for, misleading an operator into waiting on an automatic
+    reconcile that will never run.
+
+    Deliberately distinct from the marker's OWN `profile_owner_fingerprint`
+    field mismatching the CURRENT owner (see
+    `test_same_server_scope_distinct_profile_owner_stays_fenced_without_
+    network` above) -- that is a countercase the reconcile ATTEMPT itself
+    is expected to reach and then correctly refuse inside
+    (`_reconcile_inbox_polling_with_active_scope`'s own check), so
+    `connect_will_attempt_auto_reconcile` staying `true` for THAT case is
+    correct, not a bug: `connect()` does reach and attempt reconcile there,
+    it just legitimately fails once it tries. B3 is specifically about the
+    EARLIER gate that prevents the attempt from being reachable at all."""
+    state_path = tmp_path / "state.json"
+    owner = ScopeOwner("a" * 64)
+    client = AttemptClient(lease_outcomes=[MupotTransportError("Mupot request failed")])
+    adapter = make_adapter(state_path, client, owner)
+
+    assert await adapter.connect()
+    try:
+        await asyncio.wait_for(client.first_lease.wait(), 1)
+        await wait_stopped(adapter)
+    finally:
+        await adapter.disconnect()
+
+    marker = StateStore(state_path).load()["lease_reconciliation"]
+    assert marker is not None
+    assert adapter._profile_owner_fingerprint == owner.fingerprint
+
+    # Simulate the profile rotating under this SAME owner object, after
+    # construction -- exactly the condition `_connect_with_active_scope`'s
+    # own first gate re-checks live on every `connect()` call.
+    owner.fingerprint = "c" * 64
+
+    status = adapter.lease_reconciliation_status()
+    assert status is not None
+    assert status["connect_will_attempt_auto_reconcile"] is False, (
+        "a rotated profile owner can never reach the reconcile attempt -- "
+        "connect()'s own first gate refuses before it is reachable"
+    )
+
+    calls_before = len(client.calls)
+    connect_calls_before = client.connect_calls
+    ok = await adapter.connect()
+    assert ok is False
+    assert client.connect_calls == connect_calls_before, (
+        "connect() must refuse at its fingerprint gate before even the "
+        "transport-level connect(), let alone the reconcile attempt"
+    )
+    assert len(client.calls) == calls_before, (
+        "connect() must refuse before making ANY tool call, including the "
+        "reconcile attempt"
+    )
+    assert StateStore(state_path).load()["lease_reconciliation"] == marker

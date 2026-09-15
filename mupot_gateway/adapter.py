@@ -58,6 +58,20 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _REPLY_OUTBOX_VERSION = 2
 _LEGACY_REPLY_OUTBOX_VERSION = 1
 _LEASE_ATTEMPT_MARKER_VERSION = 3
+# OPEN-D (kasra re-gate round 3, 2026-09-15): safety margin a configured
+# `lease_seconds` must clear above `turn_timeout + mcp_tool_timeout`, same
+# value the unconfigured default (see the constructor) already uses.
+_LEASE_SAFETY_MARGIN_SECONDS = 60.0
+# OPEN-D: the SERVER's own hard ceiling on `delivery_attempts` before it
+# stops redelivering entirely (mupot/src/agents/messages.ts:879,
+# `MAX_DELIVERY_ATTEMPTS`). An operator-configured `max_delivery_attempts`
+# above this is not a bigger local retry budget -- it is dead configuration
+# past attempt 5: the server never delivers a 6th attempt for this adapter
+# to see, so `_resolve_turn_failure` would defer forever waiting for a
+# `delivery_attempts` value that never arrives, with no local DLQ row and no
+# `mupot_gateway_status` visibility (the exact "durable brick, just moved"
+# shape this whole class of fix exists to close).
+_SERVER_MAX_DELIVERY_ATTEMPTS = 5
 # _LEASE_ATTEMPT_ID_RE itself is imported above from .lease_ownership (single shared
 # pattern -- see the comment there) rather than redefined here.
 _PROFILE_OWNER_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -105,6 +119,15 @@ class _LiveDelivery:
     context: DeliveryContext
     expires_at: float
     source: Mapping[str, Any]
+    # Class fix (2026-09-15, round 2, see _TurnFailureDeferred): `expires_at`
+    # alone (the effective min of the two) cannot tell a genuine lease expiry
+    # (item 1 -- turn NOT at fault) apart from a turn that outlived
+    # `turn_timeout` while the message's own lease was still live (item 2 --
+    # a bounded turn failure). Keep both raw deadlines so the timeout branch
+    # in `_deliver` can compare them directly instead of guessing from the
+    # single collapsed value.
+    turn_deadline: float
+    lease_deadline: Optional[float]
     completion_event: asyncio.Event = field(default_factory=asyncio.Event)
     outcome: Optional[ProcessingOutcome] = None
     invalidated: bool = False
@@ -129,7 +152,53 @@ class MupotSafeRetryError(RuntimeError):
     """A connection failure proven to occur before any request bytes were sent."""
 
 
-class _EstopDeferred(Exception):
+class _DeliveryDeferred(Exception):
+    """Base for "try again later", never a protocol violation.
+
+    A pause, an outlived lease, a mid-turn race -- none of these are state
+    transitions; they are TEMPORAL conditions. Folding any of them into
+    `_protocol_error()` (which `_poll_loop` and `reconcile_inbox_polling`
+    both treat as a permanent violation and answer with
+    `_quarantine_inbox_polling()` -- a durable, `connect()`-refusing state
+    that outlives the condition and requires manual
+    `reconcile_inbox_polling()`) is the exact bug this base class exists to
+    close as a CLASS rather than one named site at a time (see
+    `_EstopDeferred`, added 2026-09-14 for e-stop; `_LeaseExpiredDeferred`,
+    added 2026-09-15 after the SAME "temporal condition folded into a
+    protocol violation" mechanism recurred for a message whose own
+    visibility lease expired mid-turn).
+
+    Every caller of `_process_leased_message` (the live poll loop and
+    `reconcile_inbox_polling`) must recognise every subclass of this as
+    "deferred, not violated": release the lease to expire for natural
+    redelivery, and never fold it into "message not marked processed =>
+    protocol error". Each subclass sets `reason` to a short human-readable
+    string used only for logging at the catch site -- the raise site logs
+    its own detailed context already.
+
+    Round 4 (2026-09-15, Athena second eye, head c68e0839, P0 + MED "runbook
+    :398"): **this is now the single canonical statement of the four-class
+    model** -- every delivery attempt lands in exactly one row below, and
+    `docs/telegram-onboarding-runbook.md` links here rather than restating
+    it (a prior copy drifted: it said Failed-bounded left `pending` AS-IS
+    below the cap and that the poll loop "keeps running either way" at the
+    cap, both false once `_resolve_turn_failure` existed -- a table that
+    lives in exactly one place, in the code the reader is already looking
+    at to trust it, cannot drift again).
+
+    | Outcome | Trigger | Durable representation | Who reads it |
+    | --- | --- | --- | --- |
+    | **Delivered** | Handler succeeds with human custody -- OR a `handler_error` whose error reply already reached the human WITH custody (`reply_outbox[id]` staged, non-`"complete"`, when `_resolve_turn_failure` runs -- Hermes's own crash handler calls `send()` before the outcome is known) | `processed` list + `reply_outbox[id].status="complete"`; `pending: null` once `_replay_reply_outbox` completes it on the NEXT tick (see `_TurnFailureDeferred`'s custody guard: `pending` is deliberately left set for exactly one more tick so that replay can match it) | `_process_leased_message`'s "already processed" short-circuit; operator via `processed`/`terminal_receipts` |
+    | **Deferred** | Message's own lease expired before ACK (turn not at fault) | `pending: null` (cleared -- nothing here was ever candidate reply-outbox custody); no `lease_reconciliation` marker | Poll loop releases the lease and continues; server redelivers. `connect()`'s `_legacy_pending_ambiguous` check confirms `pending` is clean on restart |
+    | **Failed-bounded** | Turn exceeds `turn_timeout` with the lease still live; handler returns no custody; handler raises WITHOUT the error reply ever reaching custody (`no_custody`/`handler_error`-without-custody, see the Delivered row for the custody case) | Below `max_delivery_attempts` (default `_SERVER_MAX_DELIVERY_ATTEMPTS`): `pending` cleared (round 5: held ONLY by genuine custody -- `self._reply_outbox_has_custody`, never by a merely non-`"complete"` status), `_TurnFailureDeferred` raised, no ack. At the cap: `dlq` entry `{message, reason}` appended ONLY when custody was never achieved (idempotent; round 5, Athena MED 3a -- a custodied reply at the cap is Delivered, not DLQ'd), `pending` cleared (same custody guard), source is **NOT acked** -- an ack sets `read_at`, which the pot's own reaper requires `NULL` to ever set `dead_lettered_at` -- `_TurnFailureDeferred(terminal=True)` raised instead so the lease is left to expire naturally and the pot's own reaper (which runs on every subsequent `inbox_lease` call for this agent, before leasing) dead-letters it server-side. `_process_leased_message` skips (no turn, no ack) any message id already carrying one of this class's `dlq` rows (`reason="already_dead_lettered"` if a non-conforming server keeps re-leasing it anyway), bounding local re-execution even against a server that never reaps (round 5, Athena MED 3b/3c; round 6: this skip's own evidence is a dedicated, independently-capped `turn_failure_ids` set, not the tail of the shared `dlq[-100:]` window, so 100+ unrelated later DLQ rows cannot evict it -- see `_has_local_turn_failure_dlq`) | `adapter.turn_failure_dlq_summary()` (excludes ids already in `processed`) / `mupot_gateway_status`'s `turn_failure_dlq` field; poll loop releases the lease and continues exactly like any other deferral -- it never blocks on this class |
+    | **Stuck reply** (round 6) | A successful handler whose reply the peer `send` call itself could never deliver -- zero custody, bounded by `_bound_reply_send_failure`'s own local `send_attempts` counter on the `reply_outbox` record itself, independent of the message's `delivery_attempts` (the server never re-leases a message this process still holds) | Below the cap: record stays `"prepared"`, `send_attempts` incremented via `_persist_reply_record` (load_checked + readback), next `_replay_reply_outbox` tick retries. At the cap: status transitions to `"send_failed"` IN PLACE -- receipt untouched (always `None`, it never reached the peer), record KEPT (never popped, never DLQ'd) so an operator can see and reconcile it by hand; `pending` cleared if it still names this source. `_replay_reply_outbox` never auto-retries a `"send_failed"` record (skipped outright) -- this is the one outcome in this table an operator, not a bounded retry, resolves | `mupot_gateway_status`'s `stuck_replies` field; poll loop never blocks on this class either (`_replay_reply_outbox` attempts at most one send per `"prepared"` record per tick, then always proceeds to `_flush_notifications`/`inbox_lease` the same tick) |
+    | **Violation** | Owner fingerprint mismatch, attempt/tenant conflict, tampered state, "processed" never set despite a successful ack (`_protocol_error()`) | `lease_reconciliation` marker (`required: true`, version 1/2/3) | `adapter.lease_reconciliation_status()` / `mupot_gateway_status`'s `lease_reconciliation` field; `connect()` refuses (self-heals once via `reconcile_inbox_polling()` for a genuine tombstone, else needs the manual runbook procedure) |
+    """
+
+    reason: str = "deferred"
+
+
+class _EstopDeferred(_DeliveryDeferred):
     """Work was deferred because Hermes's global e-stop is engaged.
 
     A pause is a TEMPORAL condition, never a state transition: it must never
@@ -201,11 +270,230 @@ class _EstopDeferred(Exception):
         the gateway's own turn dispatch gate the human's next turn, this
         class only gates the native-receive/legacy-inbox-stream surfaces
         listed above.)
-    Every caller of `_process_leased_message` (the live poll loop and
-    `reconcile_inbox_polling`) recognises this exception as "deferred by
-    pause" and releases the lease to expire for natural redelivery, rather
-    than folding it into "message not marked processed => protocol error".
+    See `_DeliveryDeferred` for the shared contract every caller of
+    `_process_leased_message` must honour for this and every sibling class.
     """
+
+    reason = "Hermes global emergency stop is engaged"
+
+
+class _LeaseExpiredDeferred(_DeliveryDeferred):
+    """A leased message's own visibility lease expired before its turn finished.
+
+    `lease_seconds` is derived from `turn_timeout` (plus margin), but a turn
+    can legitimately run past that budget -- an MCP tool call blocking near
+    its own timeout, plus normal agent-turn overhead -- with no protocol
+    violation anywhere: Mupot's own visibility lease is exactly what makes
+    this safe, redelivering the message once nothing acked it in time.
+
+    Live incident (kayhermes gateway, plugin 6c86c2b0, 2026-09-15): an
+    `mcp_tool` call blocked 180s inside a turn, the message's lease expired
+    before the turn could ACK, and `_deliver` returned (via the
+    `_expire_if_needed` early-check, or via the turn-timeout branch after
+    `asyncio.wait_for`) WITHOUT raising -- so `_poll_loop`'s "message not in
+    `processed`" check folded a routine, expected expiry into
+    `_protocol_error()` -> `_quarantine_inbox_polling()`, a state that
+    survived every subsequent operator restart because nothing ever called
+    `reconcile_inbox_polling()` automatically (see `connect()`'s handling of
+    `self._lease_quarantined`). SAME class as `_EstopDeferred`, same fix
+    shape: raise this instead of returning, so `_poll_loop` and
+    `reconcile_inbox_polling` release the lease and let the server redeliver
+    instead of quarantining.
+
+    Kasra gate round 2 (2026-09-15, head 5046ea79) BLOCK-1 + BLOCK-2:
+
+    - BLOCK-1: `_deliver` wrote `pending = {"message": message}` at the top,
+      BEFORE either raise site, and left it set on every deferral. On
+      restart, the constructor's `_legacy_pending_ambiguous` check (a
+      pending record whose source id is not staged in `reply_outbox` is
+      "ambiguous legacy work") read that survivor as ambiguous crash state
+      and `connect()` refused -- BEFORE the `_lease_quarantined` auto-
+      reconcile branch even runs, since the pending-ambiguity check is
+      earlier in `_connect_with_active_scope`. The brick moved from a
+      `lease_reconciliation` marker to `pending`, silently. Fix: both raise
+      sites now clear `pending` back to `None` before raising -- a lease
+      expiry with no lease-bound turn work in flight is, unlike a real
+      crash, NOT ambiguous: nothing here was ever a candidate for
+      `reply_outbox` custody, so there is nothing to fence for a human.
+    - BLOCK-2: this class now covers ONLY the case where the message's own
+      lease deadline is the constraint that was hit -- compared explicitly
+      against the turn's own deadline at the timeout site in `_deliver`
+      (`_LiveDelivery.lease_deadline` vs `.turn_deadline`), not inferred
+      from the single collapsed `expires_at`. A turn that exceeds
+      `turn_timeout` while the lease is still live is a TURN failure, not a
+      lease expiry -- see `_TurnFailureDeferred`, which is bounded by
+      `delivery_attempts` instead of retried forever.
+
+    See `_DeliveryDeferred` for the shared contract every caller of
+    `_process_leased_message` must honour for this and every sibling class.
+    """
+
+    reason = "the message's own visibility lease expired before its turn completed"
+
+
+class _TurnFailureDeferred(_DeliveryDeferred):
+    """The AGENT TURN itself failed while the message's own lease was live.
+
+    Kasra gate round 2 (2026-09-15, head 5046ea79) BLOCK-2 + WARN: three
+    distinct outcomes were previously folded into either an unbounded
+    `_LeaseExpiredDeferred` retry loop (turn_timeout with a live lease -- A/B
+    measured 1 turn pre-fix vs 11+ and climbing, no operator signal) or a
+    silent bare `return` that `_poll_loop` then read as "message not in
+    processed" and answered with `_quarantine_inbox_polling()` (handler
+    returned `None`/no custody; handler raised, surfaced by the base
+    adapter as `ProcessingOutcome.FAILURE`). None of these is a lease
+    expiry and none is a protocol violation -- they are TURN failures, and
+    the fix bounds them by the message's own `delivery_attempts` (already
+    validated non-negative-int by `validate_lease_attempt_result`, see
+    module top) instead of either extreme:
+
+      - `kind="turn_timeout"`: `_deliver`'s post-`asyncio.wait_for` timeout
+        branch, when the LEASE deadline was not the binding constraint
+        (`runtime.lease_deadline is None or runtime.lease_deadline >
+        runtime.turn_deadline`) -- the turn hung past its own budget with
+        plenty of lease left.
+      - `kind="no_custody"`: the handler completed
+        (`ProcessingOutcome.SUCCESS`) but produced nothing with human
+        custody to commit -- previously a silent `return` with no signal.
+      - `kind="handler_error"`: the base adapter recorded
+        `ProcessingOutcome.FAILURE` (handler raised, caught by
+        `BasePlatformAdapter`'s own `except BaseException` and turned into
+        this outcome) -- previously the same silent `return`.
+
+    Below `self.max_delivery_attempts`, `_deliver` raises this (see
+    `_resolve_turn_failure`) so `_poll_loop`/`reconcile_inbox_polling`
+    release the lease and let the server redeliver, same as any
+    `_DeliveryDeferred`.
+
+    Kasra re-gate round 3 (2026-09-15, head 7295e057) BLOCK-A: this raise
+    used to leave `pending` set (the theory being that a hung or raising
+    handler MAY have taken real side effects mid-turn, so it should fence
+    for a human exactly like a genuine crash would -- previously pinned by
+    `test_timeout_invalidates_generation_before_bounded_cancellation`).
+    That reasoning does not hold: `pending` is the "a turn is running RIGHT
+    NOW in this process" record and nothing else, `delivery_attempts` (the
+    SERVER's count, not local state) is what tracks how many times this has
+    been tried, and this raise site is only ever reached after the turn has
+    already ended (successfully far enough to observe its outcome, or
+    definitively timed out) -- there is no live turn left to describe.
+    Leaving `pending` set instead reproduced the exact durable-brick shape
+    this whole fix exists to close: the next restart's
+    `_legacy_pending_ambiguous` check read the survivor as ambiguous crash
+    state and `connect()` refused forever. Fix: `_resolve_turn_failure`
+    clears `pending` before raising, for all three `kind`s, same as the
+    lease-expiry sites.
+
+    Round 4 (2026-09-15, Athena second eye, head c68e0839) P0: the round-3
+    fix above cleared `pending` UNCONDITIONALLY, which reintroduced the
+    exact same class of brick through a different door for `handler_error`
+    specifically. Hermes's `BasePlatformAdapter` (`gateway/platforms/base.py`,
+    pinned Hermes rev) catches a raising handler itself, BEFORE this
+    function ever runs, and calls `_notify_turn_error` -> `self.send(...)`
+    to tell the human the turn failed -- that call stages
+    `reply_outbox[message_id]` at a non-`"complete"` status (`"custodied"`,
+    once a real receipt exists) via the ordinary `_prepare_final_reply` /
+    `_transmit_final_reply` path, same as any other reply. The round-3
+    clear then wiped `pending` regardless, so the VERY NEXT poll tick's
+    `_replay_reply_outbox` (statement #2 of every iteration, BEFORE the next
+    `inbox_lease`) found a non-complete record whose source no longer
+    matched `pending` (now `None`) and flipped it to
+    `"reconciliation_required"` + raised a genuine `_protocol_error()` --
+    poll dead, `connect()` refused on every subsequent restart at its FIRST
+    gate, before `_is_lease_reconcile_reachable()` even runs. Kasra's
+    decision (round 4): an error reply that already reached the human WITH
+    custody is **Delivered**, not a crash to fence for one -- it must be
+    allowed to finish through the ordinary reply-replay path, not raced
+    into `reconciliation_required` by a premature `pending` clear.
+
+    Round 4's fix held `pending` off of `staged.get("status") != "complete"`
+    -- true for `"prepared"` too, not just `"custodied"`. kasra-review
+    round 5 (2026-09-15, head c9b79aa) P0: a `"prepared"` reply (staged by
+    `_prepare_final_reply`, never transmitted -- zero custody, no receipt)
+    satisfies that predicate exactly as a `"custodied"` one does, so a
+    successful handler whose reply `send` itself fails (peer down, `send`
+    MCP tool raising) held `pending` forever for a message that was never
+    delivered at all. Worse than the round-4 brick: `_replay_reply_outbox`
+    (statement #2 of every poll tick, BEFORE `inbox_lease`) then retried
+    the same doomed `send` every tick, its exception caught by
+    `_poll_loop`'s generic `except Exception` (sleep + continue) -- no
+    quarantine, no DLQ, no operator signal, just one lease ever and
+    `mupot_gateway_status` reporting fully healthy. Fix: the ONLY thing
+    that may hold `pending` here is genuine custody --
+    `self._reply_outbox_has_custody(message_id)` (status `"sent"`/
+    `"custodied"`/`"complete"` with a receipt -- ONE definition, round 6;
+    see that method's docstring for why the round-5 version of this
+    predicate, and the separate `_reply_has_human_custody` it has since
+    been merged into and replaced, were too narrow). A `"prepared"` reply
+    that cannot be sent is therefore always
+    Failed-bounded, same as any other no-custody turn failure: below
+    `max_delivery_attempts`, `pending` clears and the lease is left to
+    expire for natural redelivery, same as before. What is new is
+    `_replay_reply_outbox`'s own bound on retrying that same `"prepared"`
+    record turn-tick over turn-tick within ONE lease window, where the
+    message's own `delivery_attempts` never moves (the server cannot
+    re-lease a message this process is still holding) -- see
+    `_bound_reply_send_failure` for that local counter, capped at the same
+    `max_delivery_attempts` semantics. Round 6: at the cap, the record now
+    transitions to `"send_failed"` IN PLACE (never dropped, never DLQ'd --
+    see that method) so the poll loop resumes leasing instead of
+    quarantining or looping forever on a reply that will never gain
+    custody through this attempt.
+
+    `no_custody`/`turn_timeout` cannot reach `_notify_turn_error` (Hermes
+    only calls it from its own handler-exception catch), and `no_custody`
+    can by construction never BE custodied (`_reply_outbox_has_custody`
+    false is exactly how `_deliver` decides to classify it `no_custody` in
+    the first place) -- so the custody guard is a genuine no-op for those
+    `kind`s under this predicate: it can only ever hold `pending` for the
+    `handler_error`-with-custody race the round-4 fix targeted (and, round
+    6, the `"sent"`-but-not-yet-`"custodied"` race the Athena gate addendum
+    on head e0556d61 closed -- see `_reply_outbox_has_custody`), never mask
+    a real crash-ambiguity case and never hold for an unsent reply.
+
+    At the cap, `_deliver` still does not retry, but (round 4, MED "cap
+    surface") it no longer acks: an ack sets `read_at`, and the pot's own
+    reaper (`mupot/src/agents/messages.ts`, dead-letter step) requires
+    `read_at IS NULL` to ever set `dead_lettered_at` on this row -- acking
+    here moved the dead-letter FACT from the pot (migration 0090's purpose)
+    to this host's local `dlq` list only. Instead: append the same `dlq`
+    row (idempotent by message id, unchanged) -- round 5 (Athena MED 3a):
+    ONLY when custody was never achieved; a message whose reply IS
+    custodied at the cap is **Delivered**, not failed, and `pending` stays
+    held for it (same guard as above) so `_replay_reply_outbox` completes
+    it normally (ack + commit) on the very next tick -- `turn_failure_dlq`
+    must never name a message that then shows up in `processed`. Then raise
+    this exception with `terminal=True` regardless -- the lease is left to
+    expire naturally, same as any other deferral, and the pot's own reaper
+    (which runs on every subsequent `inbox_lease` call for this agent,
+    before handing out a lease) dead-letters the row server-side the next
+    time this adapter polls, once its own lease has expired. This cannot
+    reintroduce unbounded local re-execution: `max_delivery_attempts` now
+    defaults to `_SERVER_MAX_DELIVERY_ATTEMPTS`, so by the time this branch
+    runs the server's own `leasable` predicate already excludes this row
+    from ever being handed out again once the reaper marks it (and the
+    reaper's own `delivery_attempts >= MAX_DELIVERY_ATTEMPTS` check is, by
+    construction, already true here) -- and (round 5, Athena MED 3c/3b)
+    `_process_leased_message`'s own local-DLQ skip (see that method) bounds
+    this even against a server that never reaps: a message already carrying
+    one of this class's `dlq` rows never gets a second local turn no matter
+    how many more times a non-conforming server hands it out.
+    """
+
+    def __init__(self, message_id: str, kind: str, *, terminal: bool = False) -> None:
+        super().__init__(message_id)
+        self.kind = kind
+        self.terminal = terminal
+        self.reason = (
+            f"turn failure ({kind}), at max_delivery_attempts -- deferred for "
+            "the pot's own reaper to dead-letter, not locally acked"
+            if terminal
+            else f"turn failure ({kind}), attempt below max_delivery_attempts"
+        )
+
+
+_TURN_FAILURE_DLQ_REASONS = frozenset(
+    {"turn_timeout", "no_custody", "handler_error", "reply_send_failed"}
+)
 
 
 def _protocol_error() -> MupotProtocolError:
@@ -934,6 +1222,54 @@ class StateStore:
                 pass
 
 
+# OPEN-E (kasra re-gate round 3, 2026-09-15): the ONE fallback value for
+# every way `_configured_mcp_tool_timeout` can fail to learn a real,
+# operator-configured number -- the server absent from `mcp_servers`
+# entirely, present but missing an explicit `timeout` key, or any exception
+# reading/resolving the config at all. These used to be two DIFFERENT
+# hardcoded numbers (300.0 for "absent"/"any exception", 30.0 for
+# "configured but no timeout key") with no reasoning tying them together --
+# picking the SMALLER of the two as a per-server default risks under-sizing
+# `lease_seconds` (see OPEN-D) for a server an operator only partially
+# configured, reproducing the exact class of incident this whole fix exists
+# to close. One named constant, the LARGER/safer of the two former values.
+_DEFAULT_MCP_TOOL_TIMEOUT_SECONDS = 300.0
+
+
+def _configured_mcp_tool_timeout(server_name: str) -> float:
+    """Read the mupot MCP server's own configured request timeout.
+
+    Item 7 (kasra-review re-gate round 2, 2026-09-15): the SAME source
+    `HermesMCPClient._ensure_client` (below) uses to build its httpx
+    client's timeout, via `load_config()["mcp_servers"][server_name]` and
+    `_resolve_mcp_server_config`. Used as `MupotAdapter`'s default for
+    `mcp_tool_timeout` (lease sizing, see the constructor) instead of a
+    hardcoded guess -- an operator can still override via `mcp_tool_timeout`
+    in `extra`. Any failure here (server not yet configured, config file
+    unreadable, import error in a unit-test sandbox with no `hermes_cli`
+    package on the path) is non-fatal: falls back to
+    `_DEFAULT_MCP_TOOL_TIMEOUT_SECONDS`.
+
+    Scope (OPEN-E): this reads ONLY the mupot MCP server's own budget
+    (`self.server_name`, i.e. `extra["mcp_server"]`, default `"mupot"`) --
+    not any other MCP server's configured timeout, and not Hermes's own
+    global default MCP timeout if one exists. An operator running several
+    MCP servers with different budgets gets lease sizing based on the one
+    this adapter actually calls through.
+    """
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.mcp_config import _resolve_mcp_server_config
+
+        raw_cfg = (load_config().get("mcp_servers") or {}).get(server_name)
+        if not isinstance(raw_cfg, dict):
+            return _DEFAULT_MCP_TOOL_TIMEOUT_SECONDS
+        cfg = _resolve_mcp_server_config(raw_cfg)
+        return float(cfg.get("timeout") or _DEFAULT_MCP_TOOL_TIMEOUT_SECONDS)
+    except Exception:
+        return _DEFAULT_MCP_TOOL_TIMEOUT_SECONDS
+
+
 class HermesMCPClient:
     def __init__(
         self,
@@ -1122,14 +1458,189 @@ class MupotAdapter(BasePlatformAdapter):
         # could ride in through it. The dead-line removal above is correct only
         # because of that scoping, not because the tree-wide grep is empty.
         self.server_name = str(extra.get("mcp_server") or "mupot")
+        # Round 3 (kasra re-gate BLOCK-C): set BEFORE the `mcp_tool_timeout`
+        # resolution below, which needs `self._profile_scope()` to read
+        # `_resolve_mcp_server_config` inside the correct (possibly
+        # multi-tenant) secret scope rather than the ambient process one.
+        self._secret_owner = secret_owner
         self.expected_agent_id = extra.get("expected_agent_id")
         self.expected_tenant = extra.get("expected_tenant")
         self.poll_interval = max(0.01, float(extra.get("poll_interval") or 2.0))
         self.rpc_timeout = max(5.0, float(extra.get("rpc_timeout") or 20.0))
         self.turn_timeout = max(10.0, float(extra.get("turn_timeout") or 300.0))
         self.cancel_timeout = max(0.01, float(extra.get("cancel_timeout") or 6.0))
-        requested_lease = float(extra.get("lease_seconds") or (self.turn_timeout + 60.0))
+        # Lease sizing (class fix, 2026-09-15, see _LeaseExpiredDeferred): a turn's
+        # REAL maximum duration is not just `turn_timeout` -- a turn can spend up
+        # to the mupot MCP server's own per-call request budget (the kayhermes
+        # incident this closes ran with it configured to 180s) blocked inside a
+        # single tool call, on top of ordinary turn overhead. `lease_seconds =
+        # turn_timeout + 60` alone (the pre-fix default) is smaller than
+        # `turn_timeout + mcp_tool_timeout` whenever `mcp_tool_timeout > 60`, so
+        # a single slow-but-legitimate tool call could always outlive the lease.
+        #
+        # HOWEVER (item 2, kasra-review re-gate round 2, 2026-09-15) --
+        # `turn_timeout`, not the lease, is the constraint that actually binds a
+        # slow-tool-call turn in practice: `_deliver`'s timeout branch classifies
+        # a timeout by comparing the LEASE's own deadline against `turn_timeout`'s
+        # deadline (see `_LiveDelivery.lease_deadline`/`.turn_deadline` and
+        # `_lease_is_binding`) -- sizing the lease generously here just means
+        # `turn_timeout` reaches its own deadline FIRST in the common case, which
+        # is now a bounded turn failure (`_TurnFailureDeferred`, kind
+        # "turn_timeout"), not a lease expiry. A turn that legitimately needs
+        # longer than `turn_timeout` for ordinary work needs `turn_timeout`
+        # raised, not a bigger lease -- the lease only needs to outlive
+        # `turn_timeout` by a safety margin so a merely-slow (not hung) turn
+        # completes and ACKs before the SERVER, independently, redelivers it out
+        # from under the still-running turn.
+        #
+        # Item 7 (kasra-review re-gate round 2, 2026-09-15): the round-1 fix's
+        # own comment here claimed this adapter "has no way to read [the
+        # Hermes-side MCP timeout] directly" and hardcoded a 300s default --
+        # false. `HermesMCPClient._ensure_client` (below) already reads the
+        # mupot MCP server's own configured `timeout` via
+        # `load_config()["mcp_servers"][name]`; `_configured_mcp_tool_timeout`
+        # reuses that exact path so the default here reflects the ACTUAL
+        # configured per-call budget for this deployment, not a guess an
+        # operator has to notice and override by hand. An explicit
+        # `mcp_tool_timeout` in `extra` still wins when an operator wants to
+        # size the lease against something other than the raw MCP client
+        # timeout (e.g. a known-slower specific tool).
+        #
+        # Round 3 (kasra re-gate BLOCK-C): only resolved from config (never
+        # called at all when `extra["mcp_tool_timeout"]` is already
+        # explicit) and, when it IS resolved, done inside `self._profile_
+        # scope()` -- `_configured_mcp_tool_timeout` -> `load_config()` ->
+        # `hermes_cli.mcp_config._resolve_mcp_server_config` loads secrets
+        # from `.env` into `os.environ` as a side effect (confirmed:
+        # `MUPOT_AGENT_TOKEN` appeared in `os.environ` after construction,
+        # even under `scripts/test.sh`'s own `unset MUPOT_AGENT_TOKEN ...`).
+        # Calling this OUTSIDE any profile scope reads the AMBIENT Hermes
+        # home (`~/.hermes`, not necessarily this adapter's own scoped
+        # `secret_owner`) and leaves whatever it loads sitting in
+        # `os.environ` permanently -- `HermesMCPClient._ensure_client`
+        # already gets this right via its own `_profile_scope()`; this
+        # constructor read was the one place that didn't.
+        explicit_mcp_tool_timeout = extra.get("mcp_tool_timeout")
+        if explicit_mcp_tool_timeout:
+            resolved_mcp_tool_timeout = explicit_mcp_tool_timeout
+        else:
+            # `self._profile_scope()` entering (`secret_owner.activate()`)
+            # can itself raise -- same class of failure
+            # `_configured_mcp_tool_timeout`'s own try/except already
+            # treats as non-fatal (falls back to the default) for every
+            # OTHER way this read can fail. A scope that is not (yet)
+            # available at construction time must not make constructing
+            # the adapter itself fail -- `connect()` already treats a
+            # failing `secret_owner.activate()` as a normal, recoverable
+            # refusal (see `_connect_with_active_scope`'s own
+            # `except Exception` around it), not a fatal error.
+            try:
+                with self._profile_scope():
+                    resolved_mcp_tool_timeout = _configured_mcp_tool_timeout(
+                        self.server_name
+                    )
+            except Exception as exc:
+                # LOW (Athena second eye, round 4, 2026-09-15): this used to
+                # be a bare `except Exception: <fallback>` with no trace at
+                # all -- fine as a fail-open default, but a silent one, so a
+                # genuinely broken profile scope at construction time left
+                # no record anywhere that the fallback (rather than the
+                # configured value) is what `lease_seconds` was derived
+                # from. `debug`, not `warning`: the comment above already
+                # establishes this is an expected, routine fallback (a scope
+                # not yet available at construction time), not an
+                # operator-actionable condition.
+                logger.debug(
+                    "[mupot] falling back to default mcp_tool_timeout=%s: "
+                    "profile scope unavailable at construction (%s)",
+                    _DEFAULT_MCP_TOOL_TIMEOUT_SECONDS,
+                    exc,
+                )
+                resolved_mcp_tool_timeout = _DEFAULT_MCP_TOOL_TIMEOUT_SECONDS
+        self.mcp_tool_timeout = max(0.0, float(resolved_mcp_tool_timeout))
+        minimum_safe_lease = (
+            self.turn_timeout + self.mcp_tool_timeout + _LEASE_SAFETY_MARGIN_SECONDS
+        )
+        explicit_lease_seconds = extra.get("lease_seconds")
+        requested_lease = float(explicit_lease_seconds or minimum_safe_lease)
+        # OPEN-D (kasra re-gate round 3, 2026-09-15): the unconfigured
+        # default already computes `turn_timeout + mcp_tool_timeout +
+        # margin`, but an EXPLICIT `lease_seconds` in `extra` bypassed that
+        # arithmetic entirely and went straight to the `[1, 3600]` clamp
+        # below -- an operator (or a stale/copied config) could set a
+        # `lease_seconds` smaller than a legitimately-slow turn's own
+        # budget, reproducing the exact live incident this whole class of
+        # fix exists to close (the message's own visibility lease expiring
+        # before the turn could finish) on every single turn, not just an
+        # unlucky slow one. Clamp up rather than refuse construction --
+        # self-healing, consistent with this fix's whole "recover
+        # automatically" bias -- but log loudly: a smaller explicit value
+        # is silently discarded, and an operator who set it deliberately
+        # for some other reason needs to know it did not take effect.
+        if explicit_lease_seconds is not None and requested_lease < minimum_safe_lease:
+            logger.warning(
+                "[mupot] configured lease_seconds=%.1f is smaller than the safe "
+                "minimum turn_timeout(%.1f) + mcp_tool_timeout(%.1f) + "
+                "margin(%.1f) = %.1f; clamping up to the safe minimum instead "
+                "of honoring the smaller explicit value",
+                requested_lease,
+                self.turn_timeout,
+                self.mcp_tool_timeout,
+                _LEASE_SAFETY_MARGIN_SECONDS,
+                minimum_safe_lease,
+            )
+            requested_lease = minimum_safe_lease
         self.lease_seconds = max(1, min(3600, int(requested_lease)))
+        if self.lease_seconds < minimum_safe_lease:
+            # The [1, 3600] ceiling above is the server's own hard cap on a
+            # lease, not negotiable here -- but a `turn_timeout`/
+            # `mcp_tool_timeout` combination large enough to exceed it means
+            # the safety property this whole class of fix relies on
+            # (lease outlives the turn) cannot hold for this configuration.
+            # Nothing to clamp UP to any further; surface it loudly instead
+            # of leaving an operator to discover it via a live incident.
+            logger.warning(
+                "[mupot] lease_seconds=%s is capped at the server's 3600s "
+                "ceiling but turn_timeout(%.1f) + mcp_tool_timeout(%.1f) + "
+                "margin(%.1f) = %.1f exceeds it; a turn using its own full "
+                "budget may still outlive its own message lease",
+                self.lease_seconds,
+                self.turn_timeout,
+                self.mcp_tool_timeout,
+                _LEASE_SAFETY_MARGIN_SECONDS,
+                minimum_safe_lease,
+            )
+        # Bound for _TurnFailureDeferred's class of defect (round 2,
+        # 2026-09-15, see that class's docstring): a turn_timeout, a
+        # no-custody handler result, or a handler exception -- ALL with the
+        # message's own lease still live -- must not retry forever. Below
+        # this many `delivery_attempts` (the server's own count, validated
+        # non-negative-int elsewhere in this module), defer for natural
+        # lease-driven redelivery; at it, DLQ (terminal, no ack -- round 4,
+        # see `_TurnFailureDeferred`'s docstring).
+        #
+        # OPEN-D (kasra re-gate round 3, 2026-09-15): also clamped DOWN to
+        # `_SERVER_MAX_DELIVERY_ATTEMPTS` -- see that constant's own
+        # docstring for why a value above the server's own hard ceiling is
+        # dead configuration, not a bigger retry budget.
+        #
+        # Round 4 (2026-09-15, Athena second eye, MED "cap surface"): the
+        # UNCONFIGURED default is now `_SERVER_MAX_DELIVERY_ATTEMPTS` itself
+        # (was a bare `3`) -- a local cap smaller than the server's own
+        # ceiling used to let this adapter DLQ a message the server would
+        # have kept redelivering for two more attempts, and (before the
+        # no-ack fix above) previously also acked at that smaller local cap,
+        # which set `read_at` and permanently prevented the server's own
+        # reaper from ever dead-lettering the row itself (it requires
+        # `read_at IS NULL`). Matching the server's ceiling by default means
+        # the local cap and the server's own dead-letter threshold coincide.
+        self.max_delivery_attempts = max(
+            1,
+            min(
+                _SERVER_MAX_DELIVERY_ATTEMPTS,
+                int(extra.get("max_delivery_attempts") or _SERVER_MAX_DELIVERY_ATTEMPTS),
+            ),
+        )
         state_path = extra.get("state_path") or str(get_hermes_home() / "platforms" / "mupot" / "state.json")
         self.store = StateStore(Path(str(state_path)))
         loaded, state_valid = self.store.load_checked()
@@ -1140,7 +1651,6 @@ class MupotAdapter(BasePlatformAdapter):
             raise ValueError("routine_events_enabled must be a boolean")
         self.routine_events_enabled = routine_events_enabled
         self.message_injector = message_injector
-        self._secret_owner = secret_owner
         self._profile_owner_fingerprint = _profile_owner_fingerprint(secret_owner)
         self._state: dict[str, Any] = copy.deepcopy(loaded) if state_valid else {}
         loaded_reply_outbox = loaded.get("reply_outbox")
@@ -1165,6 +1675,14 @@ class MupotAdapter(BasePlatformAdapter):
             "pending": pending,
             "processed": list(loaded.get("processed") or [])[-1000:],
             "dlq": list(loaded.get("dlq") or [])[-100:],
+            # Round 6 NEW-4 (kasra gate): dedicated, independently-capped
+            # evidence for `_has_local_turn_failure_dlq`'s skip -- see that
+            # method. Larger and separate from `dlq[-100:]` so 100+ later,
+            # unrelated DLQ rows (sender_policy, invalid_ack_envelope, a
+            # different message's own turn failure) can never evict a
+            # message id this adapter has already decided never to run
+            # locally again.
+            "turn_failure_ids": list(loaded.get("turn_failure_ids") or [])[-1000:],
             "terminal_receipts": list(loaded.get("terminal_receipts") or [])[-100:],
             "notification_outbox": dict(loaded.get("notification_outbox") or {}),
             "routine_event_receipts": copy.deepcopy(loaded_routine_receipts)
@@ -1194,6 +1712,20 @@ class MupotAdapter(BasePlatformAdapter):
         self._live_generations: dict[int, _LiveDelivery] = {}
         self._consumer_fence: Optional[dict[str, Any]] = None
         self._lease_quarantined = self._state["lease_reconciliation"] is not None
+        # Item 6 (kasra-review re-gate round 2, 2026-09-15): `connect()`'s
+        # auto-reconcile (see the `_lease_quarantined` branch below) can run
+        # a full leased-message turn -- bounded by `max_delivery_attempts`,
+        # same as the live poll loop -- BEFORE `_running` is ever set True,
+        # so `is_connected` (== `self._running`) already reports `False`
+        # correctly for that whole window. What was missing is any signal
+        # that a restart is DOING something rather than merely not-yet-
+        # connected; `mupot_gateway_status` surfaces this flag for exactly
+        # that gap.
+        self._reconciling = False
+        # Round 6 NEW-5: per-(site, key) last-logged monotonic timestamp for
+        # `_warn_rate_limited` -- per-instance, never persisted, cleared by
+        # process restart same as any other in-memory log-noise throttle.
+        self._warn_rate_limit: dict[str, float] = {}
         self._reply_state_invalid = not state_valid or not reply_outbox_valid
         self._routine_state_invalid = not state_valid or not routine_state_valid
         pending_routine_records: list[dict[str, Any]] = []
@@ -1213,9 +1745,7 @@ class MupotAdapter(BasePlatformAdapter):
             if isinstance(pending_message, dict)
             else ""
         )
-        self._legacy_pending_ambiguous = pending is not None and (
-            not pending_id or pending_id not in self._state["reply_outbox"]
-        )
+        self._legacy_pending_ambiguous = self._compute_legacy_pending_ambiguous()
         self._reply_reconciliation_required = any(
             not isinstance(record, dict)
             or record.get("status") == "reconciliation_required"
@@ -1238,6 +1768,65 @@ class MupotAdapter(BasePlatformAdapter):
             except MupotProtocolError:
                 self._reply_state_invalid = True
         self._log_stranded_notifications_at_startup()
+
+    def _profile_scope(self):
+        """Same shape as `HermesMCPClient._profile_scope`: a no-op context
+        when there is no scoped `secret_owner` (e.g. a unit test constructing
+        this adapter directly), or `self._secret_owner.activate()` otherwise.
+        Round 3 (kasra re-gate BLOCK-C): every read of `.env`/secret-bearing
+        config this constructor performs must go through this, not the
+        ambient process environment -- see the `mcp_tool_timeout` resolution
+        above for the incident this closes.
+        """
+        if self._secret_owner is None:
+            return nullcontext()
+        return self._secret_owner.activate()
+
+    def _warn_rate_limited(
+        self,
+        key: str,
+        message: str,
+        *args: Any,
+        window: float = 30.0,
+    ) -> None:
+        """Log `message` at WARNING at most once per `window` seconds per `key`.
+
+        Round 6 NEW-5 (kasra gate, LOW from the round-5 gate: ~1,226 WARNING
+        lines in 6 seconds against a non-reaping fake peer that keeps
+        re-leasing the same terminal message every poll tick). This changes
+        nothing about delivery, ack, DLQ, or custody -- purely how often the
+        SAME already-known fact is re-logged. Per-instance (not module-
+        level, unlike `_note_estop_pause_once`'s pause-window tracking):
+        several adapters can share this process in tests, and there is no
+        shared "window" concept to synchronize across them the way a single
+        global e-stop sentinel has.
+        """
+        now = time.monotonic()
+        last = self._warn_rate_limit.get(key)
+        if last is not None and now - last < window:
+            return
+        self._warn_rate_limit[key] = now
+        logger.warning(message, *args)
+
+    def stuck_replies(self) -> list[dict[str, Any]]:
+        """Operator-facing view of the Stuck-reply outcome (`send_failed`).
+
+        Round 6 NEW-1: `_bound_reply_send_failure` transitions a reply
+        that exhausted `max_delivery_attempts` peer `send` failures to
+        `"send_failed"` IN PLACE -- receipt untouched (always `None`, it
+        never reached the peer), record KEPT (never popped, never DLQ'd).
+        `_replay_reply_outbox` never auto-retries this status; an operator
+        finds it here and reconciles it by hand (see
+        `docs/telegram-onboarding-runbook.md`'s "Stuck reply" entry).
+        """
+        stuck = []
+        for source_id, record in self._state.get("reply_outbox", {}).items():
+            if isinstance(record, dict) and record.get("status") == "send_failed":
+                stuck.append({
+                    "source_id": source_id,
+                    "send_attempts": record.get("send_attempts"),
+                })
+        return stuck
 
     def stranded_notifications(self) -> list[dict[str, Any]]:
         """Notices parked in a terminal state that nothing else ever reconciles.
@@ -1263,6 +1852,93 @@ class MupotAdapter(BasePlatformAdapter):
                     "last_error": notice.get("last_error"),
                 })
         return stranded
+
+    def turn_failure_dlq_summary(self) -> list[dict[str, Any]]:
+        """Operator-facing view of `_TurnFailureDeferred`'s terminal disposition.
+
+        Item 2 (kasra-review re-gate round 2, 2026-09-15): a message
+        dead-lettered at `max_delivery_attempts` (turn_timeout, no_custody,
+        or handler_error -- see `_resolve_turn_failure`) must be visible
+        here, not just in `state.json`'s `dlq` list -- the whole point of
+        bounding retries instead of quarantining is that the operator finds
+        out from a tool, not from reading the durable state file by hand.
+        Only entries tagged with one of this class's own reasons are
+        included; other DLQ reasons (e.g. `invalid_ack_envelope`,
+        `sender_policy`) are pre-existing and out of scope for this surface.
+
+        Round 5 (Athena MED 3a, defense-in-depth on the read side): a `dlq`
+        row and `processed` are not mutually exclusive by construction in
+        every historical code path (a message that later completes through
+        the ordinary reply-replay flow does not retroactively remove any
+        stale `dlq` entry) -- excluding any id already in `processed` here
+        means this operator-facing surface can never claim a delivered
+        message failed, even if a future defect re-introduces a DLQ append
+        for one.
+        """
+        processed = set(self._state.get("processed") or [])
+        summary = []
+        for entry in self._state.get("dlq", []):
+            if not isinstance(entry, dict):
+                continue
+            reason = entry.get("reason")
+            if reason not in _TURN_FAILURE_DLQ_REASONS:
+                continue
+            message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
+            source_id = str(message.get("id") or "")
+            if source_id in processed:
+                continue
+            summary.append({
+                "source_id": source_id,
+                "reason": reason,
+            })
+        return summary
+
+    def lease_reconciliation_status(self) -> Optional[dict[str, Any]]:
+        """Operator-facing view of a durable inbox-lease quarantine, or ``None``.
+
+        Before this fix (2026-09-15, see `_LeaseExpiredDeferred`), nothing
+        surfaced a `lease_reconciliation` marker anywhere an operator could
+        see it short of reading `state.json` directly -- `mupot_gateway_status`
+        reported `{"ok": true, ...}` for an adapter that was fully constructed
+        but could never actually `connect()`. Report presence, the version
+        (marker shapes 1/2/3 mean different things -- see
+        `_lease_reconciliation_proof`), the attempt id when a v3 marker has
+        one, and whether `connect()` will now attempt to self-heal it
+        automatically (only true `_lease_quarantined` markers are attempted;
+        `connect()` reconciles once per call, so a mismatch/countercase
+        still requires the manual `reconcile_inbox_polling()` procedure).
+
+        M10 (kasra-review re-gate round 2, 2026-09-15): this previously read
+        `bool(proof.get("required"))` -- but `_lease_reconciliation_proof`'s
+        returned dict never carries a `required` key at all (it is consumed
+        as a gate condition inside that function, not passed through), so
+        `proof.get("required")` was ALWAYS `None` and this method reported
+        `"required": False` for every genuinely live marker. Zero tests
+        exercised this against a real marker (every one only checked the
+        `None`/absent case), so 116 tests stayed green when the whole method
+        was mutated to always return `None` -- and the same 116 stayed green
+        against the SHIPPED code's own real defect, because nothing checked
+        the value when non-`None`. `_lease_reconciliation_proof` only ever
+        returns non-`None` when the marker's `required` field is exactly
+        `True` (see its own gate: `value.get("required") is not True ->
+        return None`), so `True` here is a fact about `proof`'s existence,
+        not a re-derived guess.
+        """
+        marker = self._state.get("lease_reconciliation")
+        proof = _lease_reconciliation_proof(marker)
+        if proof is None:
+            return None
+        return {
+            "required": True,
+            "version": proof.get("version"),
+            "attempt_id": proof.get("attempt_id"),
+            # Round 3 (kasra re-gate BLOCK-B): computed by the SAME
+            # predicate `connect()` uses to decide whether it reaches the
+            # reconcile attempt (`_is_lease_reconcile_reachable`), not a
+            # separate re-derivation of `_lease_quarantined` alone -- see
+            # that method's docstring for why the two must not drift.
+            "connect_will_attempt_auto_reconcile": self._is_lease_reconcile_reachable(),
+        }
 
     def _log_stranded_notifications_at_startup(self) -> None:
         stranded = self.stranded_notifications()
@@ -1293,11 +1969,25 @@ class MupotAdapter(BasePlatformAdapter):
         text = str(value or "").strip()
         return text or None
 
-    def _delivery_deadline(self, message: dict[str, Any]) -> float:
-        deadline = time.time() + self.turn_timeout
+    def _delivery_deadlines(
+        self, message: dict[str, Any]
+    ) -> tuple[float, Optional[float]]:
+        """Return `(turn_deadline, lease_deadline)` -- the two RAW deadlines,
+        not just their collapsed minimum.
+
+        Class fix (2026-09-15, round 2, see `_TurnFailureDeferred`): kasra-
+        review's re-gate found that collapsing these into one `expires_at`
+        (the pre-round-2 shape of this method) meant `_deliver`'s timeout
+        branch could not tell "the lease died" (item 1, not the turn's
+        fault) apart from "the turn hung with the lease still live" (item 2,
+        a bounded turn failure) -- it always assumed the former. Both
+        deadlines are kept on `_LiveDelivery` so the timeout branch can
+        compare them directly.
+        """
+        turn_deadline = time.time() + self.turn_timeout
         raw_expiry = message.get("lease_expires_at")
         if raw_expiry is None:
-            return deadline
+            return turn_deadline, None
         if not isinstance(raw_expiry, str) or not raw_expiry.strip():
             raise _protocol_error()
         try:
@@ -1309,7 +1999,24 @@ class MupotAdapter(BasePlatformAdapter):
             raise _protocol_error() from None
         if not math.isfinite(lease_deadline):
             raise _protocol_error()
-        return min(deadline, lease_deadline)
+        return turn_deadline, lease_deadline
+
+    @staticmethod
+    def _lease_is_binding(turn_deadline: float, lease_deadline: Optional[float]) -> bool:
+        """True when the message's own lease -- not `turn_timeout` -- is the
+        constraint that governs `min(turn_deadline, lease_deadline)`.
+
+        OPEN-D (kasra re-gate round 3, 2026-09-15): strict `<`, not `<=`. At
+        an EXACT tie, classify as a TURN failure (`_TurnFailureDeferred`,
+        bounded by `delivery_attempts` and DLQ'd at the cap), not a lease
+        expiry (`_LeaseExpiredDeferred`, retried unboundedly by design --
+        see that class's own docstring). Neither reading is more "correct"
+        at an exact tie -- there is no way to know from here which deadline
+        would have fired first -- so this picks the side that fails
+        BOUNDED rather than the side that fails OPEN to unbounded
+        redelivery, same bias as everywhere else in this class of fix.
+        """
+        return lease_deadline is not None and lease_deadline < turn_deadline
 
     def _begin_delivery(
         self,
@@ -1332,9 +2039,14 @@ class MupotAdapter(BasePlatformAdapter):
             session_key=session_key,
             attempt_id=attempt_id,
         )
+        turn_deadline, lease_deadline = self._delivery_deadlines(message)
         runtime = _LiveDelivery(
             context=context,
-            expires_at=self._delivery_deadline(message),
+            expires_at=min(turn_deadline, lease_deadline)
+            if lease_deadline is not None
+            else turn_deadline,
+            turn_deadline=turn_deadline,
+            lease_deadline=lease_deadline,
             source=MappingProxyType(copy.deepcopy(message)),
         )
         metadata = dict(event.metadata or {})
@@ -1622,6 +2334,13 @@ class MupotAdapter(BasePlatformAdapter):
                 "custodied",
                 "complete",
                 "reconciliation_required",
+                # Round 6 NEW-1 (kasra gate, head e0556d61): a terminal,
+                # never-auto-retried disposition for a `"prepared"` reply
+                # whose peer `send` failed `max_delivery_attempts` times --
+                # see `_bound_reply_send_failure`. Zero receipt, same as
+                # `"prepared"` (it never reached the peer); distinct status
+                # so an operator can tell "never tried yet" from "gave up".
+                "send_failed",
             }
             or (receipt is not None and not isinstance(receipt, dict))
         ):
@@ -1641,7 +2360,7 @@ class MupotAdapter(BasePlatformAdapter):
         ):
             raise _protocol_error()
         status = record["status"]
-        if status == "prepared" and receipt is not None:
+        if status in {"prepared", "send_failed"} and receipt is not None:
             raise _protocol_error()
         if status in {"sent", "custodied", "complete"}:
             validate_send_receipt(
@@ -1689,6 +2408,13 @@ class MupotAdapter(BasePlatformAdapter):
             "arguments": arguments,
             "status": "prepared",
             "receipt": None,
+            # Round 5: a purely local counter of failed peer `send` attempts
+            # for this SAME `"prepared"` record, independent of the
+            # message's own `delivery_attempts` -- see
+            # `_bound_reply_send_failure`. Not part of the validated schema
+            # (`_validated_reply_record` does not require it, so legacy
+            # on-disk records without it default to 0 wherever it is read).
+            "send_attempts": 0,
         }
         return self._persist_reply_record(source_id, record)
 
@@ -1720,6 +2446,17 @@ class MupotAdapter(BasePlatformAdapter):
         source_id = record["source_id"]
         record = self._validated_reply_record(source_id, record)
         if record["status"] == "reconciliation_required":
+            raise _protocol_error()
+        if record["status"] == "send_failed":
+            # Round 6 NEW-1: terminal by design, never auto-retried.
+            # `_replay_reply_outbox` never calls this method for a
+            # `"send_failed"` record (it skips them outright, see that
+            # method) -- this branch only guards the OTHER caller, the live
+            # interim `send()` path, when a message carrying an already-
+            # exhausted reply is redelivered and handled again. Refuse
+            # before any network call; `send()`'s own generic exception
+            # handling turns this into an ordinary failed `SendResult`
+            # without touching the peer or this record.
             raise _protocol_error()
         if record["status"] == "prepared":
             # Choke point for the peer `send` MCP tool (kasra-review re-gate
@@ -1767,35 +2504,89 @@ class MupotAdapter(BasePlatformAdapter):
         if record["status"] == "sent":
             from .notifications import enqueue
 
-            enqueue(
-                self._state,
-                self.store,
-                record["source"],
-                record["arguments"]["body"],
-            )
-            # enqueue performs its own durable readback. Persisting this status
-            # after it means source consumption can require both custody proofs.
-            durable_record = self._state.get("reply_outbox", {}).get(source_id)
-            record = self._validated_reply_record(source_id, durable_record)
-            record = self._update_reply_record(
-                source_id,
-                record,
-                status="custodied",
-            )
+            # Athena gate addendum (head e0556d61, folded into round 6): the
+            # peer already CONFIRMED this reply (validated receipt on file,
+            # status already `"sent"`) -- only the local notification-
+            # durability tail runs here. A failure in it (e.g.
+            # `NotificationConflict` on an old `source_fingerprint_version`,
+            # live-reachable on kayhermes state) is a bounded local retry of
+            # the NOTIFICATION only, never a reply-state regression: this
+            # method does not raise for it, so neither `_replay_reply_
+            # outbox`'s per-tick call nor a live interim `send()` call ever
+            # sees an exception here, and the record simply stays `"sent"`
+            # for `_reply_outbox_has_custody` (which already treats `"sent"`
+            # as custody) until a later tick's `enqueue()` call succeeds.
+            try:
+                enqueue(
+                    self._state,
+                    self.store,
+                    record["source"],
+                    record["arguments"]["body"],
+                )
+            except Exception as exc:
+                self._warn_rate_limited(
+                    f"notification_enqueue:{source_id}",
+                    "[mupot] notification enqueue deferred for message=%s "
+                    "(reply already delivered to peer, receipt on file): %s",
+                    source_id,
+                    exc,
+                )
+            else:
+                # enqueue performs its own durable readback. Persisting this
+                # status after it means source consumption can require both
+                # custody proofs.
+                durable_record = self._state.get("reply_outbox", {}).get(source_id)
+                record = self._validated_reply_record(source_id, durable_record)
+                record = self._update_reply_record(
+                    source_id,
+                    record,
+                    status="custodied",
+                )
         final_receipt = record.get("receipt")
         if not isinstance(final_receipt, dict):
             raise _protocol_error()
         return final_receipt
 
-    def _reply_has_human_custody(self, source_id: str) -> bool:
+    def _reply_outbox_has_custody(self, source_id: str) -> bool:
+        """Has the staged reply reached remote custody?
+
+        ONE custody definition (Athena gate addendum on head e0556d61,
+        folded into round 6): the record holds a validated peer `send`
+        receipt -- status `"sent"`, `"custodied"`, or `"complete"`, each of
+        which `_validated_reply_record` already requires to carry one.
+        Previously this was TWO different predicates: this method accepted
+        only `"custodied"`/`"complete"`, while the (now-removed)
+        `_reply_has_human_custody` additionally required
+        `notification_outbox[...].custody_status == "durable"` -- a
+        separate, downstream, in-process notification-durability concern.
+        That extra requirement was the bug: a handler that succeeded, whose
+        reply the peer's own `send` CONFIRMED (status advances to
+        `"sent"`), whose only failure was the local `notifications.enqueue`
+        call afterwards (e.g. `NotificationConflict` on an old
+        `source_fingerprint_version`, live-reachable on kayhermes state)
+        reported `False` here -- "no custody" -- for a reply the peer
+        already has. `_resolve_turn_failure`'s guard then cleared `pending`
+        for a message that DID have a receipt on file, and the very next
+        `_replay_reply_outbox` tick found `pending` not matching a
+        receipt-bearing record and escalated to `reconciliation_required`:
+        fatal, `connect()` refused on every subsequent restart.
+
+        Once Mupot's own `send` has acknowledged a reply, it is delivered
+        from the PEER's point of view regardless of what this process's own
+        notification bookkeeping does with it afterwards -- `_transmit_
+        final_reply` itself is what carries a `"sent"` record the rest of
+        the way to `"custodied"` (retrying the local `enqueue()` on each
+        call; see that method), and a failure there is now a bounded local
+        retry of the notification only, never a reply-state regression. A
+        `"prepared"` or `"send_failed"` record (zero custody, never
+        transmitted or permanently unsendable) returns `False`, as does any
+        record without a receipt.
+        """
         record = self._state.get("reply_outbox", {}).get(source_id)
-        notice = self._state.get("notification_outbox", {}).get(source_id)
         return bool(
             isinstance(record, dict)
-            and record.get("status") in {"custodied", "complete"}
+            and record.get("status") in {"sent", "custodied", "complete"}
             and isinstance(record.get("receipt"), dict)
-            and isinstance(notice, dict)
-            and notice.get("custody_status") == "durable"
         )
 
     def _mark_reply_complete(self, source_id: str) -> None:
@@ -1804,6 +2595,110 @@ class MupotAdapter(BasePlatformAdapter):
         if validated["status"] != "complete":
             self._update_reply_record(source_id, validated, status="complete")
 
+    async def _bound_reply_send_failure(
+        self,
+        source_id: str,
+        record: dict[str, Any],
+        exc: BaseException,
+    ) -> None:
+        """Bound repeated peer `send` failures for a `"prepared"` (zero
+        custody, never transmitted) reply.
+
+        Round 6 (kasra gate, head e0556d61, NEW-1 P0): the round-5 version of
+        this method took the CALLER's loop-top `record` snapshot and blind-
+        wrote `dict(record)` back over the durable row on ANY exception --
+        including one raised (by `notifications.enqueue`, inside
+        `_transmit_final_reply`'s `"sent"` branch) AFTER the peer `send`
+        already succeeded and this same method's caller (`_replay_reply_
+        outbox`) had already persisted `status="sent"` + a validated
+        receipt. That stale snapshot overwrite silently regressed a
+        genuinely delivered reply back to `"prepared"`/`receipt: None` --
+        the peer could then receive the exact same `send` call again on the
+        next replay tick (bounded only by the peer's own `request_id`
+        dedup, never verified here). Fix: re-read the DURABLE record before
+        touching anything. If it already advanced past `"prepared"` (the
+        transmit landed and only some later step, e.g. notification
+        enqueue, raised), do nothing here at all -- there is nothing to
+        bound, and every other read of this record already treats a
+        receipt-bearing status as custody.
+
+        The message's own `delivery_attempts` cannot bound the ordinary
+        case (peer `send` itself failing): the server never re-leases a
+        message this process is still holding, so that counter does not
+        move between one `_replay_reply_outbox` tick and the next. This
+        uses a purely local counter persisted on the record itself
+        (`send_attempts`, seeded at 0 by `_prepare_final_reply`), capped
+        with the SAME semantics as `max_delivery_attempts` (reuses the
+        identical config value, not a separate knob).
+
+        Below the cap: log (rate-limited, NEW-5) and leave the record
+        `"prepared"` -- the next tick tries again, same as any other
+        bounded deferral. At the cap: transition status to `"send_failed"`
+        IN PLACE -- never a `dict(record)` write-back, never a pop. The
+        receipt stays `None` (this reply never reached the peer); the
+        record is KEPT, not dropped, so an operator can see and reconcile
+        it via `mupot_gateway_status`'s `stuck_replies` field and the
+        existing reconcile procedure, same spirit as `lease_reconciliation`
+        for the inbox-lease side. `_replay_reply_outbox` never auto-retries
+        a `"send_failed"` record (see that method) so this status change
+        alone is what lets the poll loop resume leasing -- no DLQ append,
+        no drop required for that purpose.
+        """
+        durable, valid = self.store.load_checked()
+        if not valid:
+            raise _protocol_error()
+        durable_outbox = durable.get("reply_outbox")
+        durable_record = (
+            durable_outbox.get(source_id) if isinstance(durable_outbox, dict) else None
+        )
+        if not isinstance(durable_record, dict):
+            # Already resolved and removed by some other path (e.g. the
+            # source showed up in `processed` and `_mark_reply_complete`/
+            # cleanup ran first) -- nothing left here to bound.
+            return
+        validated = self._validated_reply_record(source_id, durable_record)
+        if validated["status"] in {"sent", "custodied", "complete"}:
+            # The transmit landed -- whatever raised happened AFTER a
+            # validated receipt was already persisted (e.g. the local
+            # notification-enqueue tail). Not this method's concern; the
+            # next `_replay_reply_outbox` tick carries it the rest of the
+            # way.
+            return
+        self._state = durable
+        attempts = int(validated.get("send_attempts") or 0) + 1
+        self._warn_rate_limited(
+            f"reply_send_failure:{source_id}",
+            "[mupot] reply send failed for staged message=%s attempt=%s/%s: %s",
+            source_id,
+            attempts,
+            self.max_delivery_attempts,
+            exc,
+        )
+        if attempts < self.max_delivery_attempts:
+            updated = dict(validated)
+            updated["send_attempts"] = attempts
+            self._persist_reply_record(source_id, updated)
+            return
+        logger.warning(
+            "[mupot] staged reply for message=%s reached max_delivery_attempts=%s "
+            "with zero custody -- marking send_failed IN PLACE (receipt "
+            "untouched, record kept for operator reconciliation)",
+            source_id,
+            self.max_delivery_attempts,
+        )
+        updated = dict(validated)
+        updated["send_attempts"] = attempts
+        updated["status"] = "send_failed"
+        self._persist_reply_record(source_id, updated)
+        pending = self._state.get("pending")
+        pending_message = pending.get("message") if isinstance(pending, dict) else None
+        if (
+            isinstance(pending_message, dict)
+            and str(pending_message.get("id") or "").strip() == source_id
+        ):
+            self._state["pending"] = None
+            self.store.save(self._state)
+
     async def _replay_reply_outbox(self) -> None:
         outbox = self._state.get("reply_outbox")
         if not isinstance(outbox, dict):
@@ -1811,6 +2706,16 @@ class MupotAdapter(BasePlatformAdapter):
         for source_id in list(outbox):
             record = self._validated_reply_record(source_id, outbox[source_id])
             if record["status"] == "complete":
+                continue
+            if record["status"] == "send_failed":
+                # Round 6 (kasra gate, item 2/NEW-1): terminal by design --
+                # never retried automatically. Operator reconciliation is
+                # via `mupot_gateway_status`'s `stuck_replies` field and the
+                # existing reconcile procedure, not this loop. Skipping here
+                # (rather than attempting `_transmit_final_reply`, which
+                # would just raise `_protocol_error()` for this status) is
+                # what keeps this method from ever raising/stalling the
+                # poll tick for one of these records.
                 continue
             if record["version"] == _LEGACY_REPLY_OUTBOX_VERSION:
                 self._reply_reconciliation_required = True
@@ -1821,27 +2726,62 @@ class MupotAdapter(BasePlatformAdapter):
             if source_id in self._state.get("processed", []):
                 self._mark_reply_complete(source_id)
                 continue
-            pending = self._state.get("pending")
-            pending_message = pending.get("message") if isinstance(pending, dict) else None
-            if (
-                not isinstance(pending_message, dict)
-                or str(pending_message.get("id") or "").strip() != source_id
-                or _reply_source_fingerprint(pending_message)
-                != record["source_fingerprint"]
-            ):
-                self._update_reply_record(
-                    source_id,
-                    record,
-                    status="reconciliation_required",
-                )
-                raise _protocol_error()
             if record["status"] == "prepared":
+                # Round 5 (kasra-review P0): a `"prepared"` reply has zero
+                # custody. `_resolve_turn_failure` never holds `pending` for
+                # it (custody-only guard, see its docstring), so the common
+                # shape here is an open `"prepared"` record with `pending`
+                # already `None` -- a KNOWN outcome from earlier in this
+                # same process (the peer `send` failed with a real
+                # exception), not the ambiguous-crash state the mismatch
+                # escalation below exists to catch. Retrying a `"prepared"`
+                # record is always safe (the `send` MCP tool is idempotent
+                # on `request_id`), so bound OUR OWN retries locally instead
+                # of escalating a known-safe state to
+                # `reconciliation_required`.
+                #
+                # Round 6 NEW-3 (kasra gate, regression of round-4 commit
+                # 6547fd8): this preflight must run before EVERY transmit
+                # attempt, unconditionally -- round 5 gated it on
+                # `pending_matches`, so a reply whose ownership no longer
+                # checks out (profile/consumer-fence drift) transmitted to
+                # the peer BEFORE ownership validation whenever `pending`
+                # had already been cleared, which is the COMMON shape for a
+                # `"prepared"` retry (see above). Restored to its original,
+                # unconditional placement.
                 await self._preflight_persisted_ownership(
                     record["ack_ownership"],
                     require_attempt=True,
                 )
-            await self._transmit_final_reply(record)
-            if not self._reply_has_human_custody(source_id):
+                try:
+                    await self._transmit_final_reply(record)
+                except (_EstopDeferred, MupotProtocolError):
+                    raise
+                except Exception as exc:
+                    await self._bound_reply_send_failure(source_id, record, exc)
+                    continue
+            else:
+                # Athena gate addendum (head e0556d61): the ONLY statuses
+                # that reach this branch are `"sent"`/`"custodied"` (every
+                # other status is filtered out above), and
+                # `_validated_reply_record` already REQUIRES a validated
+                # receipt for both -- `self._reply_outbox_has_custody(
+                # source_id)` is therefore unconditionally true here by
+                # construction. Round 5's mismatched-`pending` escalation to
+                # `reconciliation_required` for this branch is removed: it
+                # was reachable only for a record that ALWAYS had custody
+                # (the peer already has it, regardless of what this
+                # process's own `pending` bookkeeping says), so it could
+                # only ever misfire -- exactly the live P0 the addendum
+                # closed (a confirmed `"sent"` reply, `pending` cleared by
+                # an unrelated no-custody classification, escalated to a
+                # fatal, `connect()`-refusing state on the next tick). Complete
+                # it via the ordinary replay below. This call must never
+                # raise/stall the tick: `_transmit_final_reply`'s own
+                # `"sent"` branch bounds the local notification `enqueue()`
+                # retry internally (see that method) instead of propagating.
+                await self._transmit_final_reply(record)
+            if not self._reply_outbox_has_custody(source_id):
                 raise _protocol_error()
             await self._ack_persisted_ownership(
                 source_id,
@@ -1849,6 +2789,99 @@ class MupotAdapter(BasePlatformAdapter):
             )
             self._commit(source_id)
             self._mark_reply_complete(source_id)
+
+    def _compute_legacy_pending_ambiguous(self) -> bool:
+        """Is the CURRENT `self._state["pending"]` genuinely ambiguous crash
+        state (v1/legacy detection, pre-dating the v3 `lease_reconciliation`
+        marker)?
+
+        Round 3 (kasra re-gate BLOCK-B): this used to be computed exactly
+        once, in `__init__`, off the state loaded from disk at construction
+        time. That is stale the moment anything else in this process
+        mutates `self._state["pending"]` afterwards -- in particular,
+        `_reconcile_inbox_polling_with_active_scope`'s own terminal-tombstone
+        branch drops an unrelated, unstaged `pending` itself (see that
+        method: "nothing was consumed and nothing is waiting to be delivered
+        for the pending source ... drop it rather than leave it to fence a
+        future, unrelated crash as ambiguous") -- a real, existing "deferral
+        tombstone" that can explain away an ambiguous `pending` the
+        constructor saw. `connect()` re-calls this method AFTER attempting
+        that reconcile (not the cached `__init__`-time attribute) so a
+        tombstone applied during THIS `connect()` call is picked up
+        immediately, in the same call, rather than requiring a second
+        restart. `self._legacy_pending_ambiguous` (the cached attribute) is
+        left as the `__init__`-time snapshot for anything that wants to know
+        what was true when the adapter was constructed.
+        """
+        pending = self._state.get("pending")
+        pending_message = pending.get("message") if isinstance(pending, dict) else None
+        pending_id = (
+            str(pending_message.get("id") or "").strip()
+            if isinstance(pending_message, dict)
+            else ""
+        )
+        return pending is not None and (
+            not pending_id or pending_id not in self._state.get("reply_outbox", {})
+        )
+
+    def _is_lease_reconcile_reachable(self) -> bool:
+        """Would `connect()`, for CURRENT state, actually attempt the
+        `_lease_quarantined` auto-reconcile step?
+
+        Round 3 (kasra re-gate BLOCK-B): `lease_reconciliation_status()`'s
+        `connect_will_attempt_auto_reconcile` field used to be a bare
+        `bool(self._lease_quarantined)` -- true whenever a v3 marker
+        existed, regardless of whether an EARLIER `connect()` gate (reply
+        state invalid, Routine reconciliation required) would refuse first
+        and never let execution reach the reconcile attempt at all. That let
+        status report a self-heal as imminent when it structurally could not
+        run. This is the ONE function both `_connect_with_active_scope` and
+        `lease_reconciliation_status()` call, so the two can never drift out
+        of sync again -- reflects only the gates that run BEFORE the
+        reconcile attempt in `connect()`'s current order; deliberately does
+        NOT include `_legacy_pending_ambiguous`, which (same fix) now runs
+        AFTER the reconcile attempt, not before it.
+
+        Round 4 (2026-09-15, Athena second eye, head c68e0839, B3 residual):
+        `_connect_with_active_scope`'s OWN first gate -- profile-owner
+        fingerprint unavailable or mismatched -- refuses before this
+        function is ever consulted, but this predicate did not account for
+        it, so a marker under a mismatched profile still reported
+        `connect_will_attempt_auto_reconcile: true` even though `connect()`
+        would refuse at that very first `if`, never reaching the reconcile
+        attempt at all. Re-derives the identical check `_connect_with_
+        active_scope` runs (`_profile_owner_fingerprint(self._secret_owner,
+        validate=True)` against the constructor-time snapshot) rather than
+        reading a cached flag, for the same reason `_legacy_pending_
+        ambiguous` is re-derived live elsewhere in this module: this can be
+        called at any time, not just at `connect()`.
+
+        Round 5 (LOW-3): `validate=True` performs real profile-store I/O
+        (re-reads and re-verifies the on-disk profile fingerprint) on EVERY
+        call, and this method is reachable from `mupot_gateway_status` (via
+        `lease_reconciliation_status()`) -- an operator/monitoring surface
+        that may be polled frequently. Deliberately not cached: the whole
+        point of `validate=True` here (vs. the unvalidated
+        `self._profile_owner_fingerprint` constructor-time snapshot it is
+        compared against) is to catch a profile SWAPPED OUT FROM UNDER a
+        live process between status calls -- caching the validated value
+        would silently reintroduce the stale-trust gap `validate=True` exists
+        to close. One profile-store read per status call is the accepted
+        cost of that guarantee; if this ever shows up as a real hot path,
+        rate-limit the STATUS TOOL CALL itself, not this check.
+        """
+        current_owner_fingerprint = _profile_owner_fingerprint(
+            self._secret_owner,
+            validate=True,
+        )
+        return bool(self._lease_quarantined) and not (
+            self._profile_owner_fingerprint is None
+            or current_owner_fingerprint != self._profile_owner_fingerprint
+            or self._reply_state_invalid
+            or self._reply_reconciliation_required
+            or self._routine_state_invalid
+            or self._routine_reconciliation_required
+        )
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if self._secret_owner is not None:
@@ -1871,11 +2904,7 @@ class MupotAdapter(BasePlatformAdapter):
         ):
             logger.error("[mupot] connect blocked; profile owner unavailable")
             return False
-        if (
-            self._reply_state_invalid
-            or self._legacy_pending_ambiguous
-            or self._reply_reconciliation_required
-        ):
+        if self._reply_state_invalid or self._reply_reconciliation_required:
             logger.error("[mupot] connect blocked; reply reconciliation required")
             return False
         if self._routine_state_invalid:
@@ -1886,8 +2915,53 @@ class MupotAdapter(BasePlatformAdapter):
                 "[mupot] connect blocked; Routine events are disabled with pending custody"
             )
             return False
-        if self._lease_quarantined:
-            logger.error("[mupot] connect blocked; inbox reconciliation required")
+        # Round 3 (kasra re-gate BLOCK-B): the `_lease_quarantined` auto-
+        # reconcile attempt below used to run AFTER the legacy-pending-
+        # ambiguous check that used to be bundled into the first `if` above.
+        # A restart carrying BOTH a stale `pending` (ambiguous) AND a v3
+        # `lease_reconciliation` marker refused at the pending check and
+        # NEVER reached this block, so the marker's self-heal never got a
+        # chance to run even though `lease_reconciliation_status()` reported
+        # `connect_will_attempt_auto_reconcile: True` -- an operator fixing
+        # the pending ambiguity by hand would then hit a SECOND, separate
+        # manual-reconcile requirement that a prior restart could already
+        # have cleared on its own. Moved here, before the pending check, so
+        # the two failure classes are independent: this always gets its
+        # shot regardless of what the pending check below decides.
+        if self._is_lease_reconcile_reachable():
+            # Class fix (2026-09-15): a `required: true` marker left by
+            # `_LeaseExpiredDeferred`'s class of defect (or any other
+            # genuinely-empty terminal tombstone -- see
+            # `_reconcile_inbox_polling_with_active_scope`) is, by
+            # construction, SELF-HEALING: the server is the authority on
+            # whether anything was actually consumed, and reconciliation
+            # only ever clears when it proves nothing was. Before this fix,
+            # a `required: true` marker blocked `connect()` forever, across
+            # every operator restart, because nothing ever called
+            # `reconcile_inbox_polling()` -- the live incident this closes
+            # (kayhermes gateway, 2026-09-15) needed a human to notice and
+            # invoke it manually. Attempt it once, here, before refusing: if
+            # it clears, proceed exactly as if never quarantined; if a real
+            # countercase holds (reply still staged, attempt/owner/tenant
+            # mismatch, readback failure), it returns False and this refuses
+            # precisely as before.
+            self._reconciling = True
+            try:
+                if not await self._reconcile_inbox_polling_with_active_scope():
+                    logger.error("[mupot] connect blocked; inbox reconciliation required")
+                    return False
+            finally:
+                self._reconciling = False
+            logger.info(
+                "[mupot] inbox lease reconciliation cleared automatically at connect"
+            )
+        # Re-evaluated live, not the `__init__`-time `self._legacy_pending_
+        # ambiguous` snapshot: the reconcile attempt just above can itself
+        # have cleared `pending` via its own terminal-tombstone branch (see
+        # `_compute_legacy_pending_ambiguous`'s docstring) in THIS call.
+        self._legacy_pending_ambiguous = self._compute_legacy_pending_ambiguous()
+        if self._legacy_pending_ambiguous:
+            logger.error("[mupot] connect blocked; reply reconciliation required")
             return False
         try:
             require_supported_profile_runtime({})
@@ -2140,23 +3214,57 @@ class MupotAdapter(BasePlatformAdapter):
                         message,
                         attempt_id=marker["attempt_id"],
                     )
-                except _EstopDeferred:
-                    # Same class as _poll_loop's own handling: a pause that happens
-                    # to be engaged while an operator is reconciling an existing
-                    # quarantine is not itself a NEW protocol violation. Leave the
-                    # quarantine marker exactly as it was (nothing here proves the
-                    # original attempt's outcome one way or the other) and let the
-                    # caller retry `reconcile_inbox_polling()` once `hermes resume`
-                    # lifts the pause, instead of logging this as a failed
-                    # reconciliation.
+                except _DeliveryDeferred as deferred:
+                    # Same class as _poll_loop's own handling: a pause, or a
+                    # lease that expires while an operator is reconciling an
+                    # existing quarantine, is not itself a NEW protocol
+                    # violation. Leave the quarantine marker exactly as it was
+                    # (nothing here proves the original attempt's outcome one
+                    # way or the other) and let the caller retry
+                    # `reconcile_inbox_polling()` once the condition clears,
+                    # instead of logging this as a failed reconciliation.
                     logger.info(
-                        "[mupot] inbox reconciliation deferred: Hermes global "
-                        "emergency stop is engaged"
+                        "[mupot] inbox reconciliation deferred: %s", deferred.reason
                     )
                     return False
                 message_id = message["id"]
                 if message_id not in self._state.get("processed", []):
                     raise _protocol_error()
+            else:
+                # Terminal tombstone (empty/cancelled/expired/acked): the
+                # attempt itself is gone and the server confirms nothing was
+                # consumed through it -- but the attempt id alone says
+                # nothing about the PENDING SOURCE it may have held mid-turn
+                # (class fix, 2026-09-15, see _LeaseExpiredDeferred). Only
+                # `reply_outbox` says whether a reply is still staged for
+                # that source. Clearing here while one is staged would let a
+                # later `_replay_reply_outbox` transmit or ack using
+                # ownership tied to an attempt this call just tombstoned --
+                # preserve the fence for a human whenever that risk is real,
+                # and self-heal only the genuinely empty case.
+                pending = self._state.get("pending")
+                pending_message = (
+                    pending.get("message") if isinstance(pending, dict) else None
+                )
+                pending_id = (
+                    str(pending_message.get("id") or "").strip()
+                    if isinstance(pending_message, dict)
+                    else ""
+                )
+                if pending_id and pending_id in self._state.get("reply_outbox", {}):
+                    logger.error(
+                        "[mupot] inbox reconciliation preserved: reply_outbox "
+                        "holds a record for the pending source=%s of a terminal, "
+                        "unconsumed attempt=%s",
+                        pending_id,
+                        marker["attempt_id"],
+                    )
+                    return False
+                # Nothing was consumed and nothing is waiting to be delivered
+                # for the pending source: it can never resume (the attempt
+                # tombstoned), so drop it rather than leave it to fence a
+                # future, unrelated crash as ambiguous.
+                self._state["pending"] = None
             self._clear_lease_fence()
         except Exception:
             logger.error("[mupot] inbox attempt reconciliation failed")
@@ -2208,6 +3316,17 @@ class MupotAdapter(BasePlatformAdapter):
                 # This is the SAME class as the lease-time race below: defer and
                 # retry next tick, never treat it as the routine-event
                 # reconciliation failure the bare `except Exception` below is for.
+                #
+                # Item 4 (kasra-review re-gate round 2, 2026-09-15): kept
+                # narrow to `_EstopDeferred` deliberately, not widened to the
+                # `_DeliveryDeferred` base -- `_replay_routine_events` only
+                # ever reaches `_ack_persisted_ownership`'s choke point
+                # (`_refuse_ack_if_estop_engaged`), never `_deliver`, so
+                # `_LeaseExpiredDeferred`/`_TurnFailureDeferred` are
+                # structurally impossible here. Widening would silently
+                # accept a class of exception this function can never
+                # actually raise, which is the wrong shape to leave for a
+                # future reader to reason about.
                 logger.info(
                     "[mupot] routine event replay deferred mid-iteration: Hermes "
                     "global emergency stop is engaged"
@@ -2234,6 +3353,13 @@ class MupotAdapter(BasePlatformAdapter):
                 # pause it actually is -- functionally harmless (both paths
                 # sleep and continue) but mislabeled, and the wrong shape to
                 # extend if this function ever needs pause-specific bookkeeping.
+                #
+                # Item 4 (kasra-review re-gate round 2, 2026-09-15): kept
+                # narrow deliberately, same reasoning as
+                # `_replay_routine_events`'s catch above -- `_replay_reply_outbox`
+                # only ever reaches `_transmit_final_reply`'s choke point, never
+                # `_deliver`, so the lease-expiry/turn-failure subclasses cannot
+                # occur here.
                 logger.info(
                     "[mupot] reply outbox replay deferred mid-iteration: Hermes "
                     "global emergency stop is engaged"
@@ -2301,29 +3427,54 @@ class MupotAdapter(BasePlatformAdapter):
                     )
                     try:
                         await self._process_leased_message(message, attempt_id=attempt_id)
-                    except _EstopDeferred:
-                        # The e-stop engaged between this iteration's pre-lease check
-                        # above and the message actually being handled (a narrow race,
-                        # not the common case, but the SAME class: a pause is never a
-                        # protocol error). `_deliver`/`_handle_routine_event`/
-                        # `_handle_ack_envelope` raise this before touching any durable
-                        # state -- but `_process_leased_message`'s own sender_policy
-                        # DLQ branch and `_handle_ack_envelope`'s invalid_ack_envelope
-                        # branch each write a DLQ row BEFORE reaching the ack that can
-                        # raise this (P3, kasra-review re-gate #4, 2026-09-14): that
-                        # write is idempotent by message id, so redelivery after this
-                        # exact race re-enters the same branch without duplicating the
-                        # row. Release this attempt's lease fence (no reconciliation is
-                        # owed for a lease we chose to abandon, as opposed to one a
-                        # genuine protocol violation left dangling) and let the
-                        # server-side lease expire on its own so `inbox_lease`
-                        # redelivers the exact same message once `hermes resume` lifts
-                        # the pause.
-                        logger.info(
-                            "[mupot] deferring leased message=%s mid-poll: Hermes "
-                            "global emergency stop is engaged; leaving lease to expire "
-                            "for redelivery",
+                    except _DeliveryDeferred as deferred:
+                        # A pause engaging between this iteration's pre-lease check
+                        # above and the message actually being handled is a narrow
+                        # race (not the common case), and a message's own lease
+                        # expiring mid-turn is the common case for a slow turn --
+                        # but both are the SAME class: neither is a protocol error.
+                        # `_handle_routine_event`/`_handle_ack_envelope` raise
+                        # `_EstopDeferred` before touching any durable state, but
+                        # (F1, kasra-review re-gate round 2, 2026-09-15: this
+                        # comment previously claimed the same for `_deliver`
+                        # unconditionally, which is false) `_deliver` itself
+                        # writes `pending` to durable state BEFORE it can raise
+                        # `_LeaseExpiredDeferred`/`_TurnFailureDeferred` -- (round
+                        # 3, kasra re-gate BLOCK-A) both of those raise sites now
+                        # explicitly clear `pending` back to `None` before
+                        # raising, same invariant as every other
+                        # `_DeliveryDeferred` site (see each class's own
+                        # docstring), rather than never having written it at
+                        # all. `_process_leased_message`'s own sender_policy DLQ
+                        # branch and `_handle_ack_envelope`'s invalid_ack_envelope
+                        # branch each write a DLQ row BEFORE reaching the ack
+                        # that can raise this (P3, kasra-review re-gate #4,
+                        # 2026-09-14): that write is idempotent by message id, so
+                        # redelivery after this exact race re-enters the same
+                        # branch without duplicating the row. Release this
+                        # attempt's lease fence (no reconciliation is owed for a
+                        # lease we chose to abandon, as opposed to one a genuine
+                        # protocol violation left dangling) and let the server-side
+                        # lease expire on its own so `inbox_lease` redelivers the
+                        # exact same message once the deferred condition clears.
+                        # Round 5 (LOW-2): `_TurnFailureDeferred.terminal` was
+                        # set on the exception but never read anywhere -- dead
+                        # weight on an otherwise-informative attribute. A
+                        # terminal disposition means the pot's own reaper is
+                        # about to dead-letter this row server-side, which is
+                        # a materially different, more actionable event for
+                        # an operator watching logs than an ordinary bounded
+                        # retry; log it at WARNING instead of INFO.
+                        log = (
+                            logger.warning
+                            if getattr(deferred, "terminal", False)
+                            else logger.info
+                        )
+                        log(
+                            "[mupot] deferring leased message=%s mid-poll: %s; "
+                            "leaving lease to expire for redelivery",
                             message_id,
+                            deferred.reason,
                         )
                         self._clear_lease_fence()
                         await asyncio.sleep(self.poll_interval)
@@ -2337,6 +3488,50 @@ class MupotAdapter(BasePlatformAdapter):
                 self._quarantine_inbox_polling()
                 return
             await asyncio.sleep(self.poll_interval)
+
+    def _mark_local_turn_failure(self, message_id: str) -> None:
+        """Record `message_id` as non-evictable evidence for `_has_local_
+        turn_failure_dlq` -- round 6 NEW-4 (kasra gate).
+
+        The round-5 predicate scanned `self._state["dlq"]`, which every
+        write site truncates to its last 100 entries
+        (`dlq[-100:]`). A message dead-lettered here, followed by 100+
+        LATER, unrelated `dlq` rows (another message's own turn failure,
+        `sender_policy`, `invalid_ack_envelope`) evicted its row from that
+        window, silently reopening the exact unbounded local re-execution
+        this skip exists to close (measured pre-round-5: 258 turns). This
+        set is capped independently, at 1000 (10x the `dlq` window), and
+        nothing else ever trims it early -- an id added here stays until
+        the cap itself rolls it off, long after any realistic `dlq` churn
+        would have evicted the corresponding row.
+        """
+        ids = self._state.setdefault("turn_failure_ids", [])
+        if message_id not in ids:
+            ids.append(message_id)
+        self._state["turn_failure_ids"] = ids[-1000:]
+
+    def _has_local_turn_failure_dlq(self, message_id: str) -> bool:
+        """Does this id already carry a LOCAL turn-failure dead-letter row?
+
+        Round 6 NEW-4: reads the dedicated `turn_failure_ids` set first (see
+        `_mark_local_turn_failure`) -- independently capped, so 100+ later
+        DLQ rows for OTHER messages can never evict this id's evidence the
+        way the round-5 `dlq[-100:]` scan could. Also still scans `dlq`
+        itself (scoped to `_TURN_FAILURE_DLQ_REASONS` -- other reasons,
+        `sender_policy`/`invalid_ack_envelope`, are permanent local policy
+        decisions that intentionally DO ack after DLQ'ing, see their own
+        call sites) as a fallback for state written by a pre-round-6
+        process that never populated the new set.
+        """
+        turn_failure_ids = self._state.get("turn_failure_ids")
+        if isinstance(turn_failure_ids, list) and message_id in turn_failure_ids:
+            return True
+        for entry in self._state.get("dlq") or []:
+            if not isinstance(entry, dict) or entry.get("reason") not in _TURN_FAILURE_DLQ_REASONS:
+                continue
+            if str((entry.get("message") or {}).get("id") or "") == message_id:
+                return True
+        return False
 
     async def _process_leased_message(
         self,
@@ -2381,8 +3576,53 @@ class MupotAdapter(BasePlatformAdapter):
                 self._commit(message_id)
             return
         if message_id in self._state["processed"]:
+            # Round 6 NEW-4 (kasra gate): this short-circuit MUST run before
+            # the local-turn-failure-dlq skip below. An id can end up in
+            # BOTH `processed` (it later completed through the ordinary
+            # reply-replay flow) AND carrying a stale turn-failure `dlq`/
+            # `turn_failure_ids` entry from an earlier attempt (`dlq` rows
+            # are not retroactively removed on later success -- see
+            # `turn_failure_dlq_summary`'s own defense-in-depth exclusion).
+            # With the skip checked first (as round 5 had it), such an id
+            # could NEVER be re-acked: every redelivery hit the skip branch
+            # below, which raises without acking, forever. Checking
+            # `processed` first means a message that later succeeded is
+            # always re-acked normally, regardless of what its `dlq`
+            # history says.
             await self._ack_expected(message_id, attempt_id=attempt_id)
             return
+        if self._has_local_turn_failure_dlq(message_id):
+            # Round 5 (Athena MED 3b/3c): `_resolve_turn_failure`'s at-cap
+            # branch deliberately leaves this row UNACKED for the pot's own
+            # reaper to dead-letter server-side (see its docstring) -- this
+            # plugin trusts the server's `leasable` predicate to stop
+            # handing it out once the reaper marks it. A non-conforming
+            # server that keeps re-leasing this id anyway must not get
+            # another local turn: that would be unbounded local
+            # re-execution against a message we already know can never
+            # gain custody through this path (measured: 258 turns before
+            # this fix). Skip it entirely -- no new turn, no ack (acking is
+            # still not this process's call to make; it would set
+            # `read_at` and defeat the reaper's own `IS NULL` gate) -- and
+            # leave the lease to expire.
+            self._warn_rate_limited(
+                f"local_turn_failure_dlq_skip:{message_id}",
+                "[mupot] leased message=%s already carries a local turn-"
+                "failure dead-letter; skipping without ack, leaving it for "
+                "the pot's own reaper",
+                message_id,
+            )
+            # Raise (never a bare `return`): `_poll_loop`'s post-call check
+            # treats "returned normally but message_id not in processed" as
+            # `_protocol_error()` -- the same brick shape every other
+            # `_DeliveryDeferred` site in this module exists to avoid. No
+            # `pending` was ever set for a message this branch never
+            # delivers, so there is nothing for `_TurnFailureDeferred` to
+            # clear here; it is reused purely for its terminal, non-acking,
+            # non-quarantining disposition.
+            raise _TurnFailureDeferred(
+                message_id, "already_dead_lettered", terminal=True
+            )
         if is_ack_envelope(message) and should_accept_message(
             message, self.allowed_agents
         ):
@@ -2590,9 +3830,22 @@ class MupotAdapter(BasePlatformAdapter):
         self.store.save(self._state)
         event, runtime = self._begin_delivery(message, attempt_id=attempt_id)
         if self._expire_if_needed(runtime):
+            # Class fix (2026-09-15, see _LeaseExpiredDeferred): the lease was
+            # already gone before the turn could even start -- a deferral, not
+            # a violation, and the turn never ran so there is no ambiguity
+            # about side effects to fence.
+            #
+            # Round 2 (kasra-review re-gate BLOCK-1): pending was previously
+            # left exactly as set above, which meant a restart read it as
+            # ambiguous legacy work (`_legacy_pending_ambiguous`) and
+            # `connect()` refused forever -- the same durable-brick shape
+            # this whole fix exists to close, just moved to a different
+            # field. Clear it: nothing about this deferral is a candidate
+            # for `reply_outbox` custody.
             logger.warning("[mupot] refusing expired leased message=%s", message_id)
+            self._state["pending"] = None
             self.store.save(self._state)
-            return
+            raise _LeaseExpiredDeferred(message_id)
         token = _delivery_context.set(runtime.context)
         try:
             await self.handle_message(event)
@@ -2611,20 +3864,65 @@ class MupotAdapter(BasePlatformAdapter):
             await self._cancel_delivery_processing(runtime)
             self.store.save(self._state)
             raise
-        if timed_out or runtime.invalidated and runtime.outcome != ProcessingOutcome.SUCCESS:
+        if runtime.invalidated and not timed_out and runtime.outcome != ProcessingOutcome.SUCCESS:
+            # Invalidated by something other than this call's own wait timing
+            # out -- e.g. `disconnect()` invalidating every live generation
+            # directly while this delivery was still in flight. Not a lease
+            # expiry; unchanged from pre-fix behavior.
             await self._cancel_delivery_processing(runtime)
             self.store.save(self._state)
+            return
+        if timed_out:
+            await self._cancel_delivery_processing(runtime)
+            if self._lease_is_binding(runtime.turn_deadline, runtime.lease_deadline):
+                # The message's own lease deadline, not `turn_timeout`, was
+                # what `asyncio.wait_for`'s `remaining` actually hit -- a
+                # genuine lease expiry, never the turn's fault. Same
+                # BLOCK-1 fix as the pre-turn branch above: clear `pending`
+                # so a restart does not read this as ambiguous crash state.
+                logger.warning(
+                    "[mupot] refusing leased message=%s: its own visibility "
+                    "lease expired mid-turn",
+                    message_id,
+                )
+                self._state["pending"] = None
+                self.store.save(self._state)
+                raise _LeaseExpiredDeferred(message_id)
+            # Round 2 (kasra-review re-gate BLOCK-2): `turn_timeout` was the
+            # binding constraint here, WITH THE LEASE STILL LIVE -- a turn
+            # that hung, not a message whose lease ran out. Pre-round-2 this
+            # unconditionally raised `_LeaseExpiredDeferred` too, which
+            # `_poll_loop` releases and the server immediately redelivers --
+            # an unbounded re-execution loop for a turn that will very
+            # likely hang again (A/B measured 1 turn before this fix vs 11+
+            # and climbing). Bounded here by `_resolve_turn_failure` instead,
+            # which (round 3, BLOCK-A) clears `pending` itself before
+            # deferring -- see that function's docstring for why a below-cap
+            # deferral is not the crash-ambiguity case `pending` exists to
+            # fence.
+            await self._resolve_turn_failure(message, attempt_id, "turn_timeout")
             return
         self._invalidate_delivery(
             runtime,
             runtime.outcome or ProcessingOutcome.FAILURE,
         )
         if runtime.outcome == ProcessingOutcome.SUCCESS:
-            if not self._reply_has_human_custody(message_id):
+            if not self._reply_outbox_has_custody(message_id):
                 # Hermes treats an empty response as a successful no-op. A
                 # peer request is not consumable until a terminal ACK has a
-                # concrete Mupot receipt and its human notice has custody.
-                self.store.save(self._state)
+                # concrete Mupot receipt (the peer's own `send`
+                # acknowledgement -- see `_reply_outbox_has_custody`'s
+                # merged custody definition, Athena gate addendum on head
+                # e0556d61).
+                #
+                # Round 2 (kasra-review re-gate WARN): this used to be a bare
+                # `return` -- unacked, unprocessed, and NOT raised as a
+                # deferral, so `_poll_loop`'s "message not in processed"
+                # check folded it into `_protocol_error()` ->
+                # `_quarantine_inbox_polling()`, exactly the class of defect
+                # this whole fix exists to close. It is a turn failure
+                # (`no_custody`), bounded the same way `turn_timeout` is.
+                await self._resolve_turn_failure(message, attempt_id, "no_custody")
                 return
             durable_record = self._validated_reply_record(
                 message_id,
@@ -2638,10 +3936,106 @@ class MupotAdapter(BasePlatformAdapter):
             self._commit(message_id)
             self._mark_reply_complete(message_id)
             return
-        # Do not acknowledge failure and do not immediately replay locally.
-        # The server-side visibility lease expires, retries safely, and moves
-        # poison messages to Mupot's durable dead-letter state.
+        # Round 2 (kasra-review re-gate WARN): `runtime.outcome` here is
+        # `ProcessingOutcome.FAILURE` -- the handler raised and
+        # `BasePlatformAdapter`'s own `except BaseException` recorded the
+        # failure outcome via `on_processing_complete` rather than letting
+        # the exception propagate through this function. This used to be a
+        # bare `return` with the same quarantine consequence as the
+        # `no_custody` case above; same bounded turn-failure treatment.
+        await self._resolve_turn_failure(message, attempt_id, "handler_error")
+
+    async def _resolve_turn_failure(
+        self,
+        message: dict[str, Any],
+        attempt_id: Optional[str],
+        kind: str,
+    ) -> None:
+        """Bound a TURN failure (never a lease expiry) by `delivery_attempts`.
+
+        See `_TurnFailureDeferred` for the full class rationale (round 4,
+        Athena second eye, head c68e0839: the `pending` custody guard and
+        the at-cap no-ack change; round 5, kasra-review head c9b79aa: why
+        the guard is now custody-based, not status-based -- all documented
+        there in full).
+
+        Round 3 (kasra re-gate BLOCK-A): `pending` is not a side-effect
+        ledger -- it is the "a turn is running right now in this process"
+        record and NOTHING else. This raise, like every `_DeliveryDeferred`
+        raise site, means the turn is no longer running in this process, so
+        `pending` is cleared here, same as the lease-expiry sites above --
+        UNLESS (round 4, tightened round 5) `self._reply_outbox_has_custody`
+        is true for this exact `message_id`, in which case clearing it would
+        race the very next tick's `_replay_reply_outbox` into treating a
+        genuinely-delivered error reply as an orphaned, unmatched record and
+        escalating it to `reconciliation_required`. Round 5 (kasra-review
+        P0): a merely non-`"complete"` staged reply (`"prepared"`, zero
+        custody, never transmitted -- e.g. a successful handler whose reply
+        `send` itself failed) is NOT this case; holding `pending` for it let
+        `_replay_reply_outbox` retry the doomed `send` forever, before ever
+        reaching `inbox_lease` again. Custody -- not staleness of status --
+        is the only thing that may hold `pending`. Below
+        `self.max_delivery_attempts`, defer for natural lease-driven
+        redelivery (raise, same shape as any `_DeliveryDeferred`). At the
+        cap, do not retry further, but (round 4) do not ack either -- see
+        `_TurnFailureDeferred`'s docstring for why acking here would hide
+        the dead-letter from the pot's own reaper. DLQ it with `kind` as the
+        reason ONLY when custody was never achieved (round 5, Athena MED
+        3a -- a custodied reply at the cap is Delivered, not DLQ'd), log one
+        WARNING, and raise `terminal=True` so the poll loop treats this
+        exactly like any other deferral: release the lease and move on,
+        never a durable quarantine and never unbounded re-execution (the
+        pot's own reaper takes it from here, and `_process_leased_message`'s
+        local-DLQ skip bounds it even if the server never reaps).
+        """
+        message_id = str(message.get("id") or "")
+        raw_attempts = message.get("delivery_attempts")
+        attempts = raw_attempts if isinstance(raw_attempts, int) and raw_attempts > 0 else 1
+        staged_has_custody = self._reply_outbox_has_custody(message_id)
+        if attempts < self.max_delivery_attempts:
+            logger.warning(
+                "[mupot] deferring leased message=%s after turn failure kind=%s "
+                "(delivery_attempts=%s/%s); leaving lease to expire for redelivery",
+                message_id,
+                kind,
+                attempts,
+                self.max_delivery_attempts,
+            )
+            if not staged_has_custody:
+                self._state["pending"] = None
+            self.store.save(self._state)
+            raise _TurnFailureDeferred(message_id, kind)
+        logger.warning(
+            "[mupot] leased message=%s reached max_delivery_attempts=%s after "
+            "turn failure kind=%s -- deferring for the pot's own reaper to "
+            "dead-letter (not acking: an ack sets read_at, which the pot's "
+            "reaper requires NULL to ever set dead_lettered_at)",
+            message_id,
+            self.max_delivery_attempts,
+            kind,
+        )
+        if not staged_has_custody:
+            # Round 5 (Athena MED 3a): a custodied reply at the cap is
+            # Delivered -- `pending` stays held for it below, so the very
+            # next `_replay_reply_outbox` tick completes it normally (ack +
+            # commit). Naming it in `turn_failure_dlq` too would let a
+            # message that then shows up in `processed` also show up as a
+            # dead-letter, which `turn_failure_dlq_summary()` now also
+            # guards against defensively on the read side.
+            dlq = list(self._state.get("dlq") or [])
+            if not any(
+                str((entry.get("message") or {}).get("id") or "") == message_id
+                for entry in dlq
+            ):
+                dlq.append({"message": dict(message), "reason": kind})
+            self._state["dlq"] = dlq[-100:]
+            # Round 6 NEW-4: this id's local-turn-failure evidence must
+            # outlive `dlq[-100:]`'s own eviction window -- see
+            # `_mark_local_turn_failure`/`_has_local_turn_failure_dlq`.
+            self._mark_local_turn_failure(message_id)
+            self._state["pending"] = None
         self.store.save(self._state)
+        raise _TurnFailureDeferred(message_id, kind, terminal=True)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         runtime = self._runtime_for_event(event)
@@ -2856,6 +4250,14 @@ class MupotAdapter(BasePlatformAdapter):
                 raw_response=receipt,
             )
         except _EstopDeferred as exc:
+            # Item 4 (kasra-review re-gate round 2, 2026-09-15): kept narrow
+            # to `_EstopDeferred` deliberately, not widened to the
+            # `_DeliveryDeferred` base -- `send()` only ever raises this
+            # itself (the interim-send gate above) or receives it from
+            # `_transmit_final_reply`'s own choke point; neither path ever
+            # calls `_deliver`, so `_LeaseExpiredDeferred`/
+            # `_TurnFailureDeferred` are structurally impossible here.
+            #
             # P2 (kasra-review re-gate #4, 2026-09-14): before this fix, a
             # pause refusal fell into the generic `except Exception` below
             # and surfaced as `error=str(exc)` -- a bare message/source id
@@ -3013,7 +4415,26 @@ def register(
         if adapter is None:
             value = {"ok": False, "error": "native_gateway_not_connected"}
         else:
-            value = {"ok": True, "stranded_notifications": adapter.stranded_notifications()}
+            # An adapter can exist here (constructed, registered) while unable
+            # to actually poll -- e.g. a durable `lease_reconciliation` marker
+            # refusing `connect()` -- so `"ok": true` alone was a blind spot
+            # (2026-09-15 kayhermes incident): the tool reported healthy while
+            # `connect()` refused on every operator restart. Surface both.
+            value = {
+                "ok": True,
+                "connected": adapter.is_connected,
+                # Item 6 (kasra-review re-gate round 2, 2026-09-15):
+                # `connected` alone cannot distinguish "not yet attempted"
+                # from "connect() is mid-way through its bounded
+                # auto-reconcile turn right now" -- both report `False`.
+                "reconciling": adapter._reconciling,
+                "lease_reconciliation": adapter.lease_reconciliation_status(),
+                "stranded_notifications": adapter.stranded_notifications(),
+                "turn_failure_dlq": adapter.turn_failure_dlq_summary(),
+                # Round 6 NEW-1: the Stuck-reply outcome (`send_failed`) --
+                # see `stuck_replies()` and the runbook's own entry for it.
+                "stuck_replies": adapter.stuck_replies(),
+            }
         return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
 
     register_tool = getattr(ctx, "register_tool", None)

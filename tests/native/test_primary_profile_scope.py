@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -256,6 +257,53 @@ async def test_primary_initial_connect_uses_owning_profile_scope_without_preinst
             for call in calls
         )
         assert GLOBAL_AGENT_SECRET not in str(calls)
+    finally:
+        await adapter.disconnect()
+        manager.unload("mupot")
+
+
+@pytest.mark.asyncio
+async def test_adapter_construction_does_not_leak_scoped_secret_into_ambient_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BLOCK-C (kasra re-gate round 3, 2026-09-15, head 7295e057): the
+    constructor's own `mcp_tool_timeout` resolution
+    (`_configured_mcp_tool_timeout` -> `hermes_cli.config.load_config` ->
+    `hermes_cli.mcp_config._resolve_mcp_server_config`) used to run OUTSIDE
+    any profile secret scope. `_resolve_mcp_server_config` itself falls back
+    to `load_hermes_dotenv()` -- loading `.env` INTO `os.environ` -- exactly
+    when `current_secret_scope() is None`, which is true again by
+    construction time even for a real, correctly-threaded `secret_owner`:
+    `__init__.py`'s own `with secret_owner.activate():` block (that wraps
+    `register_native_gateway`) has already exited by the time Hermes's
+    gateway runner lazily calls `adapter_factory(config)` and constructs
+    `MupotAdapter` -- registration-time scoping does not cover construction-
+    time reads.
+
+    This scenario reuses `discover_plugin`'s exact setup: the ambient
+    process env carries `MUPOT_AGENT_TOKEN=GLOBAL_AGENT_SECRET` (as any
+    OTHER tenant's already-running process might, or a stale shell export),
+    while THIS discovered profile's own `.env` carries a DIFFERENT,
+    genuinely scoped `MUPOT_AGENT_TOKEN=SCOPED_AGENT_SECRET`. Before the
+    fix, merely CONSTRUCTING the adapter (`native_adapter`, no `connect()`
+    needed) overwrote the ambient `os.environ["MUPOT_AGENT_TOKEN"]` with the
+    scoped secret -- a multiplex cross-tenant leak into shared process
+    state that any other, unscoped code reading `os.environ` directly
+    (rather than through `read_profile_secret`) would then see. Fixed by
+    resolving `mcp_tool_timeout` inside `self._profile_scope()`, which
+    activates `secret_owner` again for the duration of just this read --
+    `current_secret_scope()` is then non-`None`, so
+    `_resolve_mcp_server_config` never calls `load_hermes_dotenv()` at all.
+    """
+    _home, manager, loaded = discover_plugin(tmp_path, monkeypatch)
+    assert os.environ.get("MUPOT_AGENT_TOKEN") == GLOBAL_AGENT_SECRET
+    adapter, _calls = native_adapter(manager, loaded, tmp_path, monkeypatch)
+    try:
+        assert os.environ.get("MUPOT_AGENT_TOKEN") == GLOBAL_AGENT_SECRET, (
+            "BLOCK-C: constructing the adapter must never overwrite the "
+            "ambient os.environ with this profile's own scoped secret"
+        )
     finally:
         await adapter.disconnect()
         manager.unload("mupot")

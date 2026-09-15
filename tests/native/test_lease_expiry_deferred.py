@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -202,6 +203,97 @@ async def test_pre_turn_lease_expiry_defers_then_redelivers_and_completes_once(
     state = StateStore(state_path).load()
     assert "msg-1" in state["processed"]  # completed exactly once, via redelivery
     assert state.get("lease_reconciliation") is None  # never quarantined
+
+
+@pytest.mark.asyncio
+async def test_mid_poll_lease_expiry_logs_expiry_not_estop(
+    tmp_path: Path, caplog: Any,
+) -> None:
+    """F4 (kasra-review re-gate #1, 2026-09-15): `_poll_loop`'s mid-poll
+    `except _EstopDeferred` also absorbs `_LeaseExpiredDeferred` (a
+    subclass) -- it must log the true cause, not always name the e-stop."""
+    state_path = tmp_path / "state.json"
+    already_expired = "2020-01-01T00:00:00.000Z"
+    client = RedeliveringLeaseClient([(already_expired, 1), (far_future(), 2)])
+    adapter = make_adapter(state_path, client)
+
+    async def handler(event: Any) -> None:
+        await adapter.send(event.source.chat_id, "ok")
+
+    adapter.set_message_handler(handler)
+    with caplog.at_level(logging.INFO, logger="plugin"):
+        assert await adapter.connect() is True
+        try:
+            await wait_until(lambda: client.lease_calls >= 2)
+            await wait_until(
+                lambda: "msg-1" in StateStore(state_path).load().get("processed", [])
+            )
+        finally:
+            await adapter.disconnect()
+
+    messages = [r.getMessage() for r in caplog.records]
+    mid_poll = [m for m in messages if "deferring leased message=msg-1 mid-poll" in m]
+    assert mid_poll, "expected a mid-poll deferral log"
+    assert "its own lease expired" in mid_poll[0]
+    assert "emergency stop" not in mid_poll[0]
+
+
+@pytest.mark.asyncio
+async def test_mid_poll_estop_pause_logs_the_true_cause(
+    tmp_path: Path, caplog: Any,
+) -> None:
+    """F4 companion: the SAME mid-poll catch site, for the OTHER cause (a
+    real e-stop pause racing in after a successful lease, no lease expiry
+    involved at all) -- must still say "emergency stop", not "lease
+    expired"."""
+    from agent import estop as real_estop
+
+    state_path = tmp_path / "state.json"
+
+    class OneShotPausingClient:
+        def __init__(self) -> None:
+            self.lease_calls = 0
+
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            if tool == "inbox_consumer_status":
+                return dict(STATUS)
+            if tool == "inbox_lease":
+                attempt_id = arguments["attempt_id"]
+                self.lease_calls += 1
+                if self.lease_calls == 1:
+                    real_estop.engage(reason="f4-companion-test")
+                    return attempt_result(
+                        attempt_id,
+                        "leased",
+                        [message_at("msg-1", 1, far_future())],
+                        far_future(),
+                    )
+                return attempt_result(attempt_id, "empty")
+            raise AssertionError(f"unexpected tool: {tool} {arguments}")
+
+    assert real_estop.is_engaged() is False
+    client = OneShotPausingClient()
+    adapter = make_adapter(state_path, client)
+    try:
+        with caplog.at_level(logging.INFO, logger="plugin"):
+            assert await adapter.connect() is True
+            await wait_until(lambda: client.lease_calls >= 1)
+            await asyncio.sleep(0.1)  # let the mid-poll deferral log land
+    finally:
+        real_estop.disengage()
+        await adapter.disconnect()
+
+    messages = [r.getMessage() for r in caplog.records]
+    mid_poll = [m for m in messages if "deferring leased message=msg-1 mid-poll" in m]
+    assert mid_poll, "expected a mid-poll deferral log"
+    assert "Hermes global emergency stop is engaged" in mid_poll[0]
+    assert "lease expired" not in mid_poll[0]
 
 
 @pytest.mark.asyncio
@@ -412,7 +504,14 @@ async def test_mark_reply_complete_refuses_a_prepared_record_without_a_receipt(
     """Athena gate (PR #9 r6, point 1): a "prepared" record whose source_id
     lands in `processed` some other way must never be forced to "complete"
     -- that write persists cleanly but the NEXT load rejects it (a
-    "complete" record requires a receipt), bricking connect() invisibly."""
+    "complete" record requires a receipt), bricking connect() invisibly.
+
+    F6 (kasra-review re-gate #1, 2026-09-15): the round-1 fix just refused
+    and left the record "prepared" -- every subsequent tick re-walked it
+    through this exact same refusal, logging forever. Park it terminal as
+    "invalid_receipt" instead: surfaced (`invalid_reply_receipts()`), never
+    forced to "complete", and never re-walked again.
+    """
     state_path = tmp_path / "state.json"
     adapter = make_adapter(state_path, object())
     adapter._state["reply_outbox"] = {"msg-1": reply_record("msg-1", "prepared")}
@@ -422,11 +521,19 @@ async def test_mark_reply_complete_refuses_a_prepared_record_without_a_receipt(
     await adapter._replay_reply_outbox()  # hits the `processed` shortcut branch
 
     state = StateStore(state_path).load()
-    assert state["reply_outbox"]["msg-1"]["status"] == "prepared"  # NOT forced to complete
+    assert state["reply_outbox"]["msg-1"]["status"] == "invalid_receipt"
+    assert adapter.invalid_reply_receipts() == ["msg-1"]
 
     # A fresh load of this exact state must not be poisoned by the refusal.
     fresh = make_adapter(state_path, object())
     assert fresh._reply_state_invalid is False
+
+    # F6: a second replay must not re-walk (and re-log) the same refusal.
+    await adapter._replay_reply_outbox()
+    assert (
+        StateStore(state_path).load()["reply_outbox"]["msg-1"]["status"]
+        == "invalid_receipt"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -659,6 +766,29 @@ def test_configured_mcp_tool_timeout_never_reads_host_falls_back_on_any_error() 
     assert _configured_mcp_tool_timeout("mupot-server-not-configured") == 300.0
 
 
+@pytest.mark.parametrize(
+    "bad_timeout", [float("nan"), float("inf"), float("-inf"), 0.0, -5.0]
+)
+def test_configured_mcp_tool_timeout_rejects_non_finite_or_non_positive(
+    bad_timeout: float, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F5 (kasra-review re-gate #1, 2026-09-15): a NaN/inf/non-positive
+    configured timeout must fall back to the default instead of reaching
+    `int(requested_lease)` in `__init__` and crashing it."""
+    import hermes_cli.config as hermes_config
+    import hermes_cli.mcp_config as hermes_mcp_config
+
+    monkeypatch.setattr(
+        hermes_config, "load_config",
+        lambda: {"mcp_servers": {"srv": {"timeout": "irrelevant"}}},
+    )
+    monkeypatch.setattr(
+        hermes_mcp_config, "_resolve_mcp_server_config",
+        lambda raw_cfg: {"timeout": bad_timeout},
+    )
+    assert _configured_mcp_tool_timeout("srv") == 300.0
+
+
 # ---------------------------------------------------------------------------
 # Item 6: mupot_gateway_status reports lease_reconciliation + connected.
 # ---------------------------------------------------------------------------
@@ -684,11 +814,13 @@ def test_lease_reconciliation_status_reports_marker_and_attempt_id(tmp_path: Pat
 # ---------------------------------------------------------------------------
 
 
-REAL_INCIDENT_FIXTURE = (
-    Path(__file__).resolve().parents[3]
-    / "fixtures"
-    / "state.json.bak-quarantine-20260915170649"
-)
+# F2 (kasra-review re-gate #1, 2026-09-15): these were an out-of-repo
+# fixture (`parents[3]/fixtures/...`), skipif-gated -- CI silently skipped
+# the PR's headline evidence. Sanitized copies (bodies/Telegram chat ids
+# stripped, structural keys + reply_outbox schema preserved -- see
+# `scripts/sanitize_fixtures.py` used to generate them) now live in-repo.
+FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
+REAL_INCIDENT_FIXTURE = FIXTURES_DIR / "state.json.bak-quarantine-20260915170649"
 
 
 @contextmanager
@@ -707,8 +839,61 @@ def _real_fingerprint_owner(fingerprint: str):
     yield Owner()
 
 
+class InstallSimClient:
+    """Mocked Mupot RPC surface for install-sim tests: echoes the fixture's
+    own marker scope so `inbox_consumer_status`/`inbox_lease_reconcile`
+    read as belonging to that snapshot's exact quarantined attempt."""
+
+    def __init__(self, marker: dict[str, Any], reconcile_state: str = "expired") -> None:
+        self.marker = marker
+        self.reconcile_state = reconcile_state
+        self.tools: list[str] = []
+
+    async def connect(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.tools.append(tool)
+        marker = self.marker
+        if tool == "inbox_consumer_status":
+            return {
+                "strict_scope": True,
+                "tenant": marker["tenant"],
+                "agent_id": marker["agent_id"],
+                "effective_inbox_seat": marker["effective_inbox_seat"],
+                "mode": marker["mode"],
+                "generation": marker["generation"],
+                "key_matches": True,
+            }
+        if tool == "inbox_lease_reconcile":
+            return {
+                "tenant": marker["tenant"],
+                "agent_id": marker["agent_id"],
+                "effective_inbox_seat": marker["effective_inbox_seat"],
+                "attempt_id": arguments["attempt_id"],
+                "state": self.reconcile_state,
+                "lease_expires_at": None,
+                "messages": [],
+                "consumed": False,
+            }
+        if tool == "inbox_lease":
+            return {
+                "tenant": marker["tenant"],
+                "agent_id": marker["agent_id"],
+                "effective_inbox_seat": marker["effective_inbox_seat"],
+                "attempt_id": arguments["attempt_id"],
+                "state": "empty",
+                "lease_expires_at": None,
+                "messages": [],
+                "consumed": False,
+            }
+        raise AssertionError(f"unexpected tool: {tool}")
+
+
 @pytest.mark.asyncio
-@pytest.mark.skipif(not REAL_INCIDENT_FIXTURE.exists(), reason="real incident fixture not present")
 async def test_install_simulation_on_real_incident_state_is_safe_and_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -735,54 +920,8 @@ async def test_install_simulation_on_real_incident_state_is_safe_and_idempotent(
     state_path = tmp_path / "state.json"
     state_path.write_text(json.dumps(real), encoding="utf-8")
 
-    class InstallSimClient:
-        def __init__(self) -> None:
-            self.tools: list[str] = []
-
-        async def connect(self) -> None:
-            return None
-
-        async def close(self) -> None:
-            return None
-
-        async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
-            self.tools.append(tool)
-            if tool == "inbox_consumer_status":
-                return {
-                    "strict_scope": True,
-                    "tenant": marker["tenant"],
-                    "agent_id": marker["agent_id"],
-                    "effective_inbox_seat": marker["effective_inbox_seat"],
-                    "mode": marker["mode"],
-                    "generation": marker["generation"],
-                    "key_matches": True,
-                }
-            if tool == "inbox_lease_reconcile":
-                return {
-                    "tenant": marker["tenant"],
-                    "agent_id": marker["agent_id"],
-                    "effective_inbox_seat": marker["effective_inbox_seat"],
-                    "attempt_id": arguments["attempt_id"],
-                    "state": "expired",
-                    "lease_expires_at": None,
-                    "messages": [],
-                    "consumed": False,
-                }
-            if tool == "inbox_lease":
-                return {
-                    "tenant": marker["tenant"],
-                    "agent_id": marker["agent_id"],
-                    "effective_inbox_seat": marker["effective_inbox_seat"],
-                    "attempt_id": arguments["attempt_id"],
-                    "state": "empty",
-                    "lease_expires_at": None,
-                    "messages": [],
-                    "consumed": False,
-                }
-            raise AssertionError(f"unexpected tool: {tool}")
-
     with _real_fingerprint_owner(marker["profile_owner_fingerprint"]) as owner:
-        client = InstallSimClient()
+        client = InstallSimClient(marker)
         adapter = make_adapter(state_path, client)
         adapter._secret_owner = owner
         adapter._profile_owner_fingerprint = marker["profile_owner_fingerprint"]
@@ -802,7 +941,7 @@ async def test_install_simulation_on_real_incident_state_is_safe_and_idempotent(
         # Second connect() (a fresh restart, e.g. by the operator): loads the
         # ALREADY-healed state from disk -- no marker, no ambiguous pending
         # -- and connects clean, with zero reconcile network calls needed.
-        second_client = InstallSimClient()
+        second_client = InstallSimClient(marker)
         adapter2 = make_adapter(state_path, second_client)
         adapter2._secret_owner = owner
         adapter2._profile_owner_fingerprint = marker["profile_owner_fingerprint"]
@@ -813,3 +952,86 @@ async def test_install_simulation_on_real_incident_state_is_safe_and_idempotent(
 
         assert second is True
         assert "inbox_lease_reconcile" not in second_client.tools  # nothing left to heal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
+        "state.json.bak-quarantine-20260915021900",
+        "state.json.bak-quarantine-20260915155821",
+        "state.json.bak-quarantine-20260915170106",
+    ],
+)
+async def test_install_simulation_clean_marker_self_heals_on_first_connect(
+    tmp_path: Path,
+    fixture_name: str,
+) -> None:
+    """Three more real snapshots from the same 2026-09-15 crash loop (F2):
+    `pending` is already None here (nothing left to lose) but the durable
+    v3 marker is still present -- proof the process kept re-quarantining on
+    every restart with no work outstanding. No `_legacy_pending_ambiguous`
+    gate applies (pending is None), so the FIRST connect() self-heals the
+    marker and connects clean -- unlike the ambiguous-pending shape below,
+    this one needs no restart at all.
+    """
+    real = json.loads((FIXTURES_DIR / fixture_name).read_text())
+    marker = real["lease_reconciliation"]
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(real), encoding="utf-8")
+
+    with _real_fingerprint_owner(marker["profile_owner_fingerprint"]) as owner:
+        client = InstallSimClient(marker)
+        adapter = make_adapter(state_path, client)
+        adapter._secret_owner = owner
+        adapter._profile_owner_fingerprint = marker["profile_owner_fingerprint"]
+        try:
+            connected = await adapter.connect()
+        finally:
+            await adapter.disconnect()
+
+        assert connected is True
+        after = StateStore(state_path).load()
+        assert after.get("lease_reconciliation") is None
+        assert after.get("pending") is None
+
+
+@pytest.mark.asyncio
+async def test_install_simulation_unstaged_pending_needs_one_restart(
+    tmp_path: Path,
+) -> None:
+    """A fourth real snapshot (F2), same shape as the 17:06 fixture above:
+    `pending` set with no reply ever staged for it. The PRE-EXISTING
+    `_legacy_pending_ambiguous` gate refuses the first connect() even
+    though the lease marker self-heals in that same call; a second
+    connect() (a fresh restart) loads the healed state and connects clean.
+    """
+    real = json.loads(
+        (FIXTURES_DIR / "state.json.bak-quarantine-20260915144726").read_text()
+    )
+    marker = real["lease_reconciliation"]
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(real), encoding="utf-8")
+
+    with _real_fingerprint_owner(marker["profile_owner_fingerprint"]) as owner:
+        first_client = InstallSimClient(marker)
+        adapter = make_adapter(state_path, first_client)
+        adapter._secret_owner = owner
+        adapter._profile_owner_fingerprint = marker["profile_owner_fingerprint"]
+        first = await adapter.connect()
+        after_first = StateStore(state_path).load()
+        assert after_first.get("lease_reconciliation") is None
+        assert after_first.get("pending") is None
+        assert first is False
+
+        second_client = InstallSimClient(marker)
+        adapter2 = make_adapter(state_path, second_client)
+        adapter2._secret_owner = owner
+        adapter2._profile_owner_fingerprint = marker["profile_owner_fingerprint"]
+        try:
+            second = await adapter2.connect()
+        finally:
+            await adapter2.disconnect()
+
+        assert second is True
+        assert "inbox_lease_reconcile" not in second_client.tools

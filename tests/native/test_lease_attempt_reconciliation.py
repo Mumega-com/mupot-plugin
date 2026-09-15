@@ -731,3 +731,117 @@ async def test_same_profile_token_rotation_may_reconcile_exact_scope(
 
     assert await adapter.reconcile_inbox_polling() is True
     assert StateStore(state_path).load().get("lease_reconciliation") is None
+
+
+# ---------------------------------------------------------------------------
+# F1/F7 (kasra-review re-gate #1, 2026-09-15): the "acked" tombstone must
+# not silently drop an unprocessed pending, and a pending from a DIFFERENT
+# attempt must never be touched by this reconciliation at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acked_pending_never_locally_processed_is_refused_not_dropped(
+    tmp_path: Path,
+) -> None:
+    """F1: master never dropped `pending` on a non-leased tombstone at all
+    (loud refusal by omission); this fix's clean-tombstone self-heal must
+    not regress that for "acked" specifically -- the server will not
+    redeliver an acked message, so dropping it here with no local record of
+    ever having processed it is silent, permanent message loss."""
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    message = leased_ack("acked-but-unprocessed")
+    state = StateStore(state_path).load()
+    state["pending"] = {"message": message, "attempt_id": attempt_id}
+    StateStore(state_path).save(state)
+
+    client = AttemptClient(reconcile_outcome=attempt_result(attempt_id, "acked"))
+    adapter = make_adapter(state_path, client)
+
+    assert await adapter.reconcile_inbox_polling() is False  # loud, not silent
+
+    after = StateStore(state_path).load()
+    assert after["pending"]["message"]["id"] == "acked-but-unprocessed"  # kept
+    assert after.get("lease_reconciliation") is not None  # marker kept
+
+
+@pytest.mark.asyncio
+async def test_acked_pending_already_processed_clears_normally(
+    tmp_path: Path,
+) -> None:
+    """F1 companion: an "acked" tombstone whose pending message IS already
+    in `processed` (the ordinary successful case) must still self-heal --
+    the new guard is scoped to the unprocessed countercase only."""
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    message = leased_ack("acked-and-processed")
+    state = StateStore(state_path).load()
+    state["pending"] = {"message": message, "attempt_id": attempt_id}
+    state["processed"] = ["acked-and-processed"]
+    StateStore(state_path).save(state)
+
+    client = AttemptClient(reconcile_outcome=attempt_result(attempt_id, "acked"))
+    adapter = make_adapter(state_path, client)
+
+    assert await adapter.reconcile_inbox_polling() is True
+
+    after = StateStore(state_path).load()
+    assert after.get("pending") is None
+    assert after.get("lease_reconciliation") is None
+
+
+@pytest.mark.asyncio
+async def test_pending_from_a_different_attempt_is_never_touched(
+    tmp_path: Path,
+) -> None:
+    """F7: a clean tombstone for THIS attempt must never drop a `pending`
+    staged by a DIFFERENT attempt (e.g. a newer lease already in flight) --
+    attempt-scope the drop, the same way the marker itself is scoped."""
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    message = leased_ack("other-attempts-pending")
+    state = StateStore(state_path).load()
+    state["pending"] = {
+        "message": message,
+        "attempt_id": "a-totally-different-attempt-id-0000",
+    }
+    StateStore(state_path).save(state)
+
+    client = AttemptClient(reconcile_outcome=attempt_result(attempt_id, "expired"))
+    adapter = make_adapter(state_path, client)
+
+    assert await adapter.reconcile_inbox_polling() is False
+
+    after = StateStore(state_path).load()
+    assert after["pending"]["attempt_id"] == "a-totally-different-attempt-id-0000"
+    assert after.get("lease_reconciliation") is not None  # marker kept
+
+
+# ---------------------------------------------------------------------------
+# F3 (kasra-review re-gate #1, 2026-09-15): connect()'s auto-reconcile
+# self-heal has no e-stop gate -- paused, it must not touch the network.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connect_auto_reconcile_refuses_network_while_paused(
+    tmp_path: Path,
+) -> None:
+    from agent import estop as real_estop
+
+    state_path = tmp_path / "state.json"
+    attempt_id, _first = await persist_v2_ambiguous(state_path)
+    client = AttemptClient(reconcile_outcome=attempt_result(attempt_id, "expired"))
+    adapter = make_adapter(state_path, client)
+
+    assert real_estop.is_engaged() is False
+    real_estop.engage(reason="f3-test")
+    try:
+        assert await adapter.connect() is False
+    finally:
+        real_estop.disengage()
+
+    assert client.connect_calls == 0
+    assert client.calls == []
+    assert StateStore(state_path).load()["lease_reconciliation"]["attempt_id"] == attempt_id

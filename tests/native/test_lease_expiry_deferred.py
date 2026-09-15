@@ -252,6 +252,51 @@ async def test_mid_poll_lease_expiry_logs_expiry_not_estop(
 
 
 @pytest.mark.asyncio
+async def test_mid_poll_turn_timeout_logs_turn_timeout_not_lease_expired(
+    tmp_path: Path, caplog: Any,
+) -> None:
+    """Round 2 companion to the lease-expiry case above: the SAME mid-poll
+    catch site, for the turn_timeout-with-a-live-lease reason -- must name
+    that reason specifically, not the generic "its own lease expired" text
+    (both raise the same `_DeliveryDeferred` class, but the alias-based
+    `isinstance` check round 1 used could not tell them apart; `.reason`
+    can)."""
+    state_path = tmp_path / "state.json"
+    client = RedeliveringLeaseClient([(far_future(), 1), (far_future(), 2)])
+    adapter = make_adapter(state_path, client)
+    adapter.turn_timeout = 0.05  # bypass __init__'s 10.0 floor for a fast test
+    stuck = asyncio.Event()
+    handled: list[str] = []
+
+    async def handler(event: Any) -> None:
+        handled.append(event.message_id)
+        if len(handled) == 1:
+            await stuck.wait()
+            return
+        await adapter.send(event.source.chat_id, "ok")
+
+    adapter.set_message_handler(handler)
+    with caplog.at_level(logging.INFO, logger="plugin"):
+        assert await adapter.connect() is True
+        try:
+            await wait_until(lambda: client.lease_calls >= 2)
+            stuck.set()
+            await wait_until(
+                lambda: "msg-1" in StateStore(state_path).load().get("processed", [])
+            )
+        finally:
+            stuck.set()
+            await adapter.disconnect()
+
+    messages = [r.getMessage() for r in caplog.records]
+    mid_poll = [m for m in messages if "deferring leased message=msg-1 mid-poll" in m]
+    assert mid_poll, "expected a mid-poll deferral log"
+    assert "its own turn_timeout with a still-live lease" in mid_poll[0]
+    assert "lease expired" not in mid_poll[0]
+    assert "emergency stop" not in mid_poll[0]
+
+
+@pytest.mark.asyncio
 async def test_mid_poll_estop_pause_logs_the_true_cause(
     tmp_path: Path, caplog: Any,
 ) -> None:
@@ -389,6 +434,37 @@ async def test_pre_turn_expiry_preserves_pending_when_a_reply_is_staged(tmp_path
             receipt={"id": "d-1", "seq": 1, "duplicate": False, "to": "hadi-codex", "project_id": None},
         ),
     }
+    adapter.store.save(adapter._state)
+    already_expired = "2020-01-01T00:00:00.000Z"
+
+    async def handler(_event: Any) -> None:
+        raise AssertionError("must not run the model on an already-expired lease")
+
+    adapter.set_message_handler(handler)
+    with pytest.raises(_LeaseExpiredDeferred):
+        await adapter._deliver(message_at("msg-1", 1, already_expired))
+
+    state = StateStore(state_path).load()
+    assert state["pending"]["message"]["id"] == "msg-1"  # left untouched, not cleared
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_expiry_preserves_pending_for_a_never_transmitted_prepared_reply(
+    tmp_path: Path,
+) -> None:
+    """Athena F1 (PR #11 round 2, 2026-09-15): round 1's deferral sites used
+    `_has_validated_reply_receipt` (status in {sent, custodied, complete} +
+    a receipt) to decide whether to clear `pending` -- narrower than
+    `_staged_reply_blocks_reconcile`'s self-heal check, which blocks on ANY
+    non-complete staged record, "prepared" included. A never-transmitted
+    "prepared" record (no receipt yet -- a background handler mid-flight
+    preparing the final reply) did NOT block round 1's clearing, so a
+    deferral could drop `pending` right out from under it. Both call sites
+    now share `_reply_staged_incomplete` and agree: "prepared" blocks too.
+    """
+    state_path = tmp_path / "state.json"
+    adapter = make_adapter(state_path, object())
+    adapter._state["reply_outbox"] = {"msg-1": reply_record("msg-1", "prepared")}
     adapter.store.save(adapter._state)
     already_expired = "2020-01-01T00:00:00.000Z"
 

@@ -711,6 +711,36 @@ async def test_handler_error_preserves_pending_when_a_reply_is_staged(
 
 
 @pytest.mark.asyncio
+async def test_empty_output_clears_pending_immediately_without_a_staged_reply(
+    tmp_path: Path,
+) -> None:
+    """Exit 1 of 5, "nothing staged" direction, checked IMMEDIATELY after
+    the deferral rather than via eventual redelivery (adversarial BLOCK-3,
+    PR #11 round 5): `test_empty_output_defers_then_redelivers_and_
+    completes_once` only observes this indirectly -- `_deliver` overwrites
+    `pending` unconditionally on its very next call regardless of whether
+    THIS exit's own guard cleared it, so a mutation that never clears
+    `pending` here survives that test undetected. Calling `_deliver`
+    directly, with no follow-up redelivery, is the only way to observe
+    this exit's OWN guard behavior in isolation.
+    """
+    state_path = tmp_path / "state.json"
+    adapter = make_adapter(state_path, object())
+
+    async def handler(_event: Any) -> None:
+        return  # empty output -- nothing staged for this source
+
+    adapter.set_message_handler(handler)
+    with pytest.raises(_DeliveryDeferred) as exc_info:
+        await adapter._deliver(message_at("msg-1", 1, far_future()))
+    assert exc_info.value.reason == "empty_output"
+
+    state = StateStore(state_path).load()
+    assert state.get("pending") is None
+    await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
 async def test_empty_output_strict_custody_and_preserves_staged_pending(
     tmp_path: Path,
 ) -> None:

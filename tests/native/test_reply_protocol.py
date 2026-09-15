@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -235,6 +237,15 @@ async def bind_attempt_delivery(
     adapter.store.save(adapter._state)
     event, _runtime = adapter._begin_delivery(source, attempt_id=ATTEMPT_A)
     await adapter.on_processing_start(event)
+
+
+async def wait_until(predicate, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"condition not met within {timeout}s")
 
 
 def clear_lease_marker_for_replay(path: Path) -> None:
@@ -541,6 +552,68 @@ async def test_peer_restart_expired_attempt_a_never_generic_acks_live_attempt_b(
     assert state["reply_outbox"]["source-1"]["status"] == "complete"
     assert restarted._lease_quarantined is False
     assert restarted._reply_reconciliation_required is False
+
+
+@pytest.mark.asyncio
+async def test_two_restarts_second_connects_and_completes_through_real_poll_loop(
+    tmp_path: Path,
+) -> None:
+    """BLOCK-2 P1 (adversarial gate, PR #11 round 5) -- the "restart flap"
+    -- driven through the REAL poll loop (`connect()`/`_poll_loop`, not a
+    direct `_replay_reply_outbox()` call): a custodied reply whose only
+    attempt died mid-turn (e.g. `disconnect()` before its ack ran) used to
+    durably quarantine on the first restart's very first replay tick, and
+    because the quarantine flag was never persisted, `connect()` kept
+    reporting `True` and dying immediately on EVERY subsequent restart --
+    an infinite flap invisible to anything that only checks `connect()`'s
+    return value.
+
+    First restart: its poll loop's first tick replays the stale record,
+    gets a well-formed `expired` ack response for the dead attempt, commits
+    locally (custody already existed), and KEEPS RUNNING -- no crash, no
+    fatal error, `inbox_lease` proceeds normally afterward. Second restart:
+    a completely ordinary process with nothing left to reconcile at all.
+    """
+    first = adapter_at(tmp_path, ProtocolClient())
+    await bind_attempt_delivery(first)
+    assert (await first.send("sender", "Durable exact final.")).success is True
+    clear_lease_marker_for_replay(tmp_path)
+
+    client = AttemptReplayClient(attempt_state="expired", consumed=False)
+    restarted = adapter_at(tmp_path, client)
+    assert await restarted.connect() is True
+    try:
+        await wait_until(
+            lambda: "source-1"
+            in StateStore(tmp_path / "state.json").load().get("processed", [])
+        )
+        # The poll loop is still alive and healthy after committing locally
+        # -- not the flap's "connect() succeeded, then died on this exact
+        # tick" shape.
+        await asyncio.sleep(0.05)
+        assert restarted._running is True
+        assert restarted._fatal_error_code is None
+    finally:
+        await restarted.disconnect()
+
+    state = StateStore(tmp_path / "state.json").load()
+    assert "source-1" in state["processed"]
+    assert state["reply_outbox"]["source-1"]["status"] == "complete"
+    assert state.get("lease_reconciliation") is None
+    assert not any(tool == "inbox_ack" for tool, _arguments in client.calls)
+    assert client.attempts[ATTEMPT_B] == "leased"  # never generic-acked
+
+    # Second restart: an ordinary process, nothing left to reconcile.
+    third_client = ProtocolClient()
+    third = adapter_at(tmp_path, third_client)
+    assert await third.connect() is True
+    await asyncio.sleep(0.05)
+    assert third._running is True
+    assert third._fatal_error_code is None
+    assert third._lease_quarantined is False
+    assert third._reply_reconciliation_required is False
+    await third.disconnect()
+    assert not any(tool == "inbox_lease_ack" for tool, _args in third_client.calls)
 
 
 @pytest.mark.asyncio

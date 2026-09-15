@@ -1630,3 +1630,128 @@ async def test_install_simulation_leased_attempt_refuses_without_a_turn(
         assert after.get("lease_reconciliation") is not None  # marker left exactly as it was
         assert "inbox_lease" not in client.tools  # zero turns
         assert client.tools == ["inbox_consumer_status", "inbox_lease_reconcile"]
+
+
+# ---------------------------------------------------------------------------
+# Round 5 (adversarial BLOCK-1, PR #11, 2026-09-15): a failing reply replay
+# must never starve `inbox_lease` for every OTHER message.
+# ---------------------------------------------------------------------------
+
+
+class TwoMessageFailingSendClient:
+    """Two INDEPENDENT messages already pending in the mailbox (unlike
+    `RedeliveringLeaseClient`'s single redelivering message). Models real
+    Mupot `inbox_lease` semantics: `limit:1` hands out the next message NOT
+    currently under an unexpired lease -- msg-1's own lease (`far_future()`)
+    never expires within this test, so once handed out it is never
+    reoffered, but msg-2 remains immediately available on the very next
+    call. `send` fails for BOTH messages (permanently down peer transport).
+    """
+
+    def __init__(self, messages: list[dict[str, Any]]) -> None:
+        self.messages = {m["id"]: m for m in messages}
+        self.order = [m["id"] for m in messages]
+        self.leased_ids: set[str] = set()
+        self.lease_calls = 0
+        self.handed_out: list[str] = []
+        self.send_attempts = 0
+
+    async def connect(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool == "inbox_consumer_status":
+            return dict(STATUS)
+        if tool == "inbox_lease":
+            self.lease_calls += 1
+            attempt_id = arguments["attempt_id"]
+            available = [mid for mid in self.order if mid not in self.leased_ids]
+            if not available:
+                return {
+                    **SCOPE, "attempt_id": attempt_id, "state": "empty",
+                    "lease_expires_at": None, "messages": [], "consumed": False,
+                }
+            mid = available[0]
+            self.leased_ids.add(mid)
+            self.handed_out.append(mid)
+            message = self.messages[mid]
+            return {
+                **SCOPE, "attempt_id": attempt_id, "state": "leased",
+                "lease_expires_at": message["lease_expires_at"],
+                "messages": [message], "consumed": False,
+            }
+        if tool == "inbox_lease_ack":
+            return {
+                **SCOPE, "attempt_id": arguments["attempt_id"],
+                "state": "acked", "consumed": True,
+            }
+        if tool == "send":
+            self.send_attempts += 1
+            raise RuntimeError("peer send transport down")
+        raise AssertionError(f"unexpected tool: {tool}")
+
+
+@pytest.mark.asyncio
+async def test_replay_failure_does_not_starve_other_messages(
+    tmp_path: Path,
+) -> None:
+    """BLOCK-1 P0 (adversarial gate, PR #11 round 5): msg-1's reply cannot
+    transmit (peer `send` transport permanently down) and keeps failing
+    `_replay_reply_outbox` every tick. Through the REAL `_poll_loop`: msg-2,
+    a completely independent message, must still be leased and delivered.
+
+    Reproduced live before this fix: `_poll_loop`'s bare `except Exception`
+    handler for a failing replay used to `continue`, skipping `inbox_lease`
+    for the rest of that tick -- once ANY record got stuck this way,
+    `inbox_lease` never ran again, for any message, ever (measured:
+    `is_connected`/`poll_running` both green, msg-2 never leased, `send`
+    retried ~90x in 2s with zero backoff).
+    """
+    state_path = tmp_path / "state.json"
+    client = TwoMessageFailingSendClient(
+        [
+            message_at("msg-1", 1, far_future()),
+            message_at("msg-2", 1, far_future(), body="URGENT second decision"),
+        ]
+    )
+    adapter = make_adapter(state_path, client)
+    handled: list[str] = []
+
+    async def handler(event: Any) -> None:
+        handled.append(event.message_id)
+        await adapter.send(event.source.chat_id, f"answering {event.message_id}")
+
+    adapter.set_message_handler(handler)
+    assert await adapter.connect() is True
+    try:
+        await wait_until(lambda: "msg-2" in handled, timeout=5.0)
+        # Bounded retry: this stuck record gets at most ~1 send attempt per
+        # poll tick, never an unbounded burst against a down peer.
+        sends_so_far = client.send_attempts
+        ticks_so_far = client.lease_calls
+        size_before = state_path.stat().st_size
+        await asyncio.sleep(0.2)
+        size_after = state_path.stat().st_size
+    finally:
+        await adapter.disconnect()
+
+    assert "msg-2" in client.handed_out  # the fix: msg-2 was NOT starved
+    assert handled == ["msg-1", "msg-2"]
+    assert adapter.reply_replay_failures() >= 1  # msg-1's stuck reply was visible
+    assert sends_so_far <= ticks_so_far + 2  # bounded to ~1 attempt per tick
+    assert size_after <= size_before + 200  # bounded, not growing per tick
+    # Once msg-2 becomes `pending` (every `_deliver` call overwrites the
+    # single-slot marker), msg-1's still-unresolved "prepared" record no
+    # longer matches it -- pre-existing, unrelated to this fix:
+    # `_replay_reply_outbox` correctly treats an orphaned unresolved record
+    # as genuine crash ambiguity and escalates LOUDLY
+    # (`reply_reconciliation_required`) rather than the SILENT stall
+    # BLOCK-1 was about. Loud and visible beats silent even though it also
+    # ends the poll loop here -- msg-2 was still given its chance first,
+    # which is the property this test exists to prove.
+    state = StateStore(state_path).load()
+    assert state["reply_outbox"]["msg-1"]["status"] == "reconciliation_required"
+    assert adapter._reply_reconciliation_required is True

@@ -1891,6 +1891,10 @@ async def test_gateway_status_clears_to_disconnected_after_adapter_disconnect(
     assert connected["connected"] is False  # not yet connect()-ed, only constructed
     assert connected["lease_reconciliation"] == {"required": False, "attempt_id": None}
 
+    instance._mark_connected()
+    live = json.loads(tools["mupot_gateway_status"]({}))
+    assert live["connected"] is True
+
     await instance.disconnect()
 
     disconnected = json.loads(tools["mupot_gateway_status"]({}))

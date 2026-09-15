@@ -405,6 +405,30 @@ async def test_prepared_reply_with_mismatched_pending_still_fences(tmp_path: Pat
     assert adapter._state["reply_outbox"]["msg-1"]["status"] == "reconciliation_required"
 
 
+@pytest.mark.asyncio
+async def test_mark_reply_complete_refuses_a_prepared_record_without_a_receipt(
+    tmp_path: Path,
+) -> None:
+    """Athena gate (PR #9 r6, point 1): a "prepared" record whose source_id
+    lands in `processed` some other way must never be forced to "complete"
+    -- that write persists cleanly but the NEXT load rejects it (a
+    "complete" record requires a receipt), bricking connect() invisibly."""
+    state_path = tmp_path / "state.json"
+    adapter = make_adapter(state_path, object())
+    adapter._state["reply_outbox"] = {"msg-1": reply_record("msg-1", "prepared")}
+    adapter._state["processed"] = ["msg-1"]
+    adapter.store.save(adapter._state)
+
+    await adapter._replay_reply_outbox()  # hits the `processed` shortcut branch
+
+    state = StateStore(state_path).load()
+    assert state["reply_outbox"]["msg-1"]["status"] == "prepared"  # NOT forced to complete
+
+    # A fresh load of this exact state must not be poisoned by the refusal.
+    fresh = make_adapter(state_path, object())
+    assert fresh._reply_state_invalid is False
+
+
 # ---------------------------------------------------------------------------
 # Item 3 + 4: reconcile_inbox_polling's exact-scope clean tombstone, its
 # staged-reply countercase, and connect()'s auto-reconcile-before-refusal.

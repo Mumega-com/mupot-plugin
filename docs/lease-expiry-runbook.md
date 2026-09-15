@@ -55,6 +55,98 @@ new state, no new write path — three more strings
 (`empty_output`/`handler_error`/`runtime_invalidated`) added to
 `_DeliveryDeferred._REASONS` is the only thing that grew.
 
+## Round 5 (2026-09-15): a silent stall is worse than a loud brick, and a dead attempt is a deferral
+
+The adversarial gate on round 4 found the class fix had introduced a new,
+quieter failure shape rather than closing the incident entirely:
+
+- **BLOCK-1 (P0) — the reply-replay-stall wedge.** `_poll_loop`'s statement
+  order is: replay routine events, replay the reply outbox, flush
+  notifications, THEN `inbox_lease`. `_replay_reply_outbox`'s bare
+  `except Exception` clause used to `continue` on ANY non-protocol failure
+  (e.g. the peer's `send` transport being down) — skipping `inbox_lease` for
+  the rest of that tick. If the same staged reply keeps failing to
+  transmit, it fails on EVERY tick, forever, and `inbox_lease` never runs
+  again for ANY message — with `mupot_gateway_status` reporting
+  `connected: true`, no marker, and no field anywhere naming the stall.
+  Reachable with a perfectly successful handler whose reply simply cannot
+  reach the peer. Fixed by falling through instead of skipping: a failing
+  replay no longer blocks `inbox_lease` for the rest of the tick (leasing
+  message N+1 has never depended on message N's reply having transmitted —
+  records are independent, keyed by their own `source_id`). The failing
+  record's own retry stays bounded to at most one attempt per tick, same as
+  before; no new rate limit was needed. The stall is now visible via
+  `mupot_gateway_status.reply_replay_failures` — a non-persisted,
+  in-memory-only counter (there is nothing durable to derive it from: the
+  underlying failure, e.g. a transport exception, is never written to
+  `reply_outbox`), incremented on each replay failure and reset to 0 the
+  next time replay succeeds.
+
+  **A real, separate downstream effect this does NOT fix (out of scope for
+  this round):** once a SECOND message is delivered while the first
+  record's reply is still unresolved, `_deliver` overwrites the single-slot
+  `pending` marker for the new message. `_replay_reply_outbox`'s own
+  "genuine crash ambiguity" check then no longer matches the orphaned first
+  record against `pending`, and — correctly, per its existing design —
+  escalates it to `reconciliation_required`, ending the poll loop. This is
+  a PRE-EXISTING code path, not something this round introduced, and it
+  fails LOUDLY (`reply_reconciliation_required: true`, a fatal error code)
+  rather than silently, which is the property this round's fix cares about.
+  It does mean a stuck reply's window to recover on its own is bounded by
+  "until the next different message arrives," not indefinite.
+
+- **BLOCK-2 (P1) — the restart flap.** A custodied reply (human custody
+  already achieved) whose only attempt died mid-turn (e.g. `disconnect()`
+  before its `inbox_lease_ack` ran) used to durably quarantine on the very
+  first replay tick of every subsequent restart — and because the
+  quarantine flag `_ack_persisted_ownership` set was never persisted to
+  `state.json`, each fresh restart's `connect()` still returned `True`
+  (nothing on disk said otherwise) and then died immediately, identically,
+  forever: an infinite "looks healthy, dies right away" flap invisible to
+  anything that only checks `connect()`'s return value. Fixed narrowly:
+  `_ack_persisted_ownership` now treats a well-formed `inbox_lease_ack`
+  response reporting `expired`/`cancelled`/`empty` (the server plainly
+  saying this exact attempt can no longer be acked — a resolved,
+  unambiguous outcome, not a transport failure) as a deferral rather than a
+  durable ambiguity: since every caller already proved human custody exists
+  before reaching this call, it is safe to commit locally exactly as if the
+  ack had succeeded. No new state key: `processed` already dedups a future
+  redelivery of the same message through `_process_leased_message`'s
+  existing "already processed" branch, which acks under whatever attempt is
+  CURRENT at that time via `_ack_expected` — the stale `ack_ownership`
+  recorded on the reply record is simply never consulted again once the
+  message is marked processed. A response reporting `leased` (a nonsensical
+  answer to an ack call) is deliberately NOT included in this deferral —
+  that stays a durable fence, same as any other malformed/unexpected ack
+  response.
+
+- **P2 — duplicate peer `send`.** The `empty_output`/`handler_error` exits
+  were the only two of the five that never called
+  `_cancel_delivery_processing(runtime)` — both left Hermes's own
+  background session task free to keep running, which could race a peer
+  `send` against `_replay_reply_outbox`'s own retry of the identical
+  `request_id` (reproduced: a raising handler plus a slow peer `send`
+  produced two `send` calls carrying the same `request_id` for one crashed
+  turn). Now calls it, matching the other three exits — verified: exactly
+  one send per `request_id`. (The `empty_output` exit's own call is
+  structurally consistent with the other four but has no independently
+  reachable duplicate-send scenario the way `handler_error`'s does — there
+  is no analogous "Hermes auto-apology" mechanism for a clean empty return
+  — so unlike `handler_error`'s, this specific call has no dedicated
+  mutation-kill test; disclosed here rather than silently claimed.)
+- **P2 — `lease_reconciliation_status()` under-reporting.** `required` used
+  to be exactly `marker is not None` — but `_lease_quarantined` can be set
+  (e.g. by `_ack_persisted_ownership`'s own remaining ambiguous-failure
+  path, or `_quarantine_inbox_polling`'s persistence-failure branch)
+  without a marker ever being written. Either state genuinely refuses
+  `connect()`; `required` now also reflects `self._lease_quarantined`
+  directly.
+- **P2-3, re-examined — operator `reconcile_inbox_polling(execute_leased=True)`
+  on a still-`leased` attempt.** Declined as a code change; documented
+  instead (see "Operator procedure" below) — see why under item 5 there.
+- **P2 — `lease_seconds` vs `turn_timeout` clamp.** Declined as a code
+  change; see "Declined this round" below.
+
 ## The three states
 
 Every inbox-polling outcome lands in exactly one of these. Only the last one
@@ -66,9 +158,9 @@ Mupot's own server-side redelivery counter bounds it (see below).
 
 | State | Trigger | Durable representation | Who reads it |
 |---|---|---|---|
-| **Delivered** | Handler succeeds, reply reaches human custody, ack+commit. | `processed` list, `reply_outbox[id].status == "complete"`. | Nothing further — done. |
-| **Deferred** | Any of the five `_DeliveryDeferred` reasons (the message's own lease expires, `turn_timeout` fires while that lease is still live, the handler raises, the handler produces no reply at all, or the delivery runtime is invalidated mid-turn), or `hermes pause` is engaged (`_EstopDeferred`). | Nothing new written for this outcome itself — `pending` is cleared unless a non-complete reply record is already staged for the source (`_reply_staged_incomplete`), in which case `pending` is left untouched so that staged reply can still complete via replay. | `_poll_loop` releases the fence and lets Mupot redeliver. **Bounded server-side, not locally**: Mupot's own reaper dead-letters the message once its `delivery_attempts` counter reaches the server's `MAX_DELIVERY_ATTEMPTS` (5) — checked inline before every claim, so a message that keeps deferring is redelivered at most 5 times, then silently moved to the server's dead-letter state **with no notification to the human** that it happened. Nothing in this plugin watches for that; an operator who suspects a message is looping should check the redelivery count/dead-letter state on the Mupot side directly, not this plugin's own state.json (local attempt bounding is a separate, explicitly out-of-scope concern — issue #10). |
-| **Violation** | A genuine protocol error, reserved for exactly four fence kinds: (1) a **tampered**/malformed server response that fails schema or fence-proof validation, (2) an **owner mismatch** (the active secret scope's fingerprint no longer matches the one the marker/pending state was fenced under), (3) an **attempt conflict** (the durable marker's `attempt_id`/`version` doesn't match what the current call is trying to reconcile), or (4) an **unknown-attempt** ack/commit (a message id or attempt id the local state has no record of). | `lease_reconciliation` marker (durable, `connect()`-refusing). | `reconcile_inbox_polling()` — auto-attempted once by `connect()` itself, but ONLY on a clean tombstone (see below); a genuinely still-fenced attempt is left exactly as it was. |
+| **Delivered** | Handler succeeds, reply reaches human custody, ack+commit. **Includes `handler_error` when a live peer/notification transport is present**: Hermes's own `_notify_turn_error` fires from the same exception handler and calls `send()` on the crashing turn's behalf; when that auto-apology send succeeds, it IS the peer reply and the human notice both, and the very next replay tick acks+commits it normally — a decision request terminally consumed by an error handler, by design (PR #9, `c9b79aa`), not a bug and not this row's Deferred case. Only when that auto-apology's own send ALSO fails does `handler_error` land in Deferred below with nothing staged. | `processed` list, `reply_outbox[id].status == "complete"`. | Nothing further — done. |
+| **Deferred** | Any of the five `_DeliveryDeferred` reasons (the message's own lease expires, `turn_timeout` fires while that lease is still live, the handler raises, the handler produces no reply at all, or the delivery runtime is invalidated mid-turn), or `hermes pause` is engaged (`_EstopDeferred`). | Nothing new written for this outcome itself — `pending` is cleared unless a non-complete reply record is already staged for the source (`_reply_staged_incomplete`), in which case `pending` is left untouched so that staged reply can still complete via replay. | `_poll_loop` releases the fence and lets Mupot redeliver. **Bounded server-side, not locally**: Mupot's own reaper dead-letters the message once its `delivery_attempts` counter reaches the server's `MAX_DELIVERY_ATTEMPTS` (5) — checked inline before every claim, so a message that keeps deferring is redelivered at most 5 times, then silently moved to the server's dead-letter state **with no notification to the human** that it happened. Nothing in this plugin watches for that; an operator who suspects a message is looping should check the redelivery count/dead-letter state on the Mupot side directly, not this plugin's own state.json (local attempt bounding is a separate, explicitly out-of-scope concern — issue #10). **A reply stuck failing to transmit (round 5) no longer blocks other messages from being leased** (see BLOCK-1 above) — watch `mupot_gateway_status.reply_replay_failures` (a non-persisted, in-process counter) for this specific shape rather than `poll_running`/`is_connected`, which stay green throughout. |
+| **Violation** | A genuine protocol error, reserved for exactly four fence kinds: (1) a **tampered**/malformed server response that fails schema or fence-proof validation, (2) an **owner mismatch** (the active secret scope's fingerprint no longer matches the one the marker/pending state was fenced under), (3) an **attempt conflict** (the durable marker's `attempt_id`/`version` doesn't match what the current call is trying to reconcile), or (4) an **unknown-attempt** ack/commit (a message id or attempt id the local state has no record of) — **and, separately, the two `*_reconciliation_required` fatal paths below**, which are NOT `lease_reconciliation` markers but are equally durable/fatal for the running process. | `lease_reconciliation` marker (durable, `connect()`-refusing) for the four fence kinds above. **Two other, unrelated fatal paths land here too, cross-referenced because both are easy to mistake for the marker above:** (a) `mupot_reply_reconciliation_required` / `self._reply_reconciliation_required` — set by `_replay_reply_outbox`'s "genuine crash ambiguity" escalation (an orphaned non-complete reply record that no longer matches `pending`) or a legacy v1 record; recomputed at every `__init__` from `reply_outbox` record statuses, so IS effectively persisted (via the `"reconciliation_required"` status written onto the record itself), unlike (b). (b) `mupot_inbox_attempt_ack_reconciliation_required` / a second `_lease_quarantined = True` set inside `_ack_persisted_ownership`'s own genuinely-ambiguous-failure branch (a transport exception mid-ack, or a well-formed but non-`acked`/non-dead-attempt response such as `leased`) — this one is IN-MEMORY ONLY, not persisted to any key, which is exactly why the pre-round-5 "restart flap" (BLOCK-2) was invisible across restarts: `connect()` re-derives `_lease_quarantined` fresh from `state["lease_reconciliation"]` alone, so this flavor of quarantine silently resets to `False` on every fresh process even though the identical failure re-fires on the very next replay tick. | `reconcile_inbox_polling()` — auto-attempted once by `connect()` itself, but ONLY on a clean tombstone (see below); a genuinely still-fenced attempt is left exactly as it was. Path (a) above has **no code path that clears it** (see Operator procedure). Path (b) clears itself the moment a fresh restart's replay either succeeds outright or hits round 5's own dead-attempt deferral; only a GENUINELY ambiguous ack failure (not one of `expired`/`cancelled`/`empty`) re-quarantines it. |
 
 ## `connect()`'s automatic self-heal: what it will and will not do over the network
 
@@ -158,6 +250,35 @@ answer determines:
      against this class instead of hand-editing state to `"complete"` —
      forcing completeness onto a record without a receipt is exactly the
      invisible-brick failure mode point 4 above exists to prevent.
+- **`mupot_gateway_status.reply_replay_failures` is non-zero (round 5):** a
+  specific staged reply is failing to transmit on every poll tick (most
+  commonly: the peer `send` transport is down). This is a **Deferred**
+  signal, not a fence — `inbox_lease` and every other message keep working
+  normally throughout (that is exactly what round 5 fixed: this used to
+  silently stop `inbox_lease` entirely instead). Diagnose the transport
+  issue directly; there is nothing to reconcile in `state.json` for this by
+  itself. It resets to 0 on its own the next time that record's replay
+  succeeds. Watch also for it turning into a `reply_reconciliation_required`
+  Violation shortly after a SECOND message is delivered (see BLOCK-1's
+  downstream-effect note above) — that is the same underlying stuck record,
+  now escalated once it can no longer match `pending`.
+- **Calling `reconcile_inbox_polling()` yourself on a still-`leased`
+  attempt (item 5, declined as a code change):** each call burns one real
+  agent turn against the still-outstanding message and is not guaranteed to
+  make progress — the attempt may still be genuinely claimed elsewhere, in
+  which case the marker is left exactly as it was and only the log
+  changes, or the turn may defer again for an unrelated reason (any of the
+  five `_DeliveryDeferred` reasons), in which case the SAME nothing-changed
+  outcome results. This is not a bug: `execute_leased=True` exists
+  precisely so an operator can choose to force this on purpose, and
+  `test_exact_leased_attempt_is_processed_and_acked_before_clear` pins that
+  a genuinely still-outstanding `leased` attempt CAN complete successfully
+  through exactly this call — the code cannot distinguish "will succeed
+  this time" from "is hopeless" in advance without trying, so there is no
+  safe way to auto-refuse only the hopeless case. Prefer waiting for the
+  attempt to expire naturally (`connect()`'s own automatic self-heal, or a
+  later `reconcile_inbox_polling()` call once the server reports a clean
+  tombstone) unless there is a specific reason to force it now.
 
 ## What changed vs. before this fix
 
@@ -223,6 +344,41 @@ answer determines:
    `invalid_receipt` (not just `complete`) from "still staged" — a clean
    tombstone with a matching `invalid_receipt` reply record could not
    previously clear `pending` across a restart at all.
+8. (Round 5) `_poll_loop`'s reply-replay-failure handling no longer skips
+   `inbox_lease` for the rest of the tick (BLOCK-1) — see that section
+   above. `mupot_gateway_status` gained `reply_replay_failures` (a
+   non-persisted, in-process counter). `_ack_persisted_ownership` now
+   treats a well-formed `expired`/`cancelled`/`empty` ack response as a
+   deferral rather than a durable ambiguity (BLOCK-2) — no new state key.
+   The `empty_output`/`handler_error` exits now also call
+   `_cancel_delivery_processing(runtime)`, matching the other three exits
+   (closes a duplicate-peer-`send` race). `lease_reconciliation_status()`'s
+   `required` field now also reflects `self._lease_quarantined` directly,
+   not only a parseable marker.
+9. **Declined this round, documented instead of code-changed:**
+   - `lease_seconds` is NOT clamped to a floor of `turn_timeout + 60`. The
+     derived/default formula (`turn_timeout + mcp_tool_timeout + 60`)
+     already satisfies this floor unconditionally (`mcp_tool_timeout >= 0`),
+     so the clamp would be a pure no-op there; it would only ever bite an
+     EXPLICIT `lease_seconds` override — but
+     `test_lease_seconds_explicit_config_bypasses_the_formula` is a
+     round-2, deliberately-named, rationale-backed pin that an explicit
+     value bypasses every formula-side computation, and several of this
+     PR's own tests (e.g. the pre-turn/post-timeout lease-expiry scenarios)
+     rely on being able to set `lease_seconds` smaller than `turn_timeout`
+     on purpose to construct exactly the class this PR fixes. Silently
+     overriding an explicit operator/test value contradicts that intent
+     for near-zero live benefit (unreachable on the current default
+     profile: `300 < 540`). If this is ever revisited, it needs a decision
+     about whether "explicit config bypasses the formula" still holds, not
+     a silent clamp.
+   - `reconcile_inbox_polling(execute_leased=True)` still executes a turn
+     against a still-`leased` attempt with no guarantee of progress — see
+     the Operator procedure entry above for why this stays a documented
+     property rather than a refusal: `test_exact_leased_attempt_is_
+     processed_and_acked_before_clear` pins that this call CAN legitimately
+     succeed on a genuinely still-outstanding attempt, so there is no safe
+     way to distinguish "will succeed" from "is hopeless" without trying.
 
 ## Forensic note: 3 of 5 incident snapshots are the pre-lease fence shape
 

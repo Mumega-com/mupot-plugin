@@ -18,18 +18,49 @@ Drives the REAL `_poll_loop` (not `_deliver` in isolation) end to end:
   - `test_genuine_protocol_violation_still_quarantines`: the countercase
     that proves `_quarantine_inbox_polling()` is not dead code -- a real
     protocol violation unrelated to lease expiry still quarantines.
+
+Round 2 (kasra-review re-gate, head 5046ea79, 2026-09-15) BLOCK-1/BLOCK-2/
+M9/M10 fixes -- see `_TurnFailureDeferred`'s and each raise site's own
+docstrings in `mupot_gateway/adapter.py` for the full class rationale:
+  - `test_restart_after_expiry_deferral_reconnects`: BLOCK-1 -- a lease
+    expiry deferral must clear `pending`, or a restart reads it as ambiguous
+    legacy work and `connect()` refuses forever, moving the brick from
+    `lease_reconciliation` to `pending`.
+  - `test_post_timeout_lease_expiry_also_clears_pending`: same BLOCK-1 fix
+    at the OTHER `_LeaseExpiredDeferred` raise site (post-turn-timeout, lease
+    was the binding constraint).
+  - `test_turn_timeout_with_live_lease_bounds_retries_then_dlq`,
+    `test_no_custody_bounds_retries_then_dlq`,
+    `test_handler_error_bounds_retries_then_dlq`: BLOCK-2/WARN -- a turn
+    that hangs past `turn_timeout` with a LIVE lease, a handler that returns
+    no custody, and a handler that raises are turn failures, not lease
+    expiries -- bounded by `delivery_attempts`, never retried forever and
+    never silently quarantined.
+  - `test_reconcile_defers_on_lease_expiry_not_reconciliation_failed`: M9 --
+    a `_LeaseExpiredDeferred` mid-`reconcile_inbox_polling()` must be read
+    as "deferred, retry later", not folded into the generic "reconciliation
+    failed" path (both return `False`; the OBSERVABLE difference this test
+    pins is the log line, per the standing "verify the PROPERTY, not just
+    the return value" rule -- state alone survives the M9 mutation).
 """
 from __future__ import annotations
 
 import asyncio
 import copy
 import json
+import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from gateway.config import PlatformConfig
-from plugin.mupot_gateway.adapter import MupotAdapter, StateStore
+from plugin.mupot_gateway.adapter import (
+    MupotAdapter,
+    StateStore,
+    _LeaseExpiredDeferred,
+    _TurnFailureDeferred,
+)
 
 FAKE_SCOPE = {"tenant": "tenant-a", "agent_id": "agent-consumer", "effective_inbox_seat": None}
 EXPIRED_LEASE = "2000-01-01T00:00:00.000Z"
@@ -114,6 +145,40 @@ class ExpiryDriverClient:
 
     def ack_calls(self):
         return [t for t, _ in self.calls if t in {"inbox_ack", "inbox_lease_ack"}]
+
+
+def _iso_in(seconds: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+class RollingLiveLeaseClient(ExpiryDriverClient):
+    """Fake mupot server that always grants a FRESH, long-lived lease for the
+    same message, incrementing `delivery_attempts` each time -- simulates a
+    turn that keeps failing (hanging past `turn_timeout`, returning no
+    custody, or raising) while its own lease never comes close to expiring.
+    Round 2 (kasra-review re-gate BLOCK-2, 2026-09-15): proves
+    `_TurnFailureDeferred` is bounded by `delivery_attempts`, distinct from
+    `_LeaseExpiredDeferred`'s unbounded-by-design redelivery."""
+
+    async def call(self, tool, arguments):
+        if tool == "inbox_lease":
+            self.lease_calls += 1
+            aid = arguments.get("attempt_id")
+            nxt = _iso_in(30)
+            msg = dict(self.message)
+            msg["lease_expires_at"] = nxt
+            msg["delivery_attempts"] = self.lease_calls
+            return {
+                **FAKE_SCOPE,
+                "attempt_id": aid,
+                "state": "leased",
+                "lease_expires_at": nxt,
+                "messages": [msg],
+                "consumed": False,
+            }
+        return await super().call(tool, arguments)
 
 
 def make_adapter(tmp_path: Path, client: ExpiryDriverClient, *, extra=None) -> MupotAdapter:
@@ -214,5 +279,335 @@ async def test_genuine_protocol_violation_still_quarantines(tmp_path: Path) -> N
         st = _state(state_path)
         assert isinstance(st.get("lease_reconciliation"), dict)
         assert adapter.has_fatal_error is True
+
+        # M10 (kasra-review re-gate round 2, 2026-09-15): every existing test
+        # exercising `lease_reconciliation_status()` only ever saw the CLEAR
+        # case (marker absent) -- mutating it to always return `None`
+        # (regardless of state) left every one of them green. Positive case:
+        # a genuinely live marker must be reported, with real fields, not
+        # just its absence.
+        status = adapter.lease_reconciliation_status()
+        assert status is not None, "a live lease_reconciliation marker must be reported"
+        assert status["required"] is True
+        assert status["version"] == 3
+        assert isinstance(status["attempt_id"], str) and status["attempt_id"]
+        assert status["connect_will_attempt_auto_reconcile"] is True
     finally:
         await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_restart_after_expiry_deferral_reconnects(tmp_path: Path) -> None:
+    """BLOCK-1 (kasra-review re-gate round 2, 2026-09-15, head 5046ea79):
+    `_deliver` wrote `pending = {"message": message}` BEFORE either
+    `_LeaseExpiredDeferred` raise site and left it set on every deferral. On
+    restart, the constructor's `_legacy_pending_ambiguous` check read that
+    survivor as ambiguous crash state (its source id was never staged in
+    `reply_outbox`) and `connect()` refused -- BEFORE the
+    `_lease_quarantined` auto-reconcile branch even runs, since the pending-
+    ambiguity check comes first in `_connect_with_active_scope`. The brick
+    moved from `lease_reconciliation` to `pending`, silently: 476 green
+    tests and green CI were blind to it because none of them restarted a
+    fresh `MupotAdapter` against state a real deferral had produced.
+
+    Ported from kasra-review's own probe (`scratchpad/kasra-probes-pr9/
+    test_kasra_probe_a.py`, read-only, never shipped) with the outcome
+    updated to prove the FIX rather than reproduce the bug."""
+    state_path = tmp_path / "state.json"
+    client = ExpiryDriverClient(PEER_MSG)  # PEER_MSG's lease is already expired
+    adapter = make_adapter(tmp_path, client)
+
+    async def handler(event):
+        return "{ack_for:req-7} accepted"
+
+    adapter.set_message_handler(handler)
+    assert await adapter.connect()
+    try:
+        await _await_until(lambda: client.lease_calls >= 2)
+        st = _state(state_path)
+        assert st.get("lease_reconciliation") is None
+        assert st.get("pending") is None, (
+            "BLOCK-1: a clean lease-expiry deferral must clear pending -- "
+            "nothing here was ever a candidate for reply_outbox custody"
+        )
+        assert st.get("reply_outbox") == {}
+    finally:
+        await adapter.disconnect()
+
+    restarted = MupotAdapter(
+        PlatformConfig(enabled=True, typing_indicator=False, extra={
+            "allowed_agents": "hadi-codex", "poll_interval": 0.01,
+            "state_path": str(state_path)}),
+        client_factory=lambda *_: ExpiryDriverClient(PEER_MSG),
+    )
+    restarted.set_message_handler(handler)
+    assert restarted._legacy_pending_ambiguous is False, (
+        "BLOCK-1: pending survived the deferral and bricked the restart"
+    )
+    assert restarted._lease_quarantined is False
+    assert await restarted.connect() is True, "restart after a lease-expiry deferral must reconnect"
+    await restarted.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_post_timeout_lease_expiry_also_clears_pending(tmp_path: Path) -> None:
+    """BLOCK-1's SECOND raise site (kasra-review re-gate round 2, 2026-09-15):
+    the pre-turn `_expire_if_needed` check is not the only place
+    `_LeaseExpiredDeferred` is raised -- the post-`asyncio.wait_for` timeout
+    branch, when the lease deadline (not `turn_timeout`) is what bound the
+    wait, must clear `pending` too, or a restart bricks on a mid-turn lease
+    expiry exactly the same way."""
+    state_path = tmp_path / "state.json"
+    message = dict(PEER_MSG, lease_expires_at=_iso_in(0.2))
+    client = ExpiryDriverClient(message)
+    adapter = make_adapter(tmp_path, client)
+    adapter.turn_timeout = 5.0  # far longer than the lease -- the LEASE binds
+
+    async def hung(event):
+        await asyncio.Event().wait()
+
+    adapter.set_message_handler(hung)
+    with pytest.raises(_LeaseExpiredDeferred):
+        await adapter._deliver(message)
+    st = _state(state_path)
+    assert st.get("pending") is None
+    await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_turn_timeout_with_live_lease_bounds_retries_then_dlq(tmp_path: Path) -> None:
+    """BLOCK-2 (kasra-review re-gate round 2, 2026-09-15): pre-fix, a turn
+    that hangs past `turn_timeout` with its message's lease STILL LIVE
+    unconditionally raised `_LeaseExpiredDeferred` -- `_poll_loop` releases
+    the lease and the server immediately redelivers, so a turn that will
+    very likely hang again re-executes without limit (A/B measured 1 turn
+    before this fix vs 11+ and climbing, with no operator signal). Below
+    `max_delivery_attempts`, this now defers (`_TurnFailureDeferred`,
+    kind="turn_timeout") the same way; AT the cap, `_deliver` acks the
+    source, DLQs it, and commits -- terminal, never a durable quarantine and
+    never unbounded re-execution.
+
+    Adapted from kasra-review's own probe D (`scratchpad/kasra-probes-pr9/
+    test_kasra_probe_d.py`, read-only, never shipped)."""
+    state_path = tmp_path / "state.json"
+    client = RollingLiveLeaseClient(dict(PEER_MSG, lease_expires_at=_iso_in(30)))
+    adapter = make_adapter(tmp_path, client)
+    adapter.turn_timeout = 0.05
+    handled: list[str] = []
+
+    async def hung(event):
+        handled.append(event.message_id)
+        await asyncio.sleep(30)
+
+    adapter.set_message_handler(hung)
+    assert await adapter.connect()
+    try:
+        assert await _await_until(
+            lambda: len(handled) >= adapter.max_delivery_attempts, n=1000
+        ), "turn failure never reached the cap"
+        await asyncio.sleep(0.2)  # let the terminal ack/DLQ/commit tick settle
+
+        assert len(handled) == adapter.max_delivery_attempts, (
+            "turn re-executed past max_delivery_attempts -- unbounded again"
+        )
+        st = _state(state_path)
+        assert st.get("lease_reconciliation") is None, (
+            "a bounded turn failure must never quarantine inbox polling"
+        )
+        assert adapter._lease_quarantined is False
+        assert adapter.has_fatal_error is False
+        assert not adapter._poll_task.done(), "poll loop died on a bounded turn failure"
+        assert st.get("processed") == [PEER_MSG["id"]]
+        assert st.get("pending") is None
+
+        dlq = st.get("dlq") or []
+        assert len(dlq) == 1
+        assert dlq[0]["reason"] == "turn_timeout"
+        assert dlq[0]["message"]["id"] == PEER_MSG["id"]
+
+        # mupot_gateway_status must surface this (item 2), not just state.json.
+        summary = adapter.turn_failure_dlq_summary()
+        assert summary == [{"source_id": PEER_MSG["id"], "reason": "turn_timeout"}]
+
+        # No further executions after the cap: the message is processed, so
+        # redelivery just re-acks without ever calling the handler again.
+        attempts_at_cap = client.lease_calls
+        await asyncio.sleep(0.2)
+        assert len(handled) == adapter.max_delivery_attempts
+        assert client.lease_calls > attempts_at_cap, "poll loop must still be alive/leasing"
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_no_custody_bounds_retries_then_dlq(tmp_path: Path) -> None:
+    """WARN (kasra-review re-gate round 2, 2026-09-15): a handler that
+    completes but produces nothing with human custody used to `return`
+    bare -- unacked, unprocessed, no raise -- which `_poll_loop` folded into
+    `_protocol_error()` -> `_quarantine_inbox_polling()`. Now bounded the
+    same way as `turn_timeout` (kind="no_custody")."""
+    state_path = tmp_path / "state.json"
+    client = RollingLiveLeaseClient(dict(PEER_MSG, lease_expires_at=_iso_in(30)))
+    adapter = make_adapter(tmp_path, client)
+    handled: list[str] = []
+
+    async def empty_handler(event):
+        handled.append(event.message_id)
+        return ""
+
+    adapter.set_message_handler(empty_handler)
+    assert await adapter.connect()
+    try:
+        assert await _await_until(
+            lambda: len(handled) >= adapter.max_delivery_attempts, n=1000
+        )
+        await asyncio.sleep(0.2)
+        st = _state(state_path)
+        assert len(handled) == adapter.max_delivery_attempts
+        assert st.get("lease_reconciliation") is None
+        assert adapter._lease_quarantined is False
+        assert not adapter._poll_task.done()
+        dlq = st.get("dlq") or []
+        assert len(dlq) == 1 and dlq[0]["reason"] == "no_custody"
+        assert st.get("processed") == [PEER_MSG["id"]]
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_handler_error_bounds_retries_then_dlq(tmp_path: Path) -> None:
+    """WARN (kasra-review re-gate round 2, 2026-09-15): a handler that raises
+    (surfaced by `BasePlatformAdapter` as `ProcessingOutcome.FAILURE`, see
+    `on_processing_complete`) used to `return` bare -- same silent-quarantine
+    shape as `no_custody`. Now bounded (kind="handler_error").
+
+    `BasePlatformAdapter`'s own crash handling calls `_notify_turn_error`
+    (unrelated to this fix, pre-existing on every handler exception), which
+    tries to tell the human via this adapter's `send()` -- an UNCONFOUNDED
+    test of the bounded-retry property needs that side channel neutered, or
+    a successful error notification legitimately stages a "complete"
+    reply_outbox record that `_replay_reply_outbox` commits on its own,
+    finishing the message via a different, equally legitimate path before
+    `max_delivery_attempts` is ever reached. Stub `send()` to fail cleanly
+    (no reply_outbox write) so this test isolates `_resolve_turn_failure`'s
+    own bounded-retry-then-DLQ behavior specifically."""
+    state_path = tmp_path / "state.json"
+    client = RollingLiveLeaseClient(dict(PEER_MSG, lease_expires_at=_iso_in(30)))
+    adapter = make_adapter(tmp_path, client)
+    handled: list[str] = []
+
+    async def raising_handler(event):
+        handled.append(event.message_id)
+        raise RuntimeError("handler exploded")
+
+    async def stub_send(*_args, **_kwargs):
+        return None
+
+    adapter.set_message_handler(raising_handler)
+    adapter.send = stub_send
+    assert await adapter.connect()
+    try:
+        assert await _await_until(
+            lambda: len(handled) >= adapter.max_delivery_attempts, n=1000
+        )
+        await asyncio.sleep(0.2)
+        st = _state(state_path)
+        assert len(handled) == adapter.max_delivery_attempts
+        assert st.get("lease_reconciliation") is None
+        assert adapter._lease_quarantined is False
+        assert not adapter._poll_task.done()
+        dlq = st.get("dlq") or []
+        assert len(dlq) == 1 and dlq[0]["reason"] == "handler_error"
+        assert st.get("processed") == [PEER_MSG["id"]]
+    finally:
+        await adapter.disconnect()
+
+
+class ReconcileDeferralClient:
+    """Fake mupot server driving `reconcile_inbox_polling()` through a
+    `_LeaseExpiredDeferred` mid-reconciliation -- M9 (kasra-review re-gate
+    round 2, 2026-09-15): the reconcile catch must recognise every
+    `_DeliveryDeferred` subclass, not just `_EstopDeferred`, without folding
+    it into the generic "reconciliation failed" path."""
+
+    def __init__(self, message):
+        self.message = copy.deepcopy(message)
+        self.reconcile_calls = 0
+
+    async def connect(self):
+        return None
+
+    async def close(self):
+        return None
+
+    async def call(self, tool, arguments):
+        if tool == "inbox_consumer_status":
+            return {"strict_scope": True, **FAKE_SCOPE, "mode": "bearer_only",
+                    "generation": 0, "key_matches": True}
+        if tool == "inbox_lease":
+            aid = arguments.get("attempt_id")
+            msg = dict(self.message, lease_expires_at=FRESH_LEASE)
+            return {**FAKE_SCOPE, "attempt_id": aid, "state": "leased",
+                    "lease_expires_at": FRESH_LEASE, "messages": [msg], "consumed": False}
+        if tool == "inbox_lease_reconcile":
+            self.reconcile_calls += 1
+            aid = arguments["attempt_id"]
+            # The reconcile attempt re-leases the SAME message, but this
+            # time ITS OWN lease has already expired -- a genuine
+            # _LeaseExpiredDeferred site, distinct from _EstopDeferred.
+            msg = dict(self.message, lease_expires_at=EXPIRED_LEASE)
+            return {**FAKE_SCOPE, "attempt_id": aid, "state": "leased",
+                    "lease_expires_at": EXPIRED_LEASE, "messages": [msg], "consumed": False}
+        raise AssertionError(f"unexpected tool {tool} {arguments}")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_defers_on_lease_expiry_not_reconciliation_failed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """M9: force a genuine quarantine, then feed `reconcile_inbox_polling()`
+    a `_LeaseExpiredDeferred` mid-attempt. Both the pre-fix (mutated) and
+    fixed code return `False` here -- state alone cannot distinguish them
+    (the standing "verify the PROPERTY, not just the return value" rule) --
+    so this asserts the actual observable difference: which log line fires,
+    and that the marker survives untouched for a later retry rather than
+    being discarded as a failure."""
+    state_path = tmp_path / "state.json"
+    message = dict(PEER_MSG, lease_expires_at=FRESH_LEASE)
+    setup_client = ExpiryDriverClient(message)
+    adapter = make_adapter(tmp_path, setup_client)
+
+    async def handler(event):
+        return "{ack_for:req-7} accepted"
+
+    adapter.set_message_handler(handler)
+    adapter._commit = lambda message_id: None  # force a genuine quarantine
+
+    assert await adapter.connect()
+    try:
+        assert await _await_until(lambda: adapter._lease_quarantined is True)
+    finally:
+        await adapter.disconnect()
+
+    st_before = _state(state_path)
+    assert isinstance(st_before.get("lease_reconciliation"), dict)
+
+    reconcile_client = ReconcileDeferralClient(message)
+    adapter._client = reconcile_client
+    adapter._send_client = reconcile_client
+
+    with caplog.at_level(logging.INFO):
+        result = await adapter.reconcile_inbox_polling()
+
+    assert result is False, "a deferred condition must not report reconciliation as cleared"
+    assert reconcile_client.reconcile_calls == 1
+    assert adapter._lease_quarantined is True, (
+        "the marker must survive untouched so a later retry can succeed "
+        "once the deferred condition clears"
+    )
+    st_after = _state(state_path)
+    assert st_after.get("lease_reconciliation") == st_before.get("lease_reconciliation")
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("inbox reconciliation deferred" in m for m in messages), messages
+    assert not any("inbox attempt reconciliation failed" in m for m in messages), messages

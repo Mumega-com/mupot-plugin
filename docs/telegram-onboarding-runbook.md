@@ -324,10 +324,16 @@ Two changes close this as a class (`_LeaseExpiredDeferred` in
    pause — no quarantine, no ack, no "message not marked processed" error.
 2. **Lease sizing now accounts for the real ceiling.** `lease_seconds`
    defaults to `turn_timeout + mcp_tool_timeout + 60s`. `mcp_tool_timeout`
-   (default 300s) has no way to read Hermes's actual configured
-   `mcp.tool_call` timeout — set it explicitly in the `mupot` platform's
-   `extra` config to match whatever your deployment configures there (the
-   2026-09-15 incident this closes ran with `mcp.tool_call` at 180s).
+   defaults to the mupot MCP server's own configured `timeout` (read via the
+   same `load_config()["mcp_servers"][name]` path `HermesMCPClient` uses to
+   build its own client, updated round 2 below) — override it explicitly in
+   the `mupot` platform's `extra` config only if you want the lease sized
+   against something other than the raw MCP client timeout (the 2026-09-15
+   incident this closes ran with the mupot MCP server's `timeout` at 180s).
+   **`turn_timeout`, not the lease, is what actually binds a slow-tool-call
+   turn in practice** (see round 2's classification below) — a turn that
+   legitimately needs longer than `turn_timeout` needs `turn_timeout`
+   raised, not a bigger lease.
 
 **`connect()` now self-heals a genuinely-empty quarantine automatically.**
 When a durable `lease_reconciliation` marker (`required: true`) is present,
@@ -348,6 +354,10 @@ still require the manual procedure below.
 `{required, version, attempt_id, connect_will_attempt_auto_reconcile}`) —
 before this, a fully-quarantined adapter that could never `connect()` still
 reported `{"ok": true}` with no way to see why nothing was being received.
+Round 2 (2026-09-15) added `reconciling` (true while `connect()`'s bounded
+auto-reconcile turn is in flight — see below) and `turn_failure_dlq` (the
+Failed-bounded class's own terminal disposition — see the classification
+table below).
 
 **Manual procedure, when the marker survives an automatic `connect()`
 attempt (or you need to clear it without restarting):**
@@ -371,6 +381,71 @@ attempt (or you need to clear it without restarting):**
    no longer matches what the marker recorded (profile/tenant/seat/mode
    changed) and needs an operator to confirm which is authoritative before
    editing state by hand.
+
+### Round 2 (2026-09-15): every delivery outcome has exactly one class
+
+Kasra gate re-gate round 2 (head 5046ea79) found that round 1's fix, while
+correct for a *clean* lease expiry, left two more outcomes able to reach a
+durable brick or an unbounded loop by a different door. The class is now:
+**every delivery attempt lands in exactly one of four outcomes, each with
+one durable representation** — the constructor, `mupot_gateway_status`, and
+this runbook all agree on which is which.
+
+| Outcome | Trigger | Durable representation | Who reads it |
+| --- | --- | --- | --- |
+| **Delivered** | Handler succeeds with human custody | `processed` list + `reply_outbox[id].status="complete"`; `pending: null` | `_process_leased_message`'s "already processed" short-circuit; operator via `processed`/`terminal_receipts` |
+| **Deferred** | Message's own lease expired before ACK (turn not at fault) | `pending: null` (cleared — nothing here was ever candidate reply-outbox custody); no `lease_reconciliation` marker | Poll loop releases the lease and continues; server redelivers. `connect()`'s `_legacy_pending_ambiguous` check (constructor) confirms `pending` is clean on restart |
+| **Failed-bounded** | Turn exceeds `turn_timeout` with the lease still live; handler returns no custody; handler raises | Below `max_delivery_attempts` (default 3): `pending` left AS-IS (real crash-ambiguity — a hung/raising handler may have taken side effects), no ack, `_TurnFailureDeferred` raised. At the cap: `dlq` entry `{message, reason: "turn_timeout"\|"no_custody"\|"handler_error"}`, `processed` includes the id, `pending: null` | `adapter.turn_failure_dlq_summary()` / `mupot_gateway_status`'s `turn_failure_dlq` field; poll loop keeps running either way |
+| **Violation** | Owner fingerprint mismatch, attempt/tenant conflict, tampered state, "processed" never set despite a successful ack (`_protocol_error()`) | `lease_reconciliation` marker (`required: true`, version 1/2/3) | `adapter.lease_reconciliation_status()` / `mupot_gateway_status`'s `lease_reconciliation` field; `connect()` refuses (self-heals once via `reconcile_inbox_polling()` for a genuine tombstone, else needs the manual procedure above) |
+
+BLOCK-1 fix (the brick moved, not closed): `_deliver` writes `pending =
+{"message": message}` before either `_LeaseExpiredDeferred` raise site can
+run, and round 1 left it there unconditionally. On restart, the
+constructor's `_legacy_pending_ambiguous` check reads a `pending` record
+whose source id isn't staged in `reply_outbox` as ambiguous crash state, and
+`connect()` refuses — **before** the `_lease_quarantined` auto-reconcile
+branch even runs. The 2026-09-15 incident's own symptom (durable refusal
+surviving every restart) would have recurred through `pending` instead of
+`lease_reconciliation`, invisibly, since `mupot_gateway_status` had no field
+for it either. Both `_LeaseExpiredDeferred` raise sites now clear `pending`
+before raising.
+
+New knob: **`max_delivery_attempts`** (`extra`, default 3) bounds
+failed-bounded retries using the message's own `delivery_attempts` count —
+the same field Mupot's server increments on every redelivery. This is
+*independent* of `lease_seconds`/`turn_timeout`: a hung or raising turn
+retries at most this many times total, then dead-letters, regardless of how
+generously the lease is sized.
+
+**`connect()`'s auto-reconcile can still run a full bounded turn** before
+`_running` is set `True` (unchanged from round 1 — see the self-healing
+paragraph above) — it goes through the same `_process_leased_message` →
+`_deliver` → `_resolve_turn_failure` path as the live poll loop, so it is
+bounded by `max_delivery_attempts` exactly the same way. While it runs,
+`mupot_gateway_status.connected` is `false` (the adapter isn't `_running`
+yet) **and** `reconciling` is `true` — before this, `connected: false` alone
+could not distinguish "not yet attempted" from "actively working on it".
+
+**Diagnostic entry points, one per class — the operator never edits
+`state.json` for Deferred or Failed-bounded:**
+
+- **Delivered** — nothing to do; visible in `processed`/`terminal_receipts`.
+- **Deferred** — nothing to do; the poll loop and the server handle
+  redelivery on their own. If it recurs constantly for the same source,
+  check `turn_timeout` vs. the mupot server's actual `lease_seconds`
+  headroom, not `state.json`.
+- **Failed-bounded** — call `mupot_gateway_status`; read `turn_failure_dlq`
+  for `{source_id, reason}`. `reason` tells you where to look: `turn_timeout`
+  → the handler hangs (check the specific tool call it was blocked on, raise
+  `turn_timeout` or `max_delivery_attempts` if the work is legitimately
+  slow); `no_custody` → the handler is returning nothing actionable for that
+  source (application bug, not a plugin bug); `handler_error` → read the
+  Hermes error log around that source id for the raised exception. The
+  message is `processed` and will not re-execute — there is nothing in
+  `state.json` for an operator to safely touch here.
+- **Violation** — the manual procedure above; this is the ONLY class where
+  reading (and, in the documented last-resort case, editing) `state.json`
+  by hand is ever the correct next step.
 
 ## Suspension, revocation, and rollback
 

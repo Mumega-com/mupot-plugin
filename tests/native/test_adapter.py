@@ -24,10 +24,13 @@ from plugin.mupot_gateway.adapter import (  # noqa: E402
     StateStore,
     _EstopDeferred,
     _LeaseExpiredDeferred,
+    _TurnFailureDeferred,
+    _configured_mcp_tool_timeout,
     build_mupot_event,
     is_ack_envelope,
     is_terminal_ack,
 )
+import plugin.mupot_gateway.adapter as mupot_adapter_module
 
 
 FAKE_LEASE_EXPIRY = "2099-01-01T00:00:00.000Z"
@@ -368,12 +371,24 @@ def test_unscoped_message_gets_isolated_session() -> None:
 
 def test_lease_seconds_defaults_to_turn_timeout_plus_mcp_tool_timeout(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Class fix (2026-09-15): before this, `lease_seconds` defaulted to
     `turn_timeout + 60s` alone, smaller than `turn_timeout + mcp_tool_timeout`
     whenever a real deployment's MCP tool budget exceeds 60s (the kayhermes
     incident ran with it at 180s) -- a single slow-but-legitimate tool call
-    could then always outlive the lease. Pin the new formula and its knobs."""
+    could then always outlive the lease. Pin the new formula and its knobs.
+
+    Item 7 (kasra-review re-gate round 2, 2026-09-15): `mcp_tool_timeout`'s
+    default now reads the mupot MCP server's own configured `timeout` (see
+    `_configured_mcp_tool_timeout`) instead of a hardcoded 300.0 -- pin that
+    with a monkeypatched reader so this test is deterministic regardless of
+    what a given test environment's own Hermes config happens to have for
+    the `mupot` MCP server (this repo's own dev config resolves it to 180.0,
+    confirmed by running this test unpatched)."""
+    monkeypatch.setattr(
+        mupot_adapter_module, "_configured_mcp_tool_timeout", lambda _name: 300.0
+    )
     default_adapter = MupotAdapter(
         PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "a.json")}),
         client_factory=lambda *_: FakeMupotClient(),
@@ -381,6 +396,16 @@ def test_lease_seconds_defaults_to_turn_timeout_plus_mcp_tool_timeout(
     assert default_adapter.turn_timeout == 300.0
     assert default_adapter.mcp_tool_timeout == 300.0
     assert default_adapter.lease_seconds == 300 + 300 + 60
+
+    monkeypatch.setattr(
+        mupot_adapter_module, "_configured_mcp_tool_timeout", lambda _name: 180.0
+    )
+    reads_configured_default = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "configured.json")}),
+        client_factory=lambda *_: FakeMupotClient(),
+    )
+    assert reads_configured_default.mcp_tool_timeout == 180.0
+    assert reads_configured_default.lease_seconds == 300 + 180 + 60
 
     overridden = MupotAdapter(
         PlatformConfig(
@@ -408,6 +433,26 @@ def test_lease_seconds_defaults_to_turn_timeout_plus_mcp_tool_timeout(
         client_factory=lambda *_: FakeMupotClient(),
     )
     assert explicit_lease.lease_seconds == 42
+
+
+def test_configured_mcp_tool_timeout_reads_real_hermes_config() -> None:
+    """Item 7 (kasra-review re-gate round 2, 2026-09-15): the round-1 fix's
+    own comment claimed this adapter "has no way to read [the Hermes-side
+    MCP timeout] directly" -- false. `_configured_mcp_tool_timeout` reuses
+    the exact `load_config()["mcp_servers"][name]` +
+    `_resolve_mcp_server_config` path `HermesMCPClient._ensure_client` uses.
+    Positive case: this repo's own dev Hermes config configures the `mupot`
+    MCP server's `timeout` to 180 -- the SAME value the kayhermes incident
+    this whole fix closes was running with -- so this must resolve to that
+    real number, not a hardcoded guess."""
+    assert _configured_mcp_tool_timeout("mupot") == 180.0
+
+
+def test_configured_mcp_tool_timeout_falls_back_when_server_unconfigured() -> None:
+    """Countercase: an MCP server name with no entry in `mcp_servers` (or any
+    failure reading the config) must not raise -- constructing an adapter
+    must never fail just because lease-sizing's default couldn't be read."""
+    assert _configured_mcp_tool_timeout("a-server-name-nothing-configures") == 300.0
 
 
 def test_terminal_ack_requires_no_explicit_reply_expectation() -> None:
@@ -532,8 +577,16 @@ async def test_queued_event_expiry_cancels_session_before_model_start(tmp_path: 
         # Class fix (2026-09-15, see _LeaseExpiredDeferred): the queued
         # message's own runtime expires (via the turn-timeout wait) before
         # the handler ever runs -- a deferral, not a silent no-op.
-        with pytest.raises(_LeaseExpiredDeferred):
+        #
+        # Round 2 (kasra-review re-gate BLOCK-2, 2026-09-15): `message`
+        # carries no `lease_expires_at` at all (see `delivery_message`'s
+        # default), so `runtime.lease_deadline is None` -- the lease can
+        # never be the binding constraint here, only `turn_timeout` can be,
+        # so this is now `_TurnFailureDeferred(kind="turn_timeout")`, not a
+        # lease expiry (see `_lease_is_binding`).
+        with pytest.raises(_TurnFailureDeferred) as excinfo:
             await adapter._deliver(message)
+        assert excinfo.value.kind == "turn_timeout"
         assert handled == []
         assert session_key not in adapter._pending_messages
         assert blocker.cancelled()
@@ -572,8 +625,18 @@ async def test_timeout_invalidates_generation_before_bounded_cancellation(
     # of returning. `pending` below is still preserved unchanged (this test
     # is exactly what pins that: dropping it here would be a NEW behavior
     # change this fix does not make).
-    with pytest.raises(_LeaseExpiredDeferred):
+    #
+    # Round 2 (kasra-review re-gate BLOCK-2, 2026-09-15): `delivery_message`
+    # carries no `lease_expires_at`, so the lease can never be the binding
+    # constraint -- this is a turn that hung past its OWN `turn_timeout`
+    # with nothing to say about the lease at all, i.e. exactly the class
+    # `_TurnFailureDeferred` exists to name (kind="turn_timeout"), bounded
+    # by `delivery_attempts` rather than an unbounded `_LeaseExpiredDeferred`
+    # retry loop. `pending` staying set is the SAME crash-ambiguity
+    # reasoning as before, just under the corrected exception class.
+    with pytest.raises(_TurnFailureDeferred) as excinfo:
         await adapter._deliver(delivery_message("bounded-timeout"))
+    assert excinfo.value.kind == "turn_timeout"
     elapsed = time.monotonic() - started
 
     assert cancellation_started.is_set()
@@ -695,8 +758,14 @@ async def test_timed_out_thread_callback_cannot_send_with_next_delivery_context(
         # turn_timeout (0.05) is exhausted while its late thread callback is
         # still blocked on `release_thread` -- a genuine turn timeout, now a
         # deferral rather than a silent no-op.
-        with pytest.raises(_LeaseExpiredDeferred):
+        #
+        # Round 2 (kasra-review re-gate BLOCK-2, 2026-09-15): `a` carries no
+        # `lease_expires_at`, so the lease can never be the binding
+        # constraint -- `turn_timeout` is, which is now
+        # `_TurnFailureDeferred(kind="turn_timeout")`, not a lease expiry.
+        with pytest.raises(_TurnFailureDeferred) as excinfo:
             await adapter._deliver(a)
+        assert excinfo.value.kind == "turn_timeout"
         assert thread_ready.wait(1)
         adapter.turn_timeout = 1.0
         b_delivery = asyncio.create_task(adapter._deliver(b))
@@ -774,8 +843,13 @@ async def test_late_same_source_redelivery_cannot_complete_new_generation(
         # delivery's turn_timeout (0.05) expires while its handler is still
         # blocked -- a genuine turn timeout, now a deferral rather than a
         # silent no-op.
-        with pytest.raises(_LeaseExpiredDeferred):
+        #
+        # Round 2 (kasra-review re-gate BLOCK-2, 2026-09-15): `message`
+        # carries no `lease_expires_at`, so this is
+        # `_TurnFailureDeferred(kind="turn_timeout")`, not a lease expiry.
+        with pytest.raises(_TurnFailureDeferred) as excinfo:
             await adapter._deliver(message)
+        assert excinfo.value.kind == "turn_timeout"
         adapter.turn_timeout = 1.0
         b_delivery = asyncio.create_task(adapter._deliver(dict(message)))
         await asyncio.wait_for(b_started.wait(), 1)
@@ -2013,12 +2087,15 @@ def test_gateway_status_survives_real_hermes_registry_dispatch(tmp_path: Path) -
         result = json.loads(raw)
         # `connected`/`lease_reconciliation` added 2026-09-15 (see
         # lease_reconciliation_status()) so an operator can see a durable
-        # quarantine here instead of only in state.json.
+        # quarantine here instead of only in state.json. `reconciling`/
+        # `turn_failure_dlq` added round 2, 2026-09-15 (items 6/2).
         assert result == {
             "ok": True,
             "connected": False,
+            "reconciling": False,
             "lease_reconciliation": None,
             "stranded_notifications": [],
+            "turn_failure_dlq": [],
         }
     finally:
         registry.deregister(tool_name)

@@ -246,7 +246,17 @@ async def test_mid_poll_estop_pause_logs_the_true_cause(
     real e-stop pause racing in after a successful lease, no lease expiry
     involved at all) -- must still say "emergency stop", not "lease
     expired"."""
+    import hermes_constants
     from agent import estop as real_estop
+
+    # Isolate the ESTOP sentinel to this test's own tmp_path -- the default
+    # HERMES_HOME is shared by every test file's subprocess under the
+    # parallel runner, and an un-isolated engage()/disengage() here raced
+    # with an unrelated, concurrently-running file's own estop assertions
+    # in CI.
+    home = tmp_path / "hermes-home"
+    home.mkdir(exist_ok=True)
+    home_token = hermes_constants.set_hermes_home_override(str(home))
 
     state_path = tmp_path / "state.json"
 
@@ -288,6 +298,7 @@ async def test_mid_poll_estop_pause_logs_the_true_cause(
     finally:
         real_estop.disengage()
         await adapter.disconnect()
+        hermes_constants.reset_hermes_home_override(home_token)
 
     messages = [r.getMessage() for r in caplog.records]
     mid_poll = [m for m in messages if "deferring leased message=msg-1 mid-poll" in m]

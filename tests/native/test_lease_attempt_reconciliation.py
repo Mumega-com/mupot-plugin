@@ -828,20 +828,32 @@ async def test_pending_from_a_different_attempt_is_never_touched(
 async def test_connect_auto_reconcile_refuses_network_while_paused(
     tmp_path: Path,
 ) -> None:
+    import hermes_constants
     from agent import estop as real_estop
 
-    state_path = tmp_path / "state.json"
-    attempt_id, _first = await persist_v2_ambiguous(state_path)
-    client = AttemptClient(reconcile_outcome=attempt_result(attempt_id, "expired"))
-    adapter = make_adapter(state_path, client)
-
-    assert real_estop.is_engaged() is False
-    real_estop.engage(reason="f3-test")
+    # Isolate the ESTOP sentinel to this test's own tmp_path -- the default
+    # HERMES_HOME is shared by every test file's subprocess under the
+    # parallel runner, and an un-isolated engage()/disengage() here raced
+    # with an unrelated, concurrently-running file's own estop assertions
+    # in CI (test_estop_observability.py saw is_engaged() already True).
+    home = tmp_path / "hermes-home"
+    home.mkdir(exist_ok=True)
+    token = hermes_constants.set_hermes_home_override(str(home))
     try:
-        assert await adapter.connect() is False
-    finally:
-        real_estop.disengage()
+        state_path = tmp_path / "state.json"
+        attempt_id, _first = await persist_v2_ambiguous(state_path)
+        client = AttemptClient(reconcile_outcome=attempt_result(attempt_id, "expired"))
+        adapter = make_adapter(state_path, client)
 
-    assert client.connect_calls == 0
-    assert client.calls == []
-    assert StateStore(state_path).load()["lease_reconciliation"]["attempt_id"] == attempt_id
+        assert real_estop.is_engaged() is False
+        real_estop.engage(reason="f3-test")
+        try:
+            assert await adapter.connect() is False
+        finally:
+            real_estop.disengage()
+
+        assert client.connect_calls == 0
+        assert client.calls == []
+        assert StateStore(state_path).load()["lease_reconciliation"]["attempt_id"] == attempt_id
+    finally:
+        hermes_constants.reset_hermes_home_override(token)

@@ -367,12 +367,23 @@ async def test_mid_poll_estop_pause_logs_the_true_cause(
 
 @pytest.mark.asyncio
 async def test_post_timeout_lease_expiry_defers_then_redelivers_and_completes_once(
-    tmp_path: Path,
+    tmp_path: Path, caplog: Any,
 ) -> None:
+    """Also pins three mutation survivors from the adversarial gate (PR #11
+    round 3, 2026-09-15) -- all three change what `reason` computes to for a
+    GENUINELY lease-driven timeout (as opposed to `turn_timeout`-with-a-
+    live-lease, covered by the sibling test above): M2 forces
+    `lease_expired` to always read False; M3 forces `reason` to always
+    resolve `"turn_timeout"`; M13 forces `_delivery_deadline`'s returned
+    lease deadline to always be `None` (which also makes `_lease_has_expired`
+    always False). Any of the three flips the mid-poll log from "its own
+    lease expired" to "its own turn_timeout with a still-live lease" for
+    this exact scenario, where the lease -- not `turn_timeout` (30s here) --
+    is what actually fired."""
     state_path = tmp_path / "state.json"
     from datetime import datetime, timedelta, timezone
 
-    soon_expired = (datetime.now(timezone.utc) + timedelta(milliseconds=80)).isoformat()
+    soon_expired = (datetime.now(timezone.utc) + timedelta(milliseconds=300)).isoformat()
     client = RedeliveringLeaseClient([(soon_expired, 1), (far_future(), 2)])
     adapter = make_adapter(state_path, client, turn_timeout=30)
     handled: list[str] = []
@@ -386,19 +397,26 @@ async def test_post_timeout_lease_expiry_defers_then_redelivers_and_completes_on
         await adapter.send(event.source.chat_id, "ok")
 
     adapter.set_message_handler(handler)
-    assert await adapter.connect() is True
-    try:
-        await wait_until(lambda: client.lease_calls >= 2)
-        stuck.set()
-        await wait_until(lambda: "msg-1" in StateStore(state_path).load().get("processed", []))
-    finally:
-        stuck.set()
-        await adapter.disconnect()
+    with caplog.at_level(logging.INFO, logger="plugin"):
+        assert await adapter.connect() is True
+        try:
+            await wait_until(lambda: client.lease_calls >= 2)
+            stuck.set()
+            await wait_until(lambda: "msg-1" in StateStore(state_path).load().get("processed", []))
+        finally:
+            stuck.set()
+            await adapter.disconnect()
 
     state = StateStore(state_path).load()
     assert "msg-1" in state["processed"]
     assert state.get("lease_reconciliation") is None
     assert len(client.acked_attempt_ids) == 1  # deferral itself never acked; redelivery did once
+
+    messages = [r.getMessage() for r in caplog.records]
+    mid_poll = [m for m in messages if "deferring leased message=msg-1 mid-poll" in m]
+    assert mid_poll, "expected a mid-poll deferral log"
+    assert "its own lease expired" in mid_poll[0]
+    assert "turn_timeout" not in mid_poll[0]
 
 
 @pytest.mark.asyncio
@@ -555,6 +573,123 @@ async def test_turn_timeout_with_live_lease_defers_then_redelivers_and_completes
     assert "msg-1" in state["processed"]
     assert state.get("lease_reconciliation") is None  # never quarantined
     assert len(client.acked_attempt_ids) == 1  # deferral itself never acked; redelivery did once
+
+
+# ---------------------------------------------------------------------------
+# Round 4 (adversarial BLOCK-2, PR #11 round 3, 2026-09-15): the remaining
+# 3 of 5 `_deliver` exits that end a turn without human custody -- until now
+# these returned silently and were read as a protocol violation by
+# `_poll_loop`'s "message not in processed" check, the same incident class
+# as the two above, unfixed on three branches.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_empty_output_defers_then_redelivers_and_completes_once(
+    tmp_path: Path,
+) -> None:
+    """Exit 1 of 5: `outcome == SUCCESS` but the handler produced no reply at
+    all (Hermes scores that as a successful no-op) -- turn ended without
+    custody exactly as much as a lease expiry or a turn timeout, not a
+    protocol violation."""
+    state_path = tmp_path / "state.json"
+    client = RedeliveringLeaseClient([(far_future(), 1), (far_future(), 2)])
+    adapter = make_adapter(state_path, client)
+    handled: list[str] = []
+
+    async def handler(event: Any) -> None:
+        handled.append(event.message_id)
+        if len(handled) == 1:
+            return  # produce no reply at all
+        await adapter.send(event.source.chat_id, "ok")
+
+    adapter.set_message_handler(handler)
+    assert await adapter.connect() is True
+    try:
+        await wait_until(lambda: "msg-1" in StateStore(state_path).load().get("processed", []))
+    finally:
+        await adapter.disconnect()
+
+    assert handled == ["msg-1", "msg-1"]  # redelivered exactly once
+    state = StateStore(state_path).load()
+    assert "msg-1" in state["processed"]
+    assert state.get("lease_reconciliation") is None  # never quarantined
+    assert len(client.acked_attempt_ids) == 1  # deferral itself never acked; redelivery did once
+
+
+@pytest.mark.asyncio
+async def test_handler_error_defers_then_redelivers_and_completes_once(
+    tmp_path: Path,
+) -> None:
+    """Exit 2 of 5: the handler raising is the fall-through FAILURE outcome
+    -- turn ended without custody, not a protocol violation. Hermes itself
+    catches the handler's exception (`handle_message`'s own
+    `except BaseException`), so this never propagates out of `_deliver`
+    directly; it surfaces only via the FAILURE outcome `_deliver` observes
+    on `runtime.outcome`."""
+    state_path = tmp_path / "state.json"
+    client = RedeliveringLeaseClient([(far_future(), 1), (far_future(), 2)])
+    adapter = make_adapter(state_path, client)
+    handled: list[str] = []
+
+    async def handler(event: Any) -> None:
+        handled.append(event.message_id)
+        if len(handled) == 1:
+            raise RuntimeError("simulated handler crash")
+        await adapter.send(event.source.chat_id, "ok")
+
+    adapter.set_message_handler(handler)
+    assert await adapter.connect() is True
+    try:
+        await wait_until(lambda: "msg-1" in StateStore(state_path).load().get("processed", []))
+    finally:
+        await adapter.disconnect()
+
+    assert handled == ["msg-1", "msg-1"]  # redelivered exactly once
+    state = StateStore(state_path).load()
+    assert "msg-1" in state["processed"]
+    assert state.get("lease_reconciliation") is None  # never quarantined
+    assert len(client.acked_attempt_ids) == 1  # deferral itself never acked; redelivery did once
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalidated_preserves_pending_when_a_reply_is_staged(
+    tmp_path: Path,
+) -> None:
+    """Exit 3 of 5: `runtime.invalidated` with a non-SUCCESS outcome
+    (reachable from `disconnect()` mid-turn -- see test_adapter.py's
+    `test_disconnect_invalidates_generation_before_surviving_callback` for
+    the no-reply-staged, pending-cleared case) shares the SAME
+    `_reply_staged_incomplete` gate as the other four exits: a runtime
+    invalidated mid-turn must not clear `pending` out from under a reply a
+    background handler already staged for a DIFFERENT, earlier attempt of
+    the same source.
+    """
+    state_path = tmp_path / "state.json"
+    adapter = make_adapter(state_path, object())
+    adapter._state["reply_outbox"] = {
+        "msg-1": reply_record(
+            "msg-1", "sent",
+            receipt={"id": "d-1", "seq": 1, "duplicate": False, "to": "hadi-codex", "project_id": None},
+        ),
+    }
+    adapter.store.save(adapter._state)
+
+    async def handler(_event: Any) -> None:
+        await asyncio.Event().wait()
+
+    adapter.set_message_handler(handler)
+    delivery = asyncio.create_task(adapter._deliver(message_at("msg-1", 1, far_future())))
+    await wait_until(lambda: bool(adapter._live_generations))
+    for runtime in list(adapter._live_generations.values()):
+        adapter._invalidate_delivery(runtime)  # simulate disconnect()'s own call
+    with pytest.raises(_DeliveryDeferred) as exc_info:
+        await asyncio.wait_for(delivery, 1)
+    assert exc_info.value.reason == "runtime_invalidated"
+
+    state = StateStore(state_path).load()
+    assert state["pending"]["message"]["id"] == "msg-1"  # left untouched, not cleared
+    await adapter.cancel_background_tasks()
 
 
 # ---------------------------------------------------------------------------
@@ -979,6 +1114,139 @@ def test_lease_reconciliation_status_reports_marker_and_attempt_id(tmp_path: Pat
     }
 
 
+@pytest.mark.asyncio
+async def test_reply_reconciliation_required_reports_true_through_replay(
+    tmp_path: Path,
+) -> None:
+    """M10 (adversarial gate, PR #11 round 3, 2026-09-15): the mutation
+    survivor forces `reply_reconciliation_required()` to always return
+    False. The existing `mupot_gateway_status` regression test only ever
+    exercises the False case (a fresh adapter with no reconciliation-needed
+    record), so that mutation survived undetected -- this drives the SAME
+    public method to True through the real `_replay_reply_outbox` path that
+    sets the underlying flag.
+    """
+    state_path = tmp_path / "state.json"
+    adapter = make_adapter(state_path, object())
+    adapter._state["reply_outbox"] = {
+        "msg-1": reply_record("msg-1", "reconciliation_required"),
+    }
+    adapter.store.save(adapter._state)
+
+    assert adapter.reply_reconciliation_required() is False  # not yet replayed
+    with pytest.raises(MupotProtocolError):
+        await adapter._replay_reply_outbox()
+    assert adapter.reply_reconciliation_required() is True
+
+
+def test_delivery_deferred_reason_is_validated(tmp_path: Path) -> None:
+    """M15 (adversarial gate, PR #11 round 3, 2026-09-15): the reason
+    validation itself is a mutation target -- prove all five real reasons
+    construct, and an unknown one is still rejected, now that round 4 added
+    three more valid values to the set."""
+    for reason in (
+        "lease_expired", "turn_timeout", "empty_output",
+        "handler_error", "runtime_invalidated",
+    ):
+        assert _DeliveryDeferred("msg-1", reason=reason).reason == reason
+    with pytest.raises(ValueError):
+        _DeliveryDeferred("msg-1", reason="not_a_real_reason")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_self_heals_a_clean_tombstone_with_an_invalid_receipt_reply(
+    tmp_path: Path,
+) -> None:
+    """Athena F-B (PR #11 round 3, 2026-09-15): `invalid_receipt` is ALSO a
+    terminal state (`_mark_reply_complete`'s own "no validated receipt"
+    branch) -- before this fix, `_reply_staged_incomplete` treated it as
+    still-staged, so a clean tombstone (server-side attempt over, nothing
+    left to consume) plus a matching `invalid_receipt` record could never
+    clear `pending` across a restart; the only escape was a manual
+    state.json edit.
+    """
+    state_path = await quarantine_via_transport_failure(tmp_path)
+
+    class ReconcileClient:
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            if tool == "inbox_consumer_status":
+                return dict(STATUS)
+            if tool == "inbox_lease_reconcile":
+                return attempt_result(arguments["attempt_id"], "expired")
+            raise AssertionError(f"unexpected tool: {tool}")
+
+    state = StateStore(state_path).load()
+    state["pending"] = {"message": {"id": "msg-orphaned"}}
+    state["reply_outbox"] = {"msg-orphaned": reply_record("msg-orphaned", "invalid_receipt")}
+    StateStore(state_path).save(state)
+
+    adapter = make_adapter(state_path, ReconcileClient())
+    assert await adapter.reconcile_inbox_polling() is True
+    after = StateStore(state_path).load()
+    assert after.get("lease_reconciliation") is None
+    assert after.get("pending") is None  # self-heals, not held forever
+
+    # A fresh connect() on the now-healed state needs no further intervention.
+    fresh = make_adapter(state_path, ReconcileClient())
+    try:
+        assert await fresh.connect() is True
+    finally:
+        await fresh.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_mid_poll_reconcile_deferral_logs_true_cause_not_estop(
+    tmp_path: Path, caplog: Any,
+) -> None:
+    """F-A (Athena gate) / P2-4 (adversarial gate), PR #11 round 3,
+    2026-09-15: `reconcile_inbox_polling`'s own `except _EstopDeferred:`
+    clause also absorbs `_DeliveryDeferred` (a subclass) unless it has its
+    own clause checked first -- it must log the true cause, not always name
+    the e-stop, exactly the same class of bug `_poll_loop`'s own mid-poll
+    log already had to fix (F4)."""
+    state_path = await quarantine_via_transport_failure(tmp_path)
+    attempt_id = StateStore(state_path).load()["lease_reconciliation"]["attempt_id"]
+
+    class StillLeasedClient:
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            if tool == "inbox_consumer_status":
+                return dict(STATUS)
+            if tool == "inbox_lease_reconcile":
+                message = message_at("msg-1", 1, far_future())
+                return attempt_result(attempt_id, "leased", [message], far_future())
+            raise AssertionError(f"unexpected tool: {tool}")
+
+    adapter = make_adapter(state_path, StillLeasedClient())
+
+    async def handler(_event: Any) -> None:
+        raise RuntimeError("simulated handler crash")  # -> handler_error
+
+    adapter.set_message_handler(handler)
+    with caplog.at_level(logging.INFO, logger="plugin"):
+        assert await adapter.reconcile_inbox_polling() is False
+
+    after = StateStore(state_path).load()
+    assert after.get("lease_reconciliation") is not None  # marker left exactly as it was
+
+    messages = [r.getMessage() for r in caplog.records]
+    reconcile_logs = [m for m in messages if "inbox reconciliation deferred" in m]
+    assert reconcile_logs, "expected a reconciliation deferral log"
+    assert "the turn handler raising before producing a reply" in reconcile_logs[0]
+    assert "emergency stop" not in reconcile_logs[0]
+
+
 # ---------------------------------------------------------------------------
 # Install simulation: a real production incident snapshot.
 # ---------------------------------------------------------------------------
@@ -1205,3 +1473,49 @@ async def test_install_simulation_unstaged_pending_needs_one_restart(
 
         assert second is True
         assert "inbox_lease_reconcile" not in second_client.tools
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
+        "state.json.bak-quarantine-20260915170649",
+        "state.json.bak-quarantine-20260915155821",
+        "state.json.bak-quarantine-20260915144726",
+        "state.json.bak-quarantine-20260915021900",
+        "state.json.bak-quarantine-20260915170106",
+    ],
+)
+async def test_install_simulation_leased_attempt_refuses_without_a_turn(
+    tmp_path: Path,
+    fixture_name: str,
+) -> None:
+    """P2-6 (adversarial gate, PR #11 round 3, 2026-09-15): every install-sim
+    fixture above used `reconcile_state="expired"` -- a clean tombstone. A
+    still-`leased` attempt is the OTHER outcome `inbox_lease_reconcile` can
+    report, and it is exactly the FENCED case `execute_leased=False` exists
+    to refuse: `connect()`'s automatic self-heal must not re-execute the
+    turn, must leave the marker exactly as it was, and must make zero calls
+    beyond the read-only preflight (`inbox_consumer_status` +
+    `inbox_lease_reconcile` itself) -- no `inbox_lease`, no turn, no ack.
+    """
+    real = json.loads((FIXTURES_DIR / fixture_name).read_text())
+    marker = real["lease_reconciliation"]
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(real), encoding="utf-8")
+
+    with _real_fingerprint_owner(marker["profile_owner_fingerprint"]) as owner:
+        client = InstallSimClient(marker, reconcile_state="leased")
+        adapter = make_adapter(state_path, client)
+        adapter._secret_owner = owner
+        adapter._profile_owner_fingerprint = marker["profile_owner_fingerprint"]
+        try:
+            connected = await adapter.connect()
+        finally:
+            await adapter.disconnect()
+
+        assert connected is False  # still fenced -- correct refusal
+        after = StateStore(state_path).load()
+        assert after.get("lease_reconciliation") is not None  # marker left exactly as it was
+        assert "inbox_lease" not in client.tools  # zero turns
+        assert client.tools == ["inbox_consumer_status", "inbox_lease_reconcile"]

@@ -22,7 +22,9 @@ from plugin.mupot_gateway.adapter import (  # noqa: E402
     MupotTransportError,
     MupotAdapter,
     StateStore,
+    _DeliveryDeferred,
     _EstopDeferred,
+    _LeaseExpiredDeferred,
     build_mupot_event,
     is_ack_envelope,
     is_terminal_ack,
@@ -449,11 +451,13 @@ async def test_expired_leased_event_never_starts_model_work(tmp_path: Path) -> N
     adapter.set_message_handler(handler)
     expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
 
-    await adapter._deliver(delivery_message("expired", lease_expires_at=expired))
+    with pytest.raises(_LeaseExpiredDeferred):
+        await adapter._deliver(delivery_message("expired", lease_expires_at=expired))
 
     assert handled == []
     assert client.sent == []
     assert client.acked_ids == []
+    assert StateStore(tmp_path / "state.json").load()["pending"] is None
 
 
 @pytest.mark.asyncio
@@ -479,7 +483,12 @@ async def test_queued_event_expiry_cancels_session_before_model_start(tmp_path: 
     adapter._session_tasks[session_key] = blocker
     adapter._background_tasks.add(blocker)
     try:
-        await adapter._deliver(message)
+        # Round 2 (Athena BLOCK, PR #11, 2026-09-15): a turn timeout with no
+        # server-side lease on the message (as here) now defers instead of
+        # returning silently -- see `_DeliveryDeferred`.
+        with pytest.raises(_DeliveryDeferred) as exc_info:
+            await adapter._deliver(message)
+        assert exc_info.value.reason == "turn_timeout"
         assert handled == []
         assert session_key not in adapter._pending_messages
         assert blocker.cancelled()
@@ -513,14 +522,22 @@ async def test_timeout_invalidates_generation_before_bounded_cancellation(
     adapter.set_message_handler(handler)
     adapter.cancel_session_processing = stuck_cancel
     started = time.monotonic()
-    await adapter._deliver(delivery_message("bounded-timeout"))
+    # Round 2 (Athena BLOCK, PR #11, 2026-09-15): a turn timeout with no
+    # server-side lease on the message (as here) now defers instead of
+    # returning silently -- see `_DeliveryDeferred`.
+    with pytest.raises(_DeliveryDeferred) as exc_info:
+        await adapter._deliver(delivery_message("bounded-timeout"))
+    assert exc_info.value.reason == "turn_timeout"
     elapsed = time.monotonic() - started
 
     assert cancellation_started.is_set()
     assert registry_snapshots[0][1] == {}
     assert elapsed < 0.2
     pending = StateStore(tmp_path / "state.json").load()["pending"]
-    assert pending["message"]["id"] == "bounded-timeout"
+    # Turn ended without custody: deferred and cleared (no reply was ever
+    # staged for it), not held as ambiguous evidence -- that was round 1's
+    # unfixed base behaviour for this exact branch.
+    assert pending is None
     await adapter.cancel_background_tasks()
 
 
@@ -631,7 +648,12 @@ async def test_timed_out_thread_callback_cannot_send_with_next_delivery_context(
     a = delivery_message("source-a", sender="hadi-codex", project="project-a")
     b = delivery_message("source-b", sender="kasra", project="project-b")
     try:
-        await adapter._deliver(a)
+        # Round 2 (Athena BLOCK, PR #11, 2026-09-15): a turn timeout with no
+        # server-side lease on the message (as here) now defers instead of
+        # returning silently -- see `_DeliveryDeferred`.
+        with pytest.raises(_DeliveryDeferred) as exc_info:
+            await adapter._deliver(a)
+        assert exc_info.value.reason == "turn_timeout"
         assert thread_ready.wait(1)
         adapter.turn_timeout = 1.0
         b_delivery = asyncio.create_task(adapter._deliver(b))
@@ -705,7 +727,12 @@ async def test_late_same_source_redelivery_cannot_complete_new_generation(
         body="same body",
     )
     try:
-        await adapter._deliver(message)
+        # Round 2 (Athena BLOCK, PR #11, 2026-09-15): a turn timeout with no
+        # server-side lease on the message (as here) now defers instead of
+        # returning silently -- see `_DeliveryDeferred`.
+        with pytest.raises(_DeliveryDeferred) as exc_info:
+            await adapter._deliver(message)
+        assert exc_info.value.reason == "turn_timeout"
         adapter.turn_timeout = 1.0
         b_delivery = asyncio.create_task(adapter._deliver(dict(message)))
         await asyncio.wait_for(b_started.wait(), 1)
@@ -961,10 +988,13 @@ async def test_poll_loop_retries_only_classified_safe_before_send_failure(
 
 
 @pytest.mark.asyncio
-async def test_reconstructed_adapter_stays_fenced_without_network(
+async def test_reconstructed_adapter_self_heals_via_connect_on_clean_tombstone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """2026-09-15 item 4: connect() attempts one bounded reconcile before
+    refusing on a lease marker. A matching-scope tombstone (no staged reply)
+    self-heals connect() straight through instead of refusing forever."""
     state_path = await persist_ambiguous_lease_quarantine(tmp_path, monkeypatch)
     marker = StateStore(state_path).load().get("lease_reconciliation")
     assert isinstance(marker, dict)
@@ -985,10 +1015,102 @@ async def test_reconstructed_adapter_stays_fenced_without_network(
         client_factory=lambda *_: client,
     )
 
+    try:
+        assert await reconstructed.connect() is True
+    finally:
+        await reconstructed.disconnect()
+    assert client.tools == [
+        "inbox_consumer_status",
+        "inbox_lease_reconcile",
+        "inbox_consumer_status",
+    ]
+    assert StateStore(state_path).load().get("lease_reconciliation") is None
+
+
+@pytest.mark.asyncio
+async def test_reconstructed_adapter_stays_fenced_without_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1-4 (Athena gate, PR #11 round 2, 2026-09-15) -- the opposite of the
+    clean-tombstone test above: when the server's own reconcile readback
+    says the attempt is STILL `leased` (a message genuinely outstanding),
+    `connect()`'s automatic self-heal must NOT re-execute an agent turn as a
+    side effect of what is supposed to be a bounded, safe bootstrap call.
+    This is the FENCED case the marker exists to protect -- before this fix,
+    this exact scenario called `_process_leased_message` -> `_deliver` right
+    here (running the model, hitting egress network calls) and STILL ended
+    up refusing overall regardless, all for nothing.
+
+    This restores a re-scoped version of the pre-item-4 test of the same
+    name: master's version proved `connect()` made ZERO network calls at all
+    on any quarantine marker (there was no auto-heal to attempt yet). Item
+    4's auto-heal legitimately DOES make the read-only preflight calls
+    (`inbox_consumer_status`/`inbox_lease_reconcile` -- see `_EstopDeferred`'s
+    docstring, F2) to find out whether the attempt actually resolved, so
+    those are no longer zero -- what must stay zero is turn re-execution and
+    every consuming/egress call that implies (no handler invocation, no
+    ack, no send; `StillLeasedClient.call` below raises on anything else).
+    """
+    state_path = await persist_ambiguous_lease_quarantine(tmp_path, monkeypatch)
+    marker = StateStore(state_path).load().get("lease_reconciliation")
+    assert isinstance(marker, dict)
+    assert marker["required"] is True
+    assert StateStore(state_path).load().get("pending") is None
+    monkeypatch.setattr(time, "time", lambda: 200.0)
+
+    outstanding_message = dict(FakeMupotClient().message)
+    outstanding_message["lease_expires_at"] = FAKE_LEASE_EXPIRY
+
+    class StillLeasedClient(FakeMupotClient):
+        async def call(self, tool: str, arguments: dict) -> dict:
+            if tool == "inbox_consumer_status":
+                return {
+                    "strict_scope": True,
+                    "tenant": marker["tenant"],
+                    "agent_id": marker["agent_id"],
+                    "effective_inbox_seat": marker["effective_inbox_seat"],
+                    "mode": "bearer_only",
+                    "generation": 0,
+                    "key_matches": True,
+                }
+            if tool == "inbox_lease_reconcile":
+                return {
+                    "tenant": marker["tenant"],
+                    "agent_id": marker["agent_id"],
+                    "effective_inbox_seat": marker["effective_inbox_seat"],
+                    "attempt_id": arguments["attempt_id"],
+                    "state": "leased",
+                    "lease_expires_at": FAKE_LEASE_EXPIRY,
+                    "messages": [outstanding_message],
+                    "consumed": False,
+                }
+            raise AssertionError(
+                f"connect()'s auto-heal must never reach this tool while "
+                f"fenced: {tool} {arguments}"
+            )
+
+    client = StillLeasedClient()
+    handled: list[str] = []
+
+    async def handler(event: Any) -> None:
+        handled.append(event.message_id)
+
+    reconstructed = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
+        client_factory=lambda *_: client,
+    )
+    reconstructed.set_message_handler(handler)
+
     assert await reconstructed.connect() is False
-    assert client.connect_calls == 0
-    assert client.tools == []
-    assert client.lease_calls == 0
+    assert handled == []  # the turn was never re-executed
+    # `self._client.connect()` IS called (the read-only preflight itself
+    # needs a live transport) -- what stays zero is turn/ack/send below,
+    # proven structurally by StillLeasedClient.call raising on anything else.
+    assert client.connect_calls == 1
+    after = StateStore(state_path).load()
+    assert after.get("lease_reconciliation") is not None  # still fenced
+    assert after.get("pending") is None  # untouched, nothing to clear or keep
 
 
 @pytest.mark.asyncio
@@ -1079,9 +1201,13 @@ async def test_postlease_save_failure_leaves_prelease_fence_for_restart(
         PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
         client_factory=lambda *_: reconstructed_client,
     )
+    # 2026-09-15 item 4: connect() now attempts one bounded reconcile before
+    # refusing -- this one's status is malformed (no mode/generation), so the
+    # readback mismatches and it stays fenced, but the attempt itself DOES
+    # make exactly one network call now (was zero before this fix).
     assert await reconstructed.connect() is False
-    assert reconstructed_client.connect_calls == 0
-    assert reconstructed_client.tools == []
+    assert reconstructed_client.connect_calls == 1
+    assert reconstructed_client.tools == ["inbox_consumer_status"]
     assert reconstructed_client.lease_calls == 0
 
 
@@ -1184,8 +1310,11 @@ async def test_failed_reconciliation_readback_remains_durably_fenced(
     assert await reconcile() is False
     assert isinstance(StateStore(state_path).load().get("lease_reconciliation"), dict)
     assert getattr(reconstructed, "_lease_quarantined", False) is True
+    # 2026-09-15 item 4: connect() makes its OWN bounded reconcile attempt
+    # too (a second "inbox_consumer_status" call), independent of the manual
+    # one above -- both mismatch the same way and stay fenced.
     assert await reconstructed.connect() is False
-    assert client.tools == ["inbox_consumer_status"]
+    assert client.tools == ["inbox_consumer_status", "inbox_consumer_status"]
 
 
 @pytest.mark.asyncio
@@ -1815,7 +1944,11 @@ def test_gateway_status_tool_reports_stranded_notifications(tmp_path: Path) -> N
     assert "mupot_gateway_status" in tools
     # Before the platform ever connects there is no live adapter yet.
     before = json.loads(tools["mupot_gateway_status"]({}))
-    assert before == {"ok": False, "error": "native_gateway_not_connected"}
+    assert before == {
+        "ok": False,
+        "error": "native_gateway_not_connected",
+        "connected": False,
+    }
 
     ctx.adapter_factory(PlatformConfig(enabled=True, extra={"state_path": str(state_path)}))
     after = json.loads(tools["mupot_gateway_status"]({}))
@@ -1865,11 +1998,21 @@ async def test_gateway_status_clears_to_disconnected_after_adapter_disconnect(
 
     connected = json.loads(tools["mupot_gateway_status"]({}))
     assert connected["ok"] is True
+    assert connected["connected"] is False  # not yet connect()-ed, only constructed
+    assert connected["lease_reconciliation"] == {"required": False, "attempt_id": None}
+
+    instance._mark_connected()
+    live = json.loads(tools["mupot_gateway_status"]({}))
+    assert live["connected"] is True
 
     await instance.disconnect()
 
     disconnected = json.loads(tools["mupot_gateway_status"]({}))
-    assert disconnected == {"ok": False, "error": "native_gateway_not_connected"}
+    assert disconnected == {
+        "ok": False,
+        "error": "native_gateway_not_connected",
+        "connected": False,
+    }
 
 
 def test_gateway_status_survives_real_hermes_registry_dispatch(tmp_path: Path) -> None:
@@ -1913,6 +2056,13 @@ def test_gateway_status_survives_real_hermes_registry_dispatch(tmp_path: Path) -
             user_task="probe mupot_gateway_status",
         )
         result = json.loads(raw)
-        assert result == {"ok": True, "stranded_notifications": []}
+        assert result == {
+            "ok": True,
+            "connected": False,
+            "stranded_notifications": [],
+            "lease_reconciliation": {"required": False, "attempt_id": None},
+            "invalid_reply_receipts": [],
+            "reply_reconciliation_required": False,
+        }
     finally:
         registry.deregister(tool_name)

@@ -16,6 +16,7 @@ from plugin.mupot_gateway.adapter import (
     MupotProtocolError,
     MupotTransportError,
     StateStore,
+    _DeliveryDeferred,
 )
 
 
@@ -649,17 +650,29 @@ async def test_missing_final_receipt_and_empty_output_never_authorize_source_con
     tmp_path: Path,
 ) -> None:
     """Hermes success alone is insufficient without a concrete final send receipt."""
+    # Round 4 (adversarial BLOCK-2, PR #11 round 3, 2026-09-15): outcome ==
+    # SUCCESS with no reply ever reaching human custody is now a deferral
+    # (`empty_output`), not a silent return -- see `_DeliveryDeferred`. Both
+    # scenarios below still never ack/consume the source.
     malformed = ProtocolClient()
     malformed.malformed_receipt = True
     missing_receipt = adapter_at(tmp_path / "missing", malformed)
     missing_receipt.set_message_handler(lambda _event: _async_value("Final answer."))
-    await missing_receipt._deliver(source_message("missing-receipt"))
+    with pytest.raises(_DeliveryDeferred) as exc_info:
+        await missing_receipt._deliver(source_message("missing-receipt"))
+    # A malformed receipt fails the send itself (both the primary attempt and
+    # the plain-text fallback), so the turn ends via the fall-through FAILURE
+    # exit (`handler_error`), not the empty-output exit -- the handler DID
+    # produce text, it just never reached a validated receipt.
+    assert exc_info.value.reason == "handler_error"
     assert malformed.acked_ids == []
 
     empty_client = ProtocolClient()
     empty = adapter_at(tmp_path / "empty", empty_client)
     empty.set_message_handler(lambda _event: _async_value(""))
-    await empty._deliver(source_message("empty-output"))
+    with pytest.raises(_DeliveryDeferred) as exc_info:
+        await empty._deliver(source_message("empty-output"))
+    assert exc_info.value.reason == "empty_output"
     assert empty_client.acked_ids == []
     assert empty_client.messages_by_key == {}
 

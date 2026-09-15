@@ -579,7 +579,14 @@ async def test_disconnect_invalidates_generation_before_surviving_callback(
     try:
         await asyncio.wait_for(started.wait(), 1)
         await adapter.disconnect()
-        await asyncio.wait_for(delivery, 1)
+        # Round 4 (adversarial BLOCK-2, PR #11 round 3, 2026-09-15):
+        # `runtime.invalidated` with a non-SUCCESS outcome (this is exactly
+        # that -- `disconnect()` invalidates the runtime mid-turn) is one of
+        # the three remaining custody-less `_deliver` exits that used to
+        # return silently -- see `_DeliveryDeferred`.
+        with pytest.raises(_DeliveryDeferred) as exc_info:
+            await asyncio.wait_for(delivery, 1)
+        assert exc_info.value.reason == "runtime_invalidated"
         assert adapter._live_generations == {}
         assert cancellation_snapshots[0][1] == {}
 
@@ -589,7 +596,10 @@ async def test_disconnect_invalidates_generation_before_surviving_callback(
         assert late_results[0].success is False
         assert client.sent == []
         pending = StateStore(tmp_path / "state.json").load()["pending"]
-        assert pending["message"]["id"] == "disconnect-source"
+        # Turn ended without custody: deferred and cleared (no reply was
+        # ever staged for it -- the background task's own send fails
+        # closed, above), not held as ambiguous evidence forever.
+        assert pending is None
     finally:
         late_release.set()
         await asyncio.gather(delivery, return_exceptions=True)

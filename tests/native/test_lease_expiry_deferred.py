@@ -1755,3 +1755,96 @@ async def test_replay_failure_does_not_starve_other_messages(
     state = StateStore(state_path).load()
     assert state["reply_outbox"]["msg-1"]["status"] == "reconciliation_required"
     assert adapter._reply_reconciliation_required is True
+
+
+class SlowSendClient:
+    """A single leased message; `send` succeeds but after a delay -- long
+    enough for `_replay_reply_outbox`'s own next-tick retry of the SAME
+    `request_id` to race Hermes's own `_notify_turn_error` auto-apology
+    send that fires from the same raising handler."""
+
+    def __init__(self, delay: float) -> None:
+        self.delay = delay
+        self.lease_calls = 0
+        self.acked_attempt_ids: list[str] = []
+        self.sent: list[dict[str, Any]] = []
+
+    async def connect(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool == "inbox_consumer_status":
+            return dict(STATUS)
+        if tool == "inbox_lease":
+            attempt_id = arguments["attempt_id"]
+            if self.lease_calls >= 1:
+                return attempt_result(attempt_id, "empty")
+            self.lease_calls += 1
+            message = message_at("msg-1", 1, far_future())
+            return attempt_result(attempt_id, "leased", [message], far_future())
+        if tool == "inbox_lease_ack":
+            self.acked_attempt_ids.append(arguments["attempt_id"])
+            return {**SCOPE, "attempt_id": arguments["attempt_id"], "state": "acked", "consumed": True}
+        if tool == "send":
+            await asyncio.sleep(self.delay)
+            self.sent.append(dict(arguments))
+            dup = sum(1 for s in self.sent if s.get("request_id") == arguments.get("request_id")) > 1
+            return {"id": f"delivery-{len(self.sent)}", "seq": len(self.sent),
+                    "duplicate": dup, "to": arguments["to"],
+                    "project_id": arguments.get("project_id")}
+        raise AssertionError(f"unexpected tool: {tool}")
+
+
+@pytest.mark.asyncio
+async def test_handler_error_cancels_delivery_processing_no_duplicate_send(
+    tmp_path: Path,
+) -> None:
+    """P2 (adversarial gate, PR #11 round 5): the `empty_output`/
+    `handler_error` exits were the only two of five that never called
+    `_cancel_delivery_processing`, leaving Hermes's own background session
+    task free to race a peer `send` against `_replay_reply_outbox`'s own
+    retry of the identical `request_id` -- reproduced live as two `send`
+    calls carrying the SAME `request_id` for one crashed turn. Through the
+    REAL poll loop: a raising handler plus a 300ms peer `send` must produce
+    exactly one send per `request_id`.
+    """
+    state_path = tmp_path / "state.json"
+    client = SlowSendClient(delay=0.3)
+    adapter = make_adapter(state_path, client, poll_interval=0.02)
+
+    async def handler(_event: Any) -> None:
+        raise RuntimeError("model blew up")
+
+    adapter.set_message_handler(handler)
+    assert await adapter.connect() is True
+    try:
+        await asyncio.sleep(2.0)
+    finally:
+        await adapter.disconnect()
+
+    request_ids = [s.get("request_id") for s in client.sent]
+    assert request_ids.count("resp-msg-1") == 1, request_ids
+
+
+@pytest.mark.asyncio
+async def test_lease_reconciliation_status_reports_required_when_quarantined_without_marker(
+    tmp_path: Path,
+) -> None:
+    """P2 (adversarial gate, PR #11 round 5): `lease_reconciliation_status()`
+    used to report `required: marker is not None` only -- but
+    `_lease_quarantined` can be set (e.g. by `_ack_persisted_ownership`'s
+    ambiguous-failure path, or `_quarantine_inbox_polling`'s own
+    persistence-failure branch) without a marker ever being written. Either
+    state genuinely refuses `connect()`; this status tool must say so.
+    """
+    state_path = tmp_path / "state.json"
+    adapter = make_adapter(state_path, object())
+    assert adapter.lease_reconciliation_status() == {"required": False, "attempt_id": None}
+
+    adapter._lease_quarantined = True
+    status = adapter.lease_reconciliation_status()
+    assert status["required"] is True
+    assert status["attempt_id"] is None  # no marker exists to name one

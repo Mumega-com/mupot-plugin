@@ -157,7 +157,20 @@ def make_adapter(
             enabled=True,
             extra={
                 "allowed_agents": "hadi-codex",
-                "lease_seconds": 30,
+                # OPEN-D (kasra re-gate round 3, 2026-09-15): an explicit
+                # `lease_seconds` below turn_timeout + mcp_tool_timeout +
+                # margin is now clamped up (with a warning) rather than
+                # honored -- the old `"lease_seconds": 30` here (with
+                # turn_timeout/mcp_tool_timeout both left at their 300s
+                # defaults) always violated that, so it silently got
+                # clamped to 660s under the fix. This file is about lease-
+                # ATTEMPT reconciliation, not turn/tool timing, so pin
+                # turn_timeout/mcp_tool_timeout small and explicit instead
+                # (also sidesteps depending on whatever the ambient Hermes
+                # config resolves `mcp_tool_timeout` to -- see OPEN-E) and
+                # let `lease_seconds` default off them.
+                "turn_timeout": 1,
+                "mcp_tool_timeout": 1,
                 "poll_interval": 0.01,
                 "state_path": str(state_path),
             },
@@ -254,7 +267,10 @@ async def test_ambiguous_attempt_is_random_bounded_durable_and_reconciled_immedi
     assert first.calls[0] == ("inbox_consumer_status", {"strict_scope": True})
     assert first.calls[-1] == (
         "inbox_lease",
-        {"limit": 1, "lease_seconds": 30, "attempt_id": attempt_id},
+        # turn_timeout=1 floors to 10.0 (constructor's own hard floor),
+        # mcp_tool_timeout=1, + 60.0 margin (OPEN-D) = 71.0 -- see
+        # make_adapter's own comment for why this isn't 30 anymore.
+        {"limit": 1, "lease_seconds": 71, "attempt_id": attempt_id},
     )
 
     monkeypatch.setattr(time, "time", lambda: math.nan)
@@ -396,7 +412,13 @@ async def test_terminal_attempt_tombstone_drops_stale_unstaged_pending(
             enabled=True,
             extra={
                 "allowed_agents": "hadi-codex",
-                "lease_seconds": 30,
+                # OPEN-D (kasra re-gate round 3, 2026-09-15): see
+                # `make_adapter`'s own comment above -- pin turn_timeout/
+                # mcp_tool_timeout small and explicit and let lease_seconds
+                # default off them, rather than an explicit value the new
+                # safe-minimum clamp would silently override.
+                "turn_timeout": 1,
+                "mcp_tool_timeout": 1,
                 "poll_interval": 0.01,
                 "state_path": str(state_path),
             },
@@ -437,7 +459,13 @@ async def test_terminal_attempt_tombstone_preserves_fence_when_reply_staged(
             enabled=True,
             extra={
                 "allowed_agents": "hadi-codex",
-                "lease_seconds": 30,
+                # OPEN-D (kasra re-gate round 3, 2026-09-15): see
+                # `make_adapter`'s own comment above -- pin turn_timeout/
+                # mcp_tool_timeout small and explicit and let lease_seconds
+                # default off them, rather than an explicit value the new
+                # safe-minimum clamp would silently override.
+                "turn_timeout": 1,
+                "mcp_tool_timeout": 1,
                 "poll_interval": 0.01,
                 "state_path": str(state_path),
             },
@@ -646,7 +674,13 @@ async def test_same_server_scope_distinct_profile_owner_stays_fenced_without_net
             enabled=True,
             extra={
                 "allowed_agents": "hadi-codex",
-                "lease_seconds": 30,
+                # OPEN-D (kasra re-gate round 3, 2026-09-15): see
+                # `make_adapter`'s own comment above -- pin turn_timeout/
+                # mcp_tool_timeout small and explicit and let lease_seconds
+                # default off them, rather than an explicit value the new
+                # safe-minimum clamp would silently override.
+                "turn_timeout": 1,
+                "mcp_tool_timeout": 1,
                 "poll_interval": 0.01,
                 "state_path": str(state_path),
             },
@@ -772,7 +806,6 @@ async def test_reconciliation_uses_owning_profile_scope(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     owner = ScopeOwner()
     attempt_id, _first = await persist_v2_ambiguous(state_path, owner=owner)
-    owner.activations = 0
     client = ScopedAttemptClient(
         owner,
         reconcile_outcome=attempt_result(attempt_id, "cancelled"),
@@ -785,6 +818,13 @@ async def test_reconciliation_uses_owning_profile_scope(tmp_path: Path) -> None:
         client_factory=lambda *_: client,
         secret_owner=owner,  # type: ignore[arg-type]
     )
+    # BLOCK-C (kasra re-gate round 3, 2026-09-15): construction itself now
+    # activates the owning scope once too (to resolve `mcp_tool_timeout`
+    # inside it rather than the ambient environment -- see
+    # `_profile_scope()`'s own docstring). Reset AFTER construction so this
+    # test's counter isolates `reconcile_inbox_polling()`'s own activation
+    # specifically, which is what this test is actually about.
+    owner.activations = 0
 
     assert await adapter.reconcile_inbox_polling() is True
     assert owner.activations == 1

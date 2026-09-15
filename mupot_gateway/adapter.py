@@ -1407,8 +1407,23 @@ class MupotAdapter(BasePlatformAdapter):
         if explicit_mcp_tool_timeout:
             resolved_mcp_tool_timeout = explicit_mcp_tool_timeout
         else:
-            with self._profile_scope():
-                resolved_mcp_tool_timeout = _configured_mcp_tool_timeout(self.server_name)
+            # `self._profile_scope()` entering (`secret_owner.activate()`)
+            # can itself raise -- same class of failure
+            # `_configured_mcp_tool_timeout`'s own try/except already
+            # treats as non-fatal (falls back to the default) for every
+            # OTHER way this read can fail. A scope that is not (yet)
+            # available at construction time must not make constructing
+            # the adapter itself fail -- `connect()` already treats a
+            # failing `secret_owner.activate()` as a normal, recoverable
+            # refusal (see `_connect_with_active_scope`'s own
+            # `except Exception` around it), not a fatal error.
+            try:
+                with self._profile_scope():
+                    resolved_mcp_tool_timeout = _configured_mcp_tool_timeout(
+                        self.server_name
+                    )
+            except Exception:
+                resolved_mcp_tool_timeout = _DEFAULT_MCP_TOOL_TIMEOUT_SECONDS
         self.mcp_tool_timeout = max(0.0, float(resolved_mcp_tool_timeout))
         minimum_safe_lease = (
             self.turn_timeout + self.mcp_tool_timeout + _LEASE_SAFETY_MARGIN_SECONDS

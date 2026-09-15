@@ -22,6 +22,7 @@ from plugin.mupot_gateway.adapter import (  # noqa: E402
     MupotTransportError,
     MupotAdapter,
     StateStore,
+    _DeliveryDeferred,
     _EstopDeferred,
     _LeaseExpiredDeferred,
     build_mupot_event,
@@ -482,7 +483,12 @@ async def test_queued_event_expiry_cancels_session_before_model_start(tmp_path: 
     adapter._session_tasks[session_key] = blocker
     adapter._background_tasks.add(blocker)
     try:
-        await adapter._deliver(message)
+        # Round 2 (Athena BLOCK, PR #11, 2026-09-15): a turn timeout with no
+        # server-side lease on the message (as here) now defers instead of
+        # returning silently -- see `_DeliveryDeferred`.
+        with pytest.raises(_DeliveryDeferred) as exc_info:
+            await adapter._deliver(message)
+        assert exc_info.value.reason == "turn_timeout"
         assert handled == []
         assert session_key not in adapter._pending_messages
         assert blocker.cancelled()
@@ -516,14 +522,22 @@ async def test_timeout_invalidates_generation_before_bounded_cancellation(
     adapter.set_message_handler(handler)
     adapter.cancel_session_processing = stuck_cancel
     started = time.monotonic()
-    await adapter._deliver(delivery_message("bounded-timeout"))
+    # Round 2 (Athena BLOCK, PR #11, 2026-09-15): a turn timeout with no
+    # server-side lease on the message (as here) now defers instead of
+    # returning silently -- see `_DeliveryDeferred`.
+    with pytest.raises(_DeliveryDeferred) as exc_info:
+        await adapter._deliver(delivery_message("bounded-timeout"))
+    assert exc_info.value.reason == "turn_timeout"
     elapsed = time.monotonic() - started
 
     assert cancellation_started.is_set()
     assert registry_snapshots[0][1] == {}
     assert elapsed < 0.2
     pending = StateStore(tmp_path / "state.json").load()["pending"]
-    assert pending["message"]["id"] == "bounded-timeout"
+    # Turn ended without custody: deferred and cleared (no reply was ever
+    # staged for it), not held as ambiguous evidence -- that was round 1's
+    # unfixed base behaviour for this exact branch.
+    assert pending is None
     await adapter.cancel_background_tasks()
 
 
@@ -634,7 +648,12 @@ async def test_timed_out_thread_callback_cannot_send_with_next_delivery_context(
     a = delivery_message("source-a", sender="hadi-codex", project="project-a")
     b = delivery_message("source-b", sender="kasra", project="project-b")
     try:
-        await adapter._deliver(a)
+        # Round 2 (Athena BLOCK, PR #11, 2026-09-15): a turn timeout with no
+        # server-side lease on the message (as here) now defers instead of
+        # returning silently -- see `_DeliveryDeferred`.
+        with pytest.raises(_DeliveryDeferred) as exc_info:
+            await adapter._deliver(a)
+        assert exc_info.value.reason == "turn_timeout"
         assert thread_ready.wait(1)
         adapter.turn_timeout = 1.0
         b_delivery = asyncio.create_task(adapter._deliver(b))
@@ -708,7 +727,12 @@ async def test_late_same_source_redelivery_cannot_complete_new_generation(
         body="same body",
     )
     try:
-        await adapter._deliver(message)
+        # Round 2 (Athena BLOCK, PR #11, 2026-09-15): a turn timeout with no
+        # server-side lease on the message (as here) now defers instead of
+        # returning silently -- see `_DeliveryDeferred`.
+        with pytest.raises(_DeliveryDeferred) as exc_info:
+            await adapter._deliver(message)
+        assert exc_info.value.reason == "turn_timeout"
         adapter.turn_timeout = 1.0
         b_delivery = asyncio.create_task(adapter._deliver(dict(message)))
         await asyncio.wait_for(b_started.wait(), 1)

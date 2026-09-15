@@ -1222,12 +1222,18 @@ class MupotAdapter(BasePlatformAdapter):
             # _ensure_client` already gets this right via its own
             # `_profile_scope()`; this constructor read was the one place
             # that didn't.
-            with self._profile_scope():
-                requested_lease = (
-                    self.turn_timeout
-                    + _configured_mcp_tool_timeout(self.server_name)
-                    + 60.0
-                )
+            # Construction must never crash on a broken/unavailable secret
+            # scope (a pre-existing invariant this fix must not regress --
+            # see test_profile_scope_failure_stays_fenced_without_network):
+            # fall back to the documented default with NO further config
+            # read at all, rather than retrying unscoped (which would
+            # reintroduce the exact leak this fix closes).
+            try:
+                with self._profile_scope():
+                    mcp_tool_timeout = _configured_mcp_tool_timeout(self.server_name)
+            except Exception:
+                mcp_tool_timeout = _DEFAULT_MCP_TOOL_TIMEOUT_SECONDS
+            requested_lease = self.turn_timeout + mcp_tool_timeout + 60.0
         self.lease_seconds = max(1, min(3600, int(requested_lease)))
         state_path = extra.get("state_path") or str(get_hermes_home() / "platforms" / "mupot" / "state.json")
         self.store = StateStore(Path(str(state_path)))

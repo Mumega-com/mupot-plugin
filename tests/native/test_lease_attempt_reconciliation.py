@@ -689,7 +689,6 @@ async def test_reconciliation_uses_owning_profile_scope(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     owner = ScopeOwner()
     attempt_id, _first = await persist_v2_ambiguous(state_path, owner=owner)
-    owner.activations = 0
     client = ScopedAttemptClient(
         owner,
         reconcile_outcome=attempt_result(attempt_id, "cancelled"),
@@ -702,6 +701,12 @@ async def test_reconciliation_uses_owning_profile_scope(tmp_path: Path) -> None:
         client_factory=lambda *_: client,
         secret_owner=owner,  # type: ignore[arg-type]
     )
+    # P1-5 (Athena gate, PR #11 round 2, 2026-09-15): __init__ itself now
+    # activates the scope once too, to resolve lease_seconds's mcp_tool_
+    # timeout without leaking `.env` into the ambient environment -- reset
+    # AFTER construction so this assertion counts only reconcile_inbox_
+    # polling()'s own activation, unchanged from its original intent.
+    owner.activations = 0
 
     assert await adapter.reconcile_inbox_polling() is True
     assert owner.activations == 1

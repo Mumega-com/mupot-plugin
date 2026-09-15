@@ -366,6 +366,50 @@ def test_unscoped_message_gets_isolated_session() -> None:
     assert event.source.thread_id == "m-unscoped"
 
 
+def test_lease_seconds_defaults_to_turn_timeout_plus_mcp_tool_timeout(
+    tmp_path: Path,
+) -> None:
+    """Class fix (2026-09-15): before this, `lease_seconds` defaulted to
+    `turn_timeout + 60s` alone, smaller than `turn_timeout + mcp_tool_timeout`
+    whenever a real deployment's MCP tool budget exceeds 60s (the kayhermes
+    incident ran with it at 180s) -- a single slow-but-legitimate tool call
+    could then always outlive the lease. Pin the new formula and its knobs."""
+    default_adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "a.json")}),
+        client_factory=lambda *_: FakeMupotClient(),
+    )
+    assert default_adapter.turn_timeout == 300.0
+    assert default_adapter.mcp_tool_timeout == 300.0
+    assert default_adapter.lease_seconds == 300 + 300 + 60
+
+    overridden = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "state_path": str(tmp_path / "b.json"),
+                "turn_timeout": 120,
+                "mcp_tool_timeout": 180,
+            },
+        ),
+        client_factory=lambda *_: FakeMupotClient(),
+    )
+    assert overridden.lease_seconds == 120 + 180 + 60
+
+    explicit_lease = MupotAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "state_path": str(tmp_path / "c.json"),
+                "turn_timeout": 120,
+                "mcp_tool_timeout": 180,
+                "lease_seconds": 42,
+            },
+        ),
+        client_factory=lambda *_: FakeMupotClient(),
+    )
+    assert explicit_lease.lease_seconds == 42
+
+
 def test_terminal_ack_requires_no_explicit_reply_expectation() -> None:
     assert is_terminal_ack({"id": "ack-1", "kind": "ack", "expects_reply": False})
     assert not is_terminal_ack({"id": "ack-1", "kind": "ack"})

@@ -658,6 +658,108 @@ async def test_handler_error_defers_not_returns(tmp_path: Path) -> None:
 
     state = StateStore(state_path).load()
     assert state.get("lease_reconciliation") is None  # never quarantined
+    # This exit's own "nothing staged -> pending cleared" direction is NOT
+    # independently reachable here: Hermes's OWN `_notify_turn_error` (see
+    # docstring above) calls `send()` on every raising handler, which stages
+    # at least a "prepared" `reply_outbox` record before `_deliver`'s own
+    # exit branch ever runs -- `_reply_staged_incomplete` is therefore
+    # already true for source=msg-1 by the time this exit's guard checks
+    # it, regardless of whether the auto-apology send itself then succeeds
+    # (advancing the record to "custodied") or fails (leaving "prepared").
+    # The guard's "clear" branch is the SAME shared `_reply_staged_
+    # incomplete` predicate the other four exits use, and IS pinned on
+    # those exits (see `test_empty_output_defers_then_redelivers_and_
+    # completes_once` and test_adapter.py's `test_disconnect_invalidates_
+    # generation_before_surviving_callback`); this exit's specific
+    # confound is documented, not silently skipped.
+    assert state["pending"]["message"]["id"] == "msg-1"
+    await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_handler_error_preserves_pending_when_a_reply_is_staged(
+    tmp_path: Path,
+) -> None:
+    """Exit 2 of 5, staged direction (adversarial BLOCK-3, PR #11 round 5):
+    the SAME `_reply_staged_incomplete` gate the other four exits share --
+    a handler that raises must not clear `pending` out from under a reply
+    a background handler already staged for a DIFFERENT, earlier attempt
+    of the same source (here: an earlier attempt's transmitted-but-not-yet-
+    "complete" record, as opposed to `test_handler_error_defers_not_returns`'
+    own Hermes-auto-apology-staged "prepared" record for THIS attempt)."""
+    state_path = tmp_path / "state.json"
+    adapter = make_adapter(state_path, object())
+    adapter._state["reply_outbox"] = {
+        "msg-1": reply_record(
+            "msg-1", "sent",
+            receipt={"id": "d-1", "seq": 1, "duplicate": False, "to": "hadi-codex", "project_id": None},
+        ),
+    }
+    adapter.store.save(adapter._state)
+
+    async def handler(_event: Any) -> None:
+        raise RuntimeError("simulated handler crash")
+
+    adapter.set_message_handler(handler)
+    with pytest.raises(_DeliveryDeferred) as exc_info:
+        await adapter._deliver(message_at("msg-1", 1, far_future()))
+    assert exc_info.value.reason == "handler_error"
+
+    state = StateStore(state_path).load()
+    assert state["pending"]["message"]["id"] == "msg-1"  # left untouched, not cleared
+    await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_empty_output_strict_custody_and_preserves_staged_pending(
+    tmp_path: Path,
+) -> None:
+    """Exit 1 of 5 (adversarial BLOCK-3, PR #11 round 5) -- one scenario
+    proves two properties together:
+
+    1. The custody check must be the strict `_reply_has_human_custody`
+       (receipt AND durable notification custody), not the looser
+       `_has_validated_reply_receipt` (receipt only): this exact mutation
+       survived 401/401 at round 4's head. A "sent" record with a
+       validated receipt but no `notification_outbox` entry at all -- only
+       constructible directly, as here; the real `_transmit_final_reply`
+       path always creates both atomically in the same call via
+       `notifications.enqueue` -- must still defer, never ack a request
+       whose human notice never reached durable custody.
+    2. `pending` must be preserved, not cleared, while that non-complete
+       staged reply exists -- the same `_reply_staged_incomplete` gate the
+       other four exits share (only the "nothing staged" direction was
+       previously pinned, by
+       `test_empty_output_defers_then_redelivers_and_completes_once`).
+
+    Both properties fail the same way under either mutation: with the
+    looser custody check, this scenario incorrectly proceeds to
+    `_ack_persisted_ownership`, which raises `AttributeError` against the
+    bare `object()` client instead of the expected `_DeliveryDeferred` --
+    and with the pending guard removed, `pending` would be cleared instead
+    of preserved.
+    """
+    state_path = tmp_path / "state.json"
+    adapter = make_adapter(state_path, object())
+    adapter._state["reply_outbox"] = {
+        "msg-1": reply_record(
+            "msg-1", "sent",
+            receipt={"id": "d-1", "seq": 1, "duplicate": False, "to": "hadi-codex", "project_id": None},
+        ),
+    }
+    adapter.store.save(adapter._state)
+    assert "msg-1" not in adapter._state.get("notification_outbox", {})
+
+    async def handler(_event: Any) -> None:
+        return  # empty output this attempt -- outcome reads SUCCESS
+
+    adapter.set_message_handler(handler)
+    with pytest.raises(_DeliveryDeferred) as exc_info:
+        await adapter._deliver(message_at("msg-1", 1, far_future()))
+    assert exc_info.value.reason == "empty_output"
+
+    state = StateStore(state_path).load()
+    assert state["pending"]["message"]["id"] == "msg-1"  # left untouched, not cleared
     await adapter.cancel_background_tasks()
 
 

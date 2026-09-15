@@ -1453,10 +1453,20 @@ class MupotAdapter(BasePlatformAdapter):
 
         `reconcile_inbox_polling` was previously reachable only via a live
         REPL; this surfaces it through `mupot_gateway_status` instead.
+
+        P2 (adversarial gate, PR #11 round 5): `required` used to be exactly
+        `marker is not None` -- but `_quarantine_inbox_polling` sets
+        `self._lease_quarantined = True` even on its OWN persistence-failure
+        branch, where no marker was written at all, and `_lease_quarantined`
+        can also be set directly (e.g. `_ack_persisted_ownership`'s ambiguous
+        path) without a marker existing yet. Either state genuinely refuses
+        `connect()`; reporting `required: False` for it hid the refusal from
+        this status tool. `self._lease_quarantined` is the authoritative
+        flag `connect()` itself checks -- fold it in here too.
         """
         marker = _lease_reconciliation_proof(self._state.get("lease_reconciliation"))
         return {
-            "required": marker is not None,
+            "required": self._lease_quarantined or marker is not None,
             "attempt_id": marker.get("attempt_id") if marker else None,
         }
 
@@ -3146,6 +3156,18 @@ class MupotAdapter(BasePlatformAdapter):
                 # concrete Mupot receipt and its human notice has custody --
                 # this is "turn ended without custody" the same as a lease
                 # expiry or timeout, not a violation.
+                #
+                # P2 (adversarial gate, PR #11 round 5): this exit and
+                # `handler_error` below were the only two of the five that
+                # never called `_cancel_delivery_processing` -- both leave
+                # Hermes's own background session task running, which can
+                # still race a peer `send` against `_replay_reply_outbox`'s
+                # own retry of the same `request_id` (proven live: a raising
+                # handler plus a slow peer `send` produced two `send` calls
+                # with the identical `request_id`). The other three exits
+                # already call this; matching them here closes the gap
+                # structurally rather than only for the reproduced case.
+                await self._cancel_delivery_processing(runtime)
                 if not self._reply_staged_incomplete(message_id):
                     self._state["pending"] = None
                 self.store.save(self._state)
@@ -3168,6 +3190,9 @@ class MupotAdapter(BasePlatformAdapter):
         # safely, and moves poison messages to Mupot's durable dead-letter
         # state; this is a deferral, not a protocol violation, same as the
         # other four exits.
+        # P2 (adversarial gate, PR #11 round 5): see the identical comment
+        # on the `empty_output` exit above -- same gap, same fix.
+        await self._cancel_delivery_processing(runtime)
         if not self._reply_staged_incomplete(message_id):
             self._state["pending"] = None
         self.store.save(self._state)

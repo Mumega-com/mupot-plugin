@@ -229,18 +229,40 @@ class _DeliveryDeferred(_EstopDeferred):
     than `lease_seconds`) fired first. A turn timeout with a still-live
     lease is "turn ended without custody" exactly as much as a lease expiry
     is: neither ever produced a reply, neither should ever be read as a
-    protocol violation. `reason` (`"lease_expired"` or `"turn_timeout"`)
-    records which fired, for logging only -- both are handled identically:
-    no ack, no processed mark, no durable marker; the message's own
-    visibility lease (still running either way) is left to expire so Mupot
-    redelivers it, and the pot's own reaper dead-letters at the server's
-    MAX_DELIVERY_ATTEMPTS if this repeats (local attempt bounding is a
-    separate, explicitly out-of-scope concern -- issue #10).
+    protocol violation.
+
+    Round 4 (adversarial BLOCK-2, PR #11 round 3, 2026-09-15): `_deliver` has
+    FIVE terminal exits; round 3 covered only the two above. The other three
+    also end the turn without human custody and were still returning
+    silently -- `_poll_loop` read "message not in processed" as a protocol
+    violation and durably quarantined `connect()`, identically to the
+    original incident, on any of:
+      - `empty_output`: `outcome == SUCCESS` but `_reply_has_human_custody`
+        is False (Hermes scores an empty response as a successful no-op).
+      - `handler_error`: the handler raised (fall-through `FAILURE`).
+      - `runtime_invalidated`: `runtime.invalidated` with a non-`SUCCESS`
+        outcome (reachable from `disconnect()` mid-turn or
+        `_expire_if_needed` inside `_active_delivery`).
+    `reason` records which of the five exits fired, for logging only -- all
+    five are handled identically: no ack, no processed mark, no durable
+    marker; the message's own visibility lease (still running in every case)
+    is left to expire so Mupot redelivers it, and the pot's own reaper
+    dead-letters at the server's MAX_DELIVERY_ATTEMPTS if this repeats
+    (local attempt bounding is a separate, explicitly out-of-scope concern
+    -- issue #10).
     """
+
+    _REASONS = {
+        "lease_expired",
+        "turn_timeout",
+        "empty_output",
+        "handler_error",
+        "runtime_invalidated",
+    }
 
     def __init__(self, message_id: str, *, reason: str = "lease_expired") -> None:
         super().__init__(message_id)
-        if reason not in {"lease_expired", "turn_timeout"}:
+        if reason not in self._REASONS:
             raise ValueError(f"unknown _DeliveryDeferred reason: {reason!r}")
         self.reason = reason
 
@@ -249,6 +271,26 @@ class _DeliveryDeferred(_EstopDeferred):
 # class for its original, narrower scope (lease expiry only). Same class --
 # `isinstance`/`pytest.raises(_LeaseExpiredDeferred)` still work unchanged.
 _LeaseExpiredDeferred = _DeliveryDeferred
+
+
+# One place naming all five `_DeliveryDeferred.reason` values truthfully, so
+# every log site (mid-poll `_poll_loop`, `reconcile_inbox_polling`) describes
+# the SAME cause the same way -- round 3 hardcoded a binary
+# lease_expired/turn_timeout ternary at the one call site that existed then;
+# round 4 added three more reasons, so a second copy of that ternary would
+# have silently mis-described them (the exact class of bug this predicate
+# exists to prevent -- see `_DeliveryDeferred`'s own docstring history).
+_DELIVER_DEFERRAL_CAUSE = {
+    "lease_expired": "its own lease expired",
+    "turn_timeout": "its own turn_timeout with a still-live lease",
+    "empty_output": "an empty-output turn (no reply reached human custody)",
+    "handler_error": "the turn handler raising before producing a reply",
+    "runtime_invalidated": "the delivery runtime being invalidated before completion",
+}
+
+
+def _deliver_deferral_cause(reason: str) -> str:
+    return _DELIVER_DEFERRAL_CAUSE.get(reason, reason)
 
 
 def _protocol_error() -> MupotProtocolError:
@@ -2291,9 +2333,22 @@ class MupotAdapter(BasePlatformAdapter):
         restarting, or an operator) would see no `pending` to protect it and
         self-heal past the still-staged, non-complete record. Both call
         sites now ask this one question and agree on the answer.
+
+        Athena F-B (PR #11 round 3, 2026-09-15): `invalid_receipt` is ALSO a
+        terminal state (`_mark_reply_complete`'s own "no validated receipt"
+        branch, and `_replay_reply_outbox`'s skip list) -- a "prepared"
+        record forced there because it can never legally reach "complete"
+        (no receipt survives the next load). Treating it as still-staged
+        here meant a clean tombstone plus a matching `invalid_receipt`
+        record could never clear `pending` across a restart -- the ONLY
+        escape was a manual state.json edit. `invalid_receipt` is excluded
+        the same as `complete`.
         """
         staged = self._state.get("reply_outbox", {}).get(message_id)
-        return isinstance(staged, dict) and staged.get("status") != "complete"
+        return isinstance(staged, dict) and staged.get("status") not in {
+            "complete",
+            "invalid_receipt",
+        }
 
     def _staged_reply_blocks_reconcile(self, state: str, attempt_id: str) -> bool:
         """Unsafe to drop pending: staged reply, wrong attempt, or unhandled ack."""
@@ -2412,6 +2467,37 @@ class MupotAdapter(BasePlatformAdapter):
                         message,
                         attempt_id=marker["attempt_id"],
                     )
+                except _DeliveryDeferred as exc:
+                    # Own clause, checked BEFORE the generic `_EstopDeferred`
+                    # clause below (F-A, Athena gate + adversarial P2-4, PR
+                    # #11 round 3, 2026-09-15): `_DeliveryDeferred` is a
+                    # subclass, so without this Python matched the
+                    # `_EstopDeferred` clause first and this always logged
+                    # "emergency stop is engaged" even when the true cause
+                    # was one of the five `_deliver` exits -- correct
+                    # behaviour (return False, marker left exactly as it
+                    # was; nothing here calls `_clear_lease_fence()` or
+                    # flips `_lease_quarantined`), wrong log. This ALSO
+                    # closes the substantive half of P2-3: an operator's
+                    # explicit reconcile (`execute_leased=True`) re-executing
+                    # a still-`leased` attempt used to fall through to the
+                    # `message_id not in processed` check below and raise
+                    # `_protocol_error()` for exactly this case, turning a
+                    # deferral into a permanent "reconciliation failed" that
+                    # only a state.json edit could clear -- now `_deliver`
+                    # raises `_DeliveryDeferred` on every custody-less exit,
+                    # so that check is never reached for this case at all.
+                    # Smaller change than skipping the turn outright for
+                    # `execute_leased=True`: this path exists precisely so an
+                    # operator CAN choose to re-execute a still-leased
+                    # attempt on purpose; only the exception handling and the
+                    # log were wrong.
+                    logger.info(
+                        "[mupot] inbox reconciliation deferred: message=%s %s",
+                        message["id"],
+                        _deliver_deferral_cause(exc.reason),
+                    )
+                    return False
                 except _EstopDeferred:
                     # Same class as _poll_loop's own handling: a pause that happens
                     # to be engaged while an operator is reconciling an existing
@@ -2595,12 +2681,10 @@ class MupotAdapter(BasePlatformAdapter):
                         # this always logged "emergency stop" even when the
                         # true cause was the message's own lease or turn
                         # timeout (F4, then round 2: now covers both
-                        # `_DeliveryDeferred` reasons, not just lease expiry).
-                        cause = (
-                            "its own lease expired"
-                            if exc.reason == "lease_expired"
-                            else "its own turn_timeout with a still-live lease"
-                        )
+                        # `_DeliveryDeferred` reasons, not just lease expiry;
+                        # round 4: all five reasons, via the one shared
+                        # `_deliver_deferral_cause` map -- see its docstring).
+                        cause = _deliver_deferral_cause(exc.reason)
                         logger.info(
                             "[mupot] deferring leased message=%s mid-poll: %s; "
                             "leaving lease to expire for redelivery",
@@ -2951,20 +3035,33 @@ class MupotAdapter(BasePlatformAdapter):
             reason = "lease_expired" if lease_expired else "turn_timeout"
             raise _DeliveryDeferred(message_id, reason=reason)
         if runtime.invalidated and runtime.outcome != ProcessingOutcome.SUCCESS:
+            # Exit 3 of 5 (adversarial BLOCK-2, PR #11 round 3, 2026-09-15):
+            # reachable from `disconnect()` mid-turn or `_expire_if_needed`
+            # inside `_active_delivery` -- the turn ended without custody
+            # exactly as much as the two deferrals above, and used to return
+            # silently into the same "message not in processed" quarantine.
             await self._cancel_delivery_processing(runtime)
+            if not self._reply_staged_incomplete(message_id):
+                self._state["pending"] = None
             self.store.save(self._state)
-            return
+            raise _DeliveryDeferred(message_id, reason="runtime_invalidated")
         self._invalidate_delivery(
             runtime,
             runtime.outcome or ProcessingOutcome.FAILURE,
         )
         if runtime.outcome == ProcessingOutcome.SUCCESS:
             if not self._reply_has_human_custody(message_id):
-                # Hermes treats an empty response as a successful no-op. A
-                # peer request is not consumable until a terminal ACK has a
-                # concrete Mupot receipt and its human notice has custody.
+                # Exit 1 of 5 (adversarial BLOCK-2): Hermes treats an empty
+                # response as a successful no-op, so `outcome` reads SUCCESS
+                # here with nothing ever reaching human custody. A peer
+                # request is not consumable until a terminal ACK has a
+                # concrete Mupot receipt and its human notice has custody --
+                # this is "turn ended without custody" the same as a lease
+                # expiry or timeout, not a violation.
+                if not self._reply_staged_incomplete(message_id):
+                    self._state["pending"] = None
                 self.store.save(self._state)
-                return
+                raise _DeliveryDeferred(message_id, reason="empty_output")
             durable_record = self._validated_reply_record(
                 message_id,
                 self._state.get("reply_outbox", {}).get(message_id),
@@ -2977,10 +3074,16 @@ class MupotAdapter(BasePlatformAdapter):
             self._commit(message_id)
             self._mark_reply_complete(message_id)
             return
-        # Do not acknowledge failure and do not immediately replay locally.
-        # The server-side visibility lease expires, retries safely, and moves
-        # poison messages to Mupot's durable dead-letter state.
+        # Exit 2 of 5 (adversarial BLOCK-2): the handler raised (fall-through
+        # FAILURE) -- do not acknowledge failure and do not immediately
+        # replay locally. The server-side visibility lease expires, retries
+        # safely, and moves poison messages to Mupot's durable dead-letter
+        # state; this is a deferral, not a protocol violation, same as the
+        # other four exits.
+        if not self._reply_staged_incomplete(message_id):
+            self._state["pending"] = None
         self.store.save(self._state)
+        raise _DeliveryDeferred(message_id, reason="handler_error")
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         runtime = self._runtime_for_event(event)

@@ -429,6 +429,42 @@ async def test_turn_timeout_with_live_lease_bounds_retries_then_dlq(tmp_path: Pa
         summary = adapter.turn_failure_dlq_summary()
         assert summary == [{"source_id": PEER_MSG["id"], "reason": "turn_timeout"}]
 
+        # Item 2/6 (kasra-review re-gate round 2, 2026-09-15): assert through
+        # the ACTUAL registered tool and its own `adapter_factory`-built
+        # instance, not a bare `MupotAdapter()` poked into a private
+        # closure variable -- a hardcoded `"turn_failure_dlq": []` in the
+        # tool's own dict literal would pass every OTHER status test (none
+        # of them have a live DLQ entry to notice) while still lying to an
+        # operator. `_live_adapter` is a closure-local inside `register()`;
+        # the only supported way to populate it is `ctx.adapter_factory(...)`.
+        from plugin.mupot_gateway.adapter import register as register_native_gateway
+
+        tools: dict[str, object] = {}
+
+        class Ctx:
+            def inject_message(self, *_a, **_kw):
+                return True
+
+            def register_platform(self, **kwargs):
+                self.adapter_factory = kwargs["adapter_factory"]
+
+            def register_tool(self, **kwargs):
+                tools[kwargs["name"]] = kwargs["handler"]
+
+        ctx = Ctx()
+        register_native_gateway(ctx)
+        status_instance = ctx.adapter_factory(
+            PlatformConfig(enabled=True, extra={"state_path": str(state_path)})
+        )
+        try:
+            reported = json.loads(tools["mupot_gateway_status"]({}))
+        finally:
+            await status_instance.disconnect()
+        assert reported["turn_failure_dlq"] == [
+            {"source_id": PEER_MSG["id"], "reason": "turn_timeout"}
+        ]
+        assert reported["reconciling"] is False
+
         # No further executions after the cap: the message is processed, so
         # redelivery just re-acks without ever calling the handler again.
         attempts_at_cap = client.lease_calls
@@ -521,6 +557,97 @@ async def test_handler_error_bounds_retries_then_dlq(tmp_path: Path) -> None:
         assert st.get("processed") == [PEER_MSG["id"]]
     finally:
         await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_gateway_status_reports_reconciling_during_auto_reconcile(
+    tmp_path: Path,
+) -> None:
+    """Item 6 (kasra-review re-gate round 2, 2026-09-15): `connected: false`
+    alone cannot distinguish "not yet attempted" from "connect()'s bounded
+    auto-reconcile turn is actively running right now". Force a genuine
+    quarantine, restart, and observe `mupot_gateway_status.reconciling` flip
+    `True` while `connect()`'s auto-reconcile is in flight and back to
+    `False` once it resolves -- through the ACTUAL registered tool, not just
+    the adapter attribute, so a hardcoded status literal cannot pass this."""
+    state_path = tmp_path / "state.json"
+    message = dict(PEER_MSG, lease_expires_at=FRESH_LEASE)
+    setup_client = ExpiryDriverClient(message)
+    setup_adapter = make_adapter(tmp_path, setup_client)
+
+    async def handler(event):
+        return "{ack_for:req-7} accepted"
+
+    setup_adapter.set_message_handler(handler)
+    setup_adapter._commit = lambda message_id: None  # force a genuine quarantine
+    assert await setup_adapter.connect()
+    try:
+        assert await _await_until(lambda: setup_adapter._lease_quarantined is True)
+    finally:
+        await setup_adapter.disconnect()
+
+    from plugin.mupot_gateway.adapter import register as register_native_gateway
+
+    tools: dict[str, object] = {}
+
+    class Ctx:
+        def inject_message(self, *_a, **_kw):
+            return True
+
+        def register_platform(self, **kwargs):
+            self.adapter_factory = kwargs["adapter_factory"]
+
+        def register_tool(self, **kwargs):
+            tools[kwargs["name"]] = kwargs["handler"]
+
+    ctx = Ctx()
+    register_native_gateway(ctx)
+    restarted = ctx.adapter_factory(
+        PlatformConfig(enabled=True, typing_indicator=False, extra={
+            "allowed_agents": "hadi-codex", "poll_interval": 0.01,
+            "state_path": str(state_path)})
+    )
+    restarted._client = ExpiryDriverClient(message)
+    restarted._send_client = restarted._client
+    restarted.set_message_handler(handler)
+
+    # The fake client for `restarted` has no memory of the ORIGINAL attempt
+    # (a fresh `ExpiryDriverClient` doesn't implement `inbox_lease_reconcile`
+    # at all) -- this test only needs to observe the `reconciling` flag's
+    # lifecycle around the call, not a successful reconciliation (that
+    # property is already covered by `test_restart_after_expiry_deferral_
+    # reconnects`'s clean-tombstone case), so the stub returns `False`
+    # directly rather than delegating to the real implementation.
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def paused_reconcile():
+        entered.set()
+        await release.wait()
+        return False
+
+    restarted._reconcile_inbox_polling_with_active_scope = paused_reconcile
+
+    try:
+        connect_task = asyncio.create_task(restarted.connect())
+        await asyncio.wait_for(entered.wait(), 1)
+        mid_flight = json.loads(tools["mupot_gateway_status"]({}))
+        assert mid_flight["connected"] is False
+        assert mid_flight["reconciling"] is True, (
+            "connect()'s in-flight auto-reconcile must be visible, not "
+            "indistinguishable from 'not yet attempted'"
+        )
+
+        release.set()
+        assert await asyncio.wait_for(connect_task, 2) is False
+
+        after = json.loads(tools["mupot_gateway_status"]({}))
+        assert after["reconciling"] is False, (
+            "reconciling must clear once connect()'s attempt resolves, "
+            "success or failure alike"
+        )
+    finally:
+        await restarted.disconnect()
 
 
 class ReconcileDeferralClient:

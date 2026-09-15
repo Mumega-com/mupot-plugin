@@ -510,6 +510,33 @@ async def test_prepared_attempt_valid_preflight_sends_then_custodies_then_acks_o
 
 
 @pytest.mark.asyncio
+async def test_peer_restart_leased_attempt_ack_response_stays_fenced(
+    tmp_path: Path,
+) -> None:
+    """BLOCK-2's deferral (`_DEAD_ATTEMPT_ACK_STATES`) is narrow: only
+    `expired`/`cancelled`/`empty` are safe-to-commit-locally states. An ack
+    response reporting `leased` (a well-formed but nonsensical answer to an
+    ack call -- the attempt is somehow still claimed) must NOT be folded
+    into the same deferral; this is a genuine protocol confusion, not a
+    resolved "attempt is dead" outcome, and must still durably fence
+    exactly as any other malformed/unexpected ack response does."""
+    first = adapter_at(tmp_path, ProtocolClient())
+    await bind_attempt_delivery(first)
+    assert (await first.send("sender", "Durable exact final.")).success is True
+    clear_lease_marker_for_replay(tmp_path)
+
+    client = AttemptReplayClient(attempt_state="leased", consumed=False)
+    restarted = adapter_at(tmp_path, client)
+    with pytest.raises(RuntimeError, match="Mupot MCP request failed"):
+        await restarted._replay_reply_outbox()
+
+    state = StateStore(tmp_path / "state.json").load()
+    assert "source-1" not in state.get("processed", [])
+    assert state["reply_outbox"]["source-1"]["status"] == "custodied"
+    assert restarted._lease_quarantined is True
+
+
+@pytest.mark.asyncio
 async def test_peer_restart_expired_attempt_a_never_generic_acks_live_attempt_b(
     tmp_path: Path,
 ) -> None:

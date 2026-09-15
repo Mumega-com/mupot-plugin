@@ -105,6 +105,10 @@ class _LiveDelivery:
     context: DeliveryContext
     expires_at: float
     source: Mapping[str, Any]
+    # None if the message carried no server lease_expires_at. Kept apart from
+    # `expires_at` (min of turn+lease) so `_deliver` can tell which fired --
+    # see `_LeaseExpiredDeferred`.
+    lease_deadline: Optional[float] = None
     completion_event: asyncio.Event = field(default_factory=asyncio.Event)
     outcome: Optional[ProcessingOutcome] = None
     invalidated: bool = False
@@ -205,6 +209,20 @@ class _EstopDeferred(Exception):
     `reconcile_inbox_polling`) recognises this exception as "deferred by
     pause" and releases the lease to expire for natural redelivery, rather
     than folding it into "message not marked processed => protocol error".
+    """
+
+
+class _LeaseExpiredDeferred(_EstopDeferred):
+    """A leased message's own lease expired mid-delivery -- not a violation.
+
+    2026-09-15 incident: `_deliver` used to return silently on expiry, so
+    `_poll_loop`'s "message not in processed" read that as a violation and
+    durably quarantined `connect()` forever. Same temporal-condition class as
+    `_EstopDeferred` (subclassed here for that reason): the poll loop's and
+    `reconcile_inbox_polling`'s existing `except _EstopDeferred:` clauses
+    catch this for free and let the lease expire for natural redelivery. A
+    turn timeout with a still-LIVE lease is explicitly NOT this class -- see
+    `_deliver`'s post-timeout branch.
     """
 
 
@@ -934,6 +952,29 @@ class StateStore:
                 pass
 
 
+_DEFAULT_MCP_TOOL_TIMEOUT_SECONDS = 300.0
+
+
+def _configured_mcp_tool_timeout(server_name: str) -> float:
+    """MCP transport timeout configured for ``server_name``, or the default.
+
+    Lease sizing must cover one real MCP tool call taking this long (the
+    2026-09-15 incident). Mirrors `HermesMCPClient._ensure_client`'s own
+    resolution so the two numbers can't drift; never raises.
+    """
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.mcp_config import _resolve_mcp_server_config
+
+        raw_cfg = (load_config().get("mcp_servers") or {}).get(server_name)
+        if not isinstance(raw_cfg, dict):
+            return _DEFAULT_MCP_TOOL_TIMEOUT_SECONDS
+        cfg = _resolve_mcp_server_config(raw_cfg)
+        return float(cfg.get("timeout") or _DEFAULT_MCP_TOOL_TIMEOUT_SECONDS)
+    except Exception:
+        return _DEFAULT_MCP_TOOL_TIMEOUT_SECONDS
+
+
 class HermesMCPClient:
     def __init__(
         self,
@@ -1128,7 +1169,14 @@ class MupotAdapter(BasePlatformAdapter):
         self.rpc_timeout = max(5.0, float(extra.get("rpc_timeout") or 20.0))
         self.turn_timeout = max(10.0, float(extra.get("turn_timeout") or 300.0))
         self.cancel_timeout = max(0.01, float(extra.get("cancel_timeout") or 6.0))
-        requested_lease = float(extra.get("lease_seconds") or (self.turn_timeout + 60.0))
+        requested_lease = float(
+            extra.get("lease_seconds")
+            or (
+                self.turn_timeout
+                + _configured_mcp_tool_timeout(self.server_name)
+                + 60.0
+            )
+        )
         self.lease_seconds = max(1, min(3600, int(requested_lease)))
         state_path = extra.get("state_path") or str(get_hermes_home() / "platforms" / "mupot" / "state.json")
         self.store = StateStore(Path(str(state_path)))
@@ -1264,6 +1312,18 @@ class MupotAdapter(BasePlatformAdapter):
                 })
         return stranded
 
+    def lease_reconciliation_status(self) -> dict[str, Any]:
+        """Whether a durable lease-reconciliation marker is present, + attempt id.
+
+        `reconcile_inbox_polling` was previously reachable only via a live
+        REPL; this surfaces it through `mupot_gateway_status` instead.
+        """
+        marker = _lease_reconciliation_proof(self._state.get("lease_reconciliation"))
+        return {
+            "required": marker is not None,
+            "attempt_id": marker.get("attempt_id") if marker else None,
+        }
+
     def _log_stranded_notifications_at_startup(self) -> None:
         stranded = self.stranded_notifications()
         if stranded:
@@ -1293,11 +1353,14 @@ class MupotAdapter(BasePlatformAdapter):
         text = str(value or "").strip()
         return text or None
 
-    def _delivery_deadline(self, message: dict[str, Any]) -> float:
+    def _delivery_deadline(
+        self, message: dict[str, Any]
+    ) -> tuple[float, Optional[float]]:
+        """Return (combined deadline, lease deadline or None if absent)."""
         deadline = time.time() + self.turn_timeout
         raw_expiry = message.get("lease_expires_at")
         if raw_expiry is None:
-            return deadline
+            return deadline, None
         if not isinstance(raw_expiry, str) or not raw_expiry.strip():
             raise _protocol_error()
         try:
@@ -1309,7 +1372,11 @@ class MupotAdapter(BasePlatformAdapter):
             raise _protocol_error() from None
         if not math.isfinite(lease_deadline):
             raise _protocol_error()
-        return min(deadline, lease_deadline)
+        return min(deadline, lease_deadline), lease_deadline
+
+    def _lease_has_expired(self, runtime: "_LiveDelivery") -> bool:
+        """True only when the message's OWN lease, not the turn deadline, fired."""
+        return runtime.lease_deadline is not None and time.time() >= runtime.lease_deadline
 
     def _begin_delivery(
         self,
@@ -1332,9 +1399,11 @@ class MupotAdapter(BasePlatformAdapter):
             session_key=session_key,
             attempt_id=attempt_id,
         )
+        deadline, lease_deadline = self._delivery_deadline(message)
         runtime = _LiveDelivery(
             context=context,
-            expires_at=self._delivery_deadline(message),
+            expires_at=deadline,
+            lease_deadline=lease_deadline,
             source=MappingProxyType(copy.deepcopy(message)),
         )
         metadata = dict(event.metadata or {})
@@ -1798,9 +1867,36 @@ class MupotAdapter(BasePlatformAdapter):
             and notice.get("custody_status") == "durable"
         )
 
+    def _has_validated_reply_receipt(self, source_id: str) -> bool:
+        """Reply already reached "sent" or later, with a validated receipt.
+
+        Narrower than `_reply_has_human_custody` (no notification-custody
+        requirement). Used only to gate pending-clearing on lease expiry and
+        `_replay_reply_outbox` tolerance -- never to authorise an ack/commit.
+        """
+        record = self._state.get("reply_outbox", {}).get(source_id)
+        return (
+            isinstance(record, dict)
+            and record.get("status") in {"sent", "custodied", "complete"}
+            and isinstance(record.get("receipt"), dict)
+        )
+
     def _mark_reply_complete(self, source_id: str) -> None:
         record = self._state.get("reply_outbox", {}).get(source_id)
         validated = self._validated_reply_record(source_id, record)
+        if validated["status"] not in {"sent", "custodied", "complete"} or not isinstance(
+            validated.get("receipt"), dict
+        ):
+            # A "prepared" record (no receipt) forced to "complete" persists
+            # fine here but the NEXT load rejects it (receipt required for
+            # "complete"), bricking connect() invisibly. Refuse instead.
+            logger.error(
+                "[mupot] refusing to mark reply complete without a validated "
+                "receipt source=%s status=%s",
+                source_id,
+                validated["status"],
+            )
+            return
         if validated["status"] != "complete":
             self._update_reply_record(source_id, validated, status="complete")
 
@@ -1823,12 +1919,19 @@ class MupotAdapter(BasePlatformAdapter):
                 continue
             pending = self._state.get("pending")
             pending_message = pending.get("message") if isinstance(pending, dict) else None
-            if (
-                not isinstance(pending_message, dict)
-                or str(pending_message.get("id") or "").strip() != source_id
-                or _reply_source_fingerprint(pending_message)
-                != record["source_fingerprint"]
-            ):
+            pending_matches = (
+                isinstance(pending_message, dict)
+                and str(pending_message.get("id") or "").strip() == source_id
+                and _reply_source_fingerprint(pending_message)
+                == record["source_fingerprint"]
+            )
+            if not pending_matches and not self._has_validated_reply_receipt(source_id):
+                # Genuine crash ambiguity for a never-transmitted "prepared"
+                # record. A record already holding a validated receipt is
+                # the opposite case: a lease-expiry deferral may have
+                # cleared `pending` for this source while a background
+                # handler staged/transmitted the reply anyway -- replaying
+                # an idempotent-by-request_id record is always safe.
                 self._update_reply_record(
                     source_id,
                     record,
@@ -1871,6 +1974,14 @@ class MupotAdapter(BasePlatformAdapter):
         ):
             logger.error("[mupot] connect blocked; profile owner unavailable")
             return False
+        if self._lease_quarantined:
+            # A durable lease marker (see `_LeaseExpiredDeferred`) is not a
+            # protocol violation: attempt one bounded self-heal BEFORE the
+            # ambiguous-pending refusal below reads pre-reconcile state.
+            # Every countercase leaves `_lease_quarantined` set and falls
+            # through unchanged. Call the scoped variant directly -- already
+            # inside the active secret scope here.
+            await self._reconcile_inbox_polling_with_active_scope()
         if (
             self._reply_state_invalid
             or self._legacy_pending_ambiguous
@@ -2064,6 +2175,24 @@ class MupotAdapter(BasePlatformAdapter):
         )
         logger.error("[mupot] inbox polling quarantined; reconciliation required")
 
+    def _staged_reply_blocks_reconcile(self) -> bool:
+        """A non-"complete" reply is staged for this attempt's `pending` source.
+
+        The exact-scope "expired"/"empty" clean-tombstone case must
+        fail-closed on this real countercase instead of self-healing.
+        """
+        pending = self._state.get("pending")
+        pending_message = pending.get("message") if isinstance(pending, dict) else None
+        pending_id = (
+            str(pending_message.get("id") or "").strip()
+            if isinstance(pending_message, dict)
+            else ""
+        )
+        if not pending_id:
+            return False
+        staged = self._state.get("reply_outbox", {}).get(pending_id)
+        return isinstance(staged, dict) and staged.get("status") != "complete"
+
     async def reconcile_inbox_polling(self) -> bool:
         """Reconcile a durable attempt through its authoritative server receipt."""
         if self._secret_owner is not None:
@@ -2157,6 +2286,19 @@ class MupotAdapter(BasePlatformAdapter):
                 message_id = message["id"]
                 if message_id not in self._state.get("processed", []):
                     raise _protocol_error()
+            else:
+                # Attempt is over (empty/cancelled/expired/acked) with
+                # nothing left to consume (unconsumed is guaranteed above).
+                # A clean tombstone: self-heal by dropping the stale pending
+                # and clearing below, unless a reply is still staged for it
+                # (real countercase).
+                if self._staged_reply_blocks_reconcile():
+                    logger.error(
+                        "[mupot] inbox reconciliation refused; reply staged "
+                        "for pending source"
+                    )
+                    return False
+                self._state["pending"] = None
             self._clear_lease_fence()
         except Exception:
             logger.error("[mupot] inbox attempt reconciliation failed")
@@ -2590,27 +2732,47 @@ class MupotAdapter(BasePlatformAdapter):
         self.store.save(self._state)
         event, runtime = self._begin_delivery(message, attempt_id=attempt_id)
         if self._expire_if_needed(runtime):
-            logger.warning("[mupot] refusing expired leased message=%s", message_id)
+            # Pre-turn lease expiry (site 1 of 2, see `_LeaseExpiredDeferred`):
+            # never ack, never mark processed, never quarantine -- leave the
+            # lease to expire naturally so Mupot redelivers.
+            logger.warning("[mupot] deferring expired leased message=%s", message_id)
+            if not self._has_validated_reply_receipt(message_id):
+                self._state["pending"] = None
             self.store.save(self._state)
-            return
+            raise _LeaseExpiredDeferred(message_id)
         token = _delivery_context.set(runtime.context)
         try:
             await self.handle_message(event)
         finally:
             _delivery_context.reset(token)
         timed_out = False
+        lease_expired = False
         try:
             remaining = max(0.0, runtime.expires_at - time.time())
             await asyncio.wait_for(runtime.completion_event.wait(), remaining)
         except asyncio.TimeoutError:
             timed_out = True
+            lease_expired = self._lease_has_expired(runtime)
             self._invalidate_delivery(runtime)
-            logger.error("[mupot] turn timeout message=%s", message_id)
+            logger.error(
+                "[mupot] turn timeout message=%s lease_expired=%s",
+                message_id,
+                lease_expired,
+            )
         except asyncio.CancelledError:
             self._invalidate_delivery(runtime, ProcessingOutcome.CANCELLED)
             await self._cancel_delivery_processing(runtime)
             self.store.save(self._state)
             raise
+        if lease_expired:
+            # Post-timeout lease expiry (site 2 of 2): the message's OWN
+            # lease fired, not `turn_timeout`. A turn timeout with a
+            # still-live lease falls through unchanged (base behaviour).
+            await self._cancel_delivery_processing(runtime)
+            if not self._has_validated_reply_receipt(message_id):
+                self._state["pending"] = None
+            self.store.save(self._state)
+            raise _LeaseExpiredDeferred(message_id)
         if timed_out or runtime.invalidated and runtime.outcome != ProcessingOutcome.SUCCESS:
             await self._cancel_delivery_processing(runtime)
             self.store.save(self._state)
@@ -3011,9 +3173,18 @@ def register(
         # real Hermes dispatch raises "unexpected keyword argument 'task_id'".
         adapter = _live_adapter[0] if _live_adapter else None
         if adapter is None:
-            value = {"ok": False, "error": "native_gateway_not_connected"}
+            value = {
+                "ok": False,
+                "error": "native_gateway_not_connected",
+                "connected": False,
+            }
         else:
-            value = {"ok": True, "stranded_notifications": adapter.stranded_notifications()}
+            value = {
+                "ok": True,
+                "connected": adapter.is_connected,
+                "stranded_notifications": adapter.stranded_notifications(),
+                "lease_reconciliation": adapter.lease_reconciliation_status(),
+            }
         return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
 
     register_tool = getattr(ctx, "register_tool", None)

@@ -23,6 +23,7 @@ from plugin.mupot_gateway.adapter import (  # noqa: E402
     MupotAdapter,
     StateStore,
     _EstopDeferred,
+    _LeaseExpiredDeferred,
     build_mupot_event,
     is_ack_envelope,
     is_terminal_ack,
@@ -449,11 +450,13 @@ async def test_expired_leased_event_never_starts_model_work(tmp_path: Path) -> N
     adapter.set_message_handler(handler)
     expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
 
-    await adapter._deliver(delivery_message("expired", lease_expires_at=expired))
+    with pytest.raises(_LeaseExpiredDeferred):
+        await adapter._deliver(delivery_message("expired", lease_expires_at=expired))
 
     assert handled == []
     assert client.sent == []
     assert client.acked_ids == []
+    assert StateStore(tmp_path / "state.json").load()["pending"] is None
 
 
 @pytest.mark.asyncio
@@ -961,10 +964,13 @@ async def test_poll_loop_retries_only_classified_safe_before_send_failure(
 
 
 @pytest.mark.asyncio
-async def test_reconstructed_adapter_stays_fenced_without_network(
+async def test_reconstructed_adapter_self_heals_via_connect_on_clean_tombstone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """2026-09-15 item 4: connect() attempts one bounded reconcile before
+    refusing on a lease marker. A matching-scope tombstone (no staged reply)
+    self-heals connect() straight through instead of refusing forever."""
     state_path = await persist_ambiguous_lease_quarantine(tmp_path, monkeypatch)
     marker = StateStore(state_path).load().get("lease_reconciliation")
     assert isinstance(marker, dict)
@@ -985,10 +991,16 @@ async def test_reconstructed_adapter_stays_fenced_without_network(
         client_factory=lambda *_: client,
     )
 
-    assert await reconstructed.connect() is False
-    assert client.connect_calls == 0
-    assert client.tools == []
-    assert client.lease_calls == 0
+    try:
+        assert await reconstructed.connect() is True
+    finally:
+        await reconstructed.disconnect()
+    assert client.tools == [
+        "inbox_consumer_status",
+        "inbox_lease_reconcile",
+        "inbox_consumer_status",
+    ]
+    assert StateStore(state_path).load().get("lease_reconciliation") is None
 
 
 @pytest.mark.asyncio
@@ -1079,9 +1091,13 @@ async def test_postlease_save_failure_leaves_prelease_fence_for_restart(
         PlatformConfig(enabled=True, extra={"state_path": str(state_path)}),
         client_factory=lambda *_: reconstructed_client,
     )
+    # 2026-09-15 item 4: connect() now attempts one bounded reconcile before
+    # refusing -- this one's status is malformed (no mode/generation), so the
+    # readback mismatches and it stays fenced, but the attempt itself DOES
+    # make exactly one network call now (was zero before this fix).
     assert await reconstructed.connect() is False
-    assert reconstructed_client.connect_calls == 0
-    assert reconstructed_client.tools == []
+    assert reconstructed_client.connect_calls == 1
+    assert reconstructed_client.tools == ["inbox_consumer_status"]
     assert reconstructed_client.lease_calls == 0
 
 
@@ -1184,8 +1200,11 @@ async def test_failed_reconciliation_readback_remains_durably_fenced(
     assert await reconcile() is False
     assert isinstance(StateStore(state_path).load().get("lease_reconciliation"), dict)
     assert getattr(reconstructed, "_lease_quarantined", False) is True
+    # 2026-09-15 item 4: connect() makes its OWN bounded reconcile attempt
+    # too (a second "inbox_consumer_status" call), independent of the manual
+    # one above -- both mismatch the same way and stay fenced.
     assert await reconstructed.connect() is False
-    assert client.tools == ["inbox_consumer_status"]
+    assert client.tools == ["inbox_consumer_status", "inbox_consumer_status"]
 
 
 @pytest.mark.asyncio
@@ -1815,7 +1834,11 @@ def test_gateway_status_tool_reports_stranded_notifications(tmp_path: Path) -> N
     assert "mupot_gateway_status" in tools
     # Before the platform ever connects there is no live adapter yet.
     before = json.loads(tools["mupot_gateway_status"]({}))
-    assert before == {"ok": False, "error": "native_gateway_not_connected"}
+    assert before == {
+        "ok": False,
+        "error": "native_gateway_not_connected",
+        "connected": False,
+    }
 
     ctx.adapter_factory(PlatformConfig(enabled=True, extra={"state_path": str(state_path)}))
     after = json.loads(tools["mupot_gateway_status"]({}))
@@ -1865,11 +1888,17 @@ async def test_gateway_status_clears_to_disconnected_after_adapter_disconnect(
 
     connected = json.loads(tools["mupot_gateway_status"]({}))
     assert connected["ok"] is True
+    assert connected["connected"] is False  # not yet connect()-ed, only constructed
+    assert connected["lease_reconciliation"] == {"required": False, "attempt_id": None}
 
     await instance.disconnect()
 
     disconnected = json.loads(tools["mupot_gateway_status"]({}))
-    assert disconnected == {"ok": False, "error": "native_gateway_not_connected"}
+    assert disconnected == {
+        "ok": False,
+        "error": "native_gateway_not_connected",
+        "connected": False,
+    }
 
 
 def test_gateway_status_survives_real_hermes_registry_dispatch(tmp_path: Path) -> None:
@@ -1913,6 +1942,11 @@ def test_gateway_status_survives_real_hermes_registry_dispatch(tmp_path: Path) -
             user_task="probe mupot_gateway_status",
         )
         result = json.loads(raw)
-        assert result == {"ok": True, "stranded_notifications": []}
+        assert result == {
+            "ok": True,
+            "connected": False,
+            "stranded_notifications": [],
+            "lease_reconciliation": {"required": False, "attempt_id": None},
+        }
     finally:
         registry.deregister(tool_name)

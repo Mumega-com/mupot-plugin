@@ -854,3 +854,72 @@ async def test_same_profile_token_rotation_may_reconcile_exact_scope(
 
     assert await adapter.reconcile_inbox_polling() is True
     assert StateStore(state_path).load().get("lease_reconciliation") is None
+
+
+@pytest.mark.asyncio
+async def test_status_reports_no_auto_reconcile_when_profile_owner_rotates(
+    tmp_path: Path,
+) -> None:
+    """B3 residual (Athena second eye, round 4, 2026-09-15, head c68e0839):
+    `_connect_with_active_scope`'s OWN first gate -- the constructor-time
+    `self._profile_owner_fingerprint` no longer matching a LIVE re-
+    validation of the SAME `secret_owner` object (e.g. an on-disk profile
+    rotated after this adapter was constructed) -- refuses `connect()`
+    before `_is_lease_reconcile_reachable()` is ever consulted. That
+    predicate did not account for it, so `mupot_gateway_status`'s
+    `connect_will_attempt_auto_reconcile` field still reported `true` for a
+    marker this exact adapter instance could never reach the reconcile
+    attempt for, misleading an operator into waiting on an automatic
+    reconcile that will never run.
+
+    Deliberately distinct from the marker's OWN `profile_owner_fingerprint`
+    field mismatching the CURRENT owner (see
+    `test_same_server_scope_distinct_profile_owner_stays_fenced_without_
+    network` above) -- that is a countercase the reconcile ATTEMPT itself
+    is expected to reach and then correctly refuse inside
+    (`_reconcile_inbox_polling_with_active_scope`'s own check), so
+    `connect_will_attempt_auto_reconcile` staying `true` for THAT case is
+    correct, not a bug: `connect()` does reach and attempt reconcile there,
+    it just legitimately fails once it tries. B3 is specifically about the
+    EARLIER gate that prevents the attempt from being reachable at all."""
+    state_path = tmp_path / "state.json"
+    owner = ScopeOwner("a" * 64)
+    client = AttemptClient(lease_outcomes=[MupotTransportError("Mupot request failed")])
+    adapter = make_adapter(state_path, client, owner)
+
+    assert await adapter.connect()
+    try:
+        await asyncio.wait_for(client.first_lease.wait(), 1)
+        await wait_stopped(adapter)
+    finally:
+        await adapter.disconnect()
+
+    marker = StateStore(state_path).load()["lease_reconciliation"]
+    assert marker is not None
+    assert adapter._profile_owner_fingerprint == owner.fingerprint
+
+    # Simulate the profile rotating under this SAME owner object, after
+    # construction -- exactly the condition `_connect_with_active_scope`'s
+    # own first gate re-checks live on every `connect()` call.
+    owner.fingerprint = "c" * 64
+
+    status = adapter.lease_reconciliation_status()
+    assert status is not None
+    assert status["connect_will_attempt_auto_reconcile"] is False, (
+        "a rotated profile owner can never reach the reconcile attempt -- "
+        "connect()'s own first gate refuses before it is reachable"
+    )
+
+    calls_before = len(client.calls)
+    connect_calls_before = client.connect_calls
+    ok = await adapter.connect()
+    assert ok is False
+    assert client.connect_calls == connect_calls_before, (
+        "connect() must refuse at its fingerprint gate before even the "
+        "transport-level connect(), let alone the reconcile attempt"
+    )
+    assert len(client.calls) == calls_before, (
+        "connect() must refuse before making ANY tool call, including the "
+        "reconcile attempt"
+    )
+    assert StateStore(state_path).load()["lease_reconciliation"] == marker

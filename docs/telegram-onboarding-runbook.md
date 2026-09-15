@@ -356,8 +356,8 @@ before this, a fully-quarantined adapter that could never `connect()` still
 reported `{"ok": true}` with no way to see why nothing was being received.
 Round 2 (2026-09-15) added `reconciling` (true while `connect()`'s bounded
 auto-reconcile turn is in flight — see below) and `turn_failure_dlq` (the
-Failed-bounded class's own terminal disposition — see the classification
-table below).
+Failed-bounded class's own terminal disposition — see `_DeliveryDeferred`'s
+docstring in the code for the classification table).
 
 **Manual procedure, when the marker survives an automatic `connect()`
 attempt (or you need to clear it without restarting):**
@@ -386,17 +386,18 @@ attempt (or you need to clear it without restarting):**
 
 Kasra gate re-gate round 2 (head 5046ea79) found that round 1's fix, while
 correct for a *clean* lease expiry, left two more outcomes able to reach a
-durable brick or an unbounded loop by a different door. The class is now:
+durable brick or an unbounded loop by a different door. The class is:
 **every delivery attempt lands in exactly one of four outcomes, each with
-one durable representation** — the constructor, `mupot_gateway_status`, and
-this runbook all agree on which is which.
+one durable representation.**
 
-| Outcome | Trigger | Durable representation | Who reads it |
-| --- | --- | --- | --- |
-| **Delivered** | Handler succeeds with human custody | `processed` list + `reply_outbox[id].status="complete"`; `pending: null` | `_process_leased_message`'s "already processed" short-circuit; operator via `processed`/`terminal_receipts` |
-| **Deferred** | Message's own lease expired before ACK (turn not at fault) | `pending: null` (cleared — nothing here was ever candidate reply-outbox custody); no `lease_reconciliation` marker | Poll loop releases the lease and continues; server redelivers. `connect()`'s `_legacy_pending_ambiguous` check (constructor) confirms `pending` is clean on restart |
-| **Failed-bounded** | Turn exceeds `turn_timeout` with the lease still live; handler returns no custody; handler raises | Below `max_delivery_attempts` (default 3): `pending` left AS-IS (real crash-ambiguity — a hung/raising handler may have taken side effects), no ack, `_TurnFailureDeferred` raised. At the cap: `dlq` entry `{message, reason: "turn_timeout"\|"no_custody"\|"handler_error"}`, `processed` includes the id, `pending: null` | `adapter.turn_failure_dlq_summary()` / `mupot_gateway_status`'s `turn_failure_dlq` field; poll loop keeps running either way |
-| **Violation** | Owner fingerprint mismatch, attempt/tenant conflict, tampered state, "processed" never set despite a successful ack (`_protocol_error()`) | `lease_reconciliation` marker (`required: true`, version 1/2/3) | `adapter.lease_reconciliation_status()` / `mupot_gateway_status`'s `lease_reconciliation` field; `connect()` refuses (self-heals once via `reconcile_inbox_polling()` for a genuine tombstone, else needs the manual procedure above) |
+**The canonical table lives in exactly one place: `_DeliveryDeferred`'s own
+docstring in `mupot_gateway/adapter.py`** (round 4, Athena second eye, head
+c68e0839, MED "runbook :398" — a copy of this table living here too had
+drifted out of sync with the code twice already: it said a Failed-bounded
+deferral left `pending` AS-IS below the cap, and that the poll loop "keeps
+running either way" at the cap, both false once `_resolve_turn_failure`
+existed. Read the code's own docstring for the current, authoritative
+version of the table — this runbook intentionally does not restate it).
 
 BLOCK-1 fix (the brick moved, not closed): `_deliver` writes `pending =
 {"message": message}` before either `_LeaseExpiredDeferred` raise site can
@@ -408,14 +409,31 @@ branch even runs. The 2026-09-15 incident's own symptom (durable refusal
 surviving every restart) would have recurred through `pending` instead of
 `lease_reconciliation`, invisibly, since `mupot_gateway_status` had no field
 for it either. Both `_LeaseExpiredDeferred` raise sites now clear `pending`
-before raising.
+before raising (round 4: UNLESS a non-`"complete"` `reply_outbox` entry is
+already staged for that exact source — see `_TurnFailureDeferred`'s
+docstring for the `handler_error`-with-custody race this guards against).
 
-New knob: **`max_delivery_attempts`** (`extra`, default 3) bounds
-failed-bounded retries using the message's own `delivery_attempts` count —
-the same field Mupot's server increments on every redelivery. This is
-*independent* of `lease_seconds`/`turn_timeout`: a hung or raising turn
-retries at most this many times total, then dead-letters, regardless of how
-generously the lease is sized.
+New knob: **`max_delivery_attempts`** (`extra`, default
+`_SERVER_MAX_DELIVERY_ATTEMPTS` — currently `5`, matching the pot's own
+`MAX_DELIVERY_ATTEMPTS`, round 4) bounds failed-bounded retries using the
+message's own `delivery_attempts` count — the same field Mupot's server
+increments on every redelivery. This is *independent* of
+`lease_seconds`/`turn_timeout`: a hung or raising turn retries at most this
+many times total, then defers terminally (round 4: without acking — see
+below) regardless of how generously the lease is sized.
+
+**At the cap, this adapter no longer acks (round 4, MED "cap surface").** An
+ack sets `read_at` on the pot's row, and the pot's own reaper
+(`mupot/src/agents/messages.ts`, dead-letter step) requires `read_at IS
+NULL` to ever set `dead_lettered_at` — acking at the cap (round 1-3
+behavior) permanently prevented the pot from ever recording the dead-letter
+itself, moving that fact to this host's local `dlq` file only. The local
+`dlq` row is still recorded (unchanged, idempotent by message id) for
+operator visibility; the lease is instead left to expire naturally so the
+pot's own reaper — which runs on every subsequent `inbox_lease` call for
+this agent, before handing out a lease — dead-letters the row server-side
+the next time this adapter polls. Matching `max_delivery_attempts`'s default
+to the pot's own ceiling means the two thresholds coincide by construction.
 
 **`connect()`'s auto-reconcile can still run a full bounded turn** before
 `_running` is set `True` (unchanged from round 1 — see the self-healing
@@ -425,6 +443,27 @@ bounded by `max_delivery_attempts` exactly the same way. While it runs,
 `mupot_gateway_status.connected` is `false` (the adapter isn't `_running`
 yet) **and** `reconciling` is `true` — before this, `connected: false` alone
 could not distinguish "not yet attempted" from "actively working on it".
+Note: this means `connect()` can make REAL egress (at minimum
+`inbox_lease_reconcile`, possibly `inbox_lease_ack`/`send` if a leased
+attempt is genuinely resolved during reconcile) BEFORE `is_connected`
+reports `true` — do not read `is_connected: false` as "no network activity
+has happened yet".
+
+**Round 4 notes (Athena second eye, head c68e0839):**
+
+- **B3:** `connect_will_attempt_auto_reconcile` is now `false` whenever the
+  profile-owner fingerprint is unavailable or mismatched, even if a v3
+  marker exists — `connect()`'s own first gate refuses before the reconcile
+  attempt is ever reachable in that case, and the status field now agrees
+  (`_is_lease_reconcile_reachable()` re-derives the exact same check).
+- `_clear_lease_fence()` (called after every poll-loop iteration that
+  finishes or defers cleanly) **removes** the `lease_reconciliation` key
+  entirely, it does not set it to `null` — `"lease_reconciliation" not in
+  state` is the clean-state shape on disk; `mupot_gateway_status` and
+  `lease_reconciliation_status()` both still report it as absent (`None`/
+  not present) either way, so no operator-facing behavior differs, but a
+  hand-inspection of `state.json` should not expect a `"lease_reconciliation":
+  null` key to be literally present.
 
 **Diagnostic entry points, one per class — the operator never edits
 `state.json` for Deferred or Failed-bounded:**
@@ -440,9 +479,13 @@ could not distinguish "not yet attempted" from "actively working on it".
   `turn_timeout` or `max_delivery_attempts` if the work is legitimately
   slow); `no_custody` → the handler is returning nothing actionable for that
   source (application bug, not a plugin bug); `handler_error` → read the
-  Hermes error log around that source id for the raised exception. The
-  message is `processed` and will not re-execute — there is nothing in
-  `state.json` for an operator to safely touch here.
+  Hermes error log around that source id for the raised exception (note:
+  IF that error reply reached the human with custody, this is actually
+  Delivered, not Failed-bounded — see `_DeliveryDeferred`'s docstring). At the
+  cap (round 4): this adapter does not ack, so the message is deliberately
+  NOT `processed` locally — the pot's own reaper resolves the dead-letter
+  server-side once the row's lease naturally expires; there is nothing in
+  `state.json` for an operator to safely touch here either way.
 - **Violation** — the manual procedure above; this is the ONLY class where
   reading (and, in the documented last-resort case, editing) `state.json`
   by hand is ever the correct next step.

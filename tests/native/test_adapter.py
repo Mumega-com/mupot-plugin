@@ -498,18 +498,28 @@ def test_max_delivery_attempts_clamped_to_server_ceiling(tmp_path: Path) -> None
     assert above_ceiling.max_delivery_attempts == mupot_adapter_module._SERVER_MAX_DELIVERY_ATTEMPTS
 
 
-def test_default_max_delivery_attempts_is_three_not_a_mutated_default(tmp_path: Path) -> None:
+def test_default_max_delivery_attempts_is_five_not_a_mutated_default(tmp_path: Path) -> None:
     """M-A (kasra re-gate round 3, 2026-09-15): the unconfigured default for
-    `max_delivery_attempts` is a bare literal (`... or 3`) inside the
-    constructor, not a named constant -- a mutation of that literal (e.g.
-    3 -> 99) is invisible to any test that reads the count back off
-    `adapter.max_delivery_attempts` itself (both sides of the assertion see
-    the SAME mutated value). Pin the literal directly instead."""
+    `max_delivery_attempts` is a named-constant fallback
+    (`... or _SERVER_MAX_DELIVERY_ATTEMPTS`) inside the constructor -- a
+    mutation of that constant's value is invisible to any test that reads
+    the count back off `adapter.max_delivery_attempts` itself (both sides of
+    the assertion see the SAME mutated value) OR compares it against the
+    constant by name. Pin the literal directly instead.
+
+    Round 4 (Athena second eye, head c68e0839, MED "cap surface"): the
+    default changed from a bare `3` to `_SERVER_MAX_DELIVERY_ATTEMPTS`
+    (currently `5`) -- an operator-configured local cap smaller than the
+    server's own dead-letter ceiling let this adapter DLQ a message the
+    server would have redelivered for two more attempts, and (before the
+    at-cap no-ack fix, same round) acking at that smaller local cap
+    permanently prevented the server's own reaper from ever dead-lettering
+    the row itself."""
     adapter = MupotAdapter(
         PlatformConfig(enabled=True, extra={"state_path": str(tmp_path / "state.json")}),
         client_factory=lambda *_: FakeMupotClient(),
     )
-    assert adapter.max_delivery_attempts == 3
+    assert adapter.max_delivery_attempts == 5
 
 
 def test_lease_is_binding_boundary_classifies_as_turn_failure_not_lease_expiry() -> None:

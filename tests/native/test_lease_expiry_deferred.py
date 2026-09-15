@@ -66,6 +66,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -74,6 +75,7 @@ from plugin.mupot_gateway.adapter import (
     MupotAdapter,
     StateStore,
     _LeaseExpiredDeferred,
+    _reply_source_fingerprint,
     _TurnFailureDeferred,
 )
 
@@ -175,10 +177,39 @@ class RollingLiveLeaseClient(ExpiryDriverClient):
     custody, or raising) while its own lease never comes close to expiring.
     Round 2 (kasra-review re-gate BLOCK-2, 2026-09-15): proves
     `_TurnFailureDeferred` is bounded by `delivery_attempts`, distinct from
-    `_LeaseExpiredDeferred`'s unbounded-by-design redelivery."""
+    `_LeaseExpiredDeferred`'s unbounded-by-design redelivery.
+
+    Round 4 (2026-09-15, Athena second eye): the real pot's own reaper
+    (`mupot/src/agents/messages.ts`, dead-letter step) runs on every
+    `inbox_lease` call BEFORE handing out a lease, dead-lettering any row
+    with `delivery_attempts >= MAX_DELIVERY_ATTEMPTS` whose OWN lease has
+    since expired and was never acked -- once that fires the row is
+    excluded from every future lease. `dead_letter_after`, set by the test
+    to `adapter.max_delivery_attempts` once the adapter exists, models
+    exactly that: the ONE lease call immediately after the cap-attempt was
+    handed out (this adapter's own turn-failure branch no longer acks at
+    the cap, round 4) is answered as reaped -- `state="empty"` forever
+    after, same as the real server would once this row's lease naturally
+    expired with `read_at` still `NULL`."""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.dead_letter_after: Optional[int] = None
+        self.dead_lettered = False
 
     async def call(self, tool, arguments):
         if tool == "inbox_lease":
+            if self.dead_lettered:
+                aid = arguments.get("attempt_id")
+                return attempt_result(aid, "empty")
+            if (
+                not self.acked
+                and self.dead_letter_after is not None
+                and self.lease_calls >= self.dead_letter_after
+            ):
+                self.dead_lettered = True
+                aid = arguments.get("attempt_id")
+                return attempt_result(aid, "empty")
             self.lease_calls += 1
             aid = arguments.get("attempt_id")
             nxt = _iso_in(30)
@@ -398,9 +429,11 @@ async def test_turn_timeout_with_live_lease_bounds_retries_then_dlq(tmp_path: Pa
     very likely hang again re-executes without limit (A/B measured 1 turn
     before this fix vs 11+ and climbing, with no operator signal). Below
     `max_delivery_attempts`, this now defers (`_TurnFailureDeferred`,
-    kind="turn_timeout") the same way; AT the cap, `_deliver` acks the
-    source, DLQs it, and commits -- terminal, never a durable quarantine and
-    never unbounded re-execution.
+    kind="turn_timeout") the same way; AT the cap (round 4, MED "cap
+    surface"), `_deliver` DLQs it and defers WITHOUT acking -- terminal
+    (never re-executed again -- the pot's own reaper is what stops
+    redelivery, modeled here by `RollingLiveLeaseClient.dead_letter_after`),
+    never a durable quarantine and never unbounded re-execution.
 
     Adapted from kasra-review's own probe D (`scratchpad/kasra-probes-pr9/
     test_kasra_probe_d.py`, read-only, never shipped)."""
@@ -408,6 +441,7 @@ async def test_turn_timeout_with_live_lease_bounds_retries_then_dlq(tmp_path: Pa
     client = RollingLiveLeaseClient(dict(PEER_MSG, lease_expires_at=_iso_in(30)))
     adapter = make_adapter(tmp_path, client)
     adapter.turn_timeout = 0.05
+    client.dead_letter_after = adapter.max_delivery_attempts
     handled: list[str] = []
 
     async def hung(event):
@@ -420,7 +454,7 @@ async def test_turn_timeout_with_live_lease_bounds_retries_then_dlq(tmp_path: Pa
         assert await _await_until(
             lambda: len(handled) >= adapter.max_delivery_attempts, n=1000
         ), "turn failure never reached the cap"
-        await asyncio.sleep(0.2)  # let the terminal ack/DLQ/commit tick settle
+        await asyncio.sleep(0.2)  # let the terminal DLQ tick + reaper simulation settle
 
         assert len(handled) == adapter.max_delivery_attempts, (
             "turn re-executed past max_delivery_attempts -- unbounded again"
@@ -432,7 +466,11 @@ async def test_turn_timeout_with_live_lease_bounds_retries_then_dlq(tmp_path: Pa
         assert adapter._lease_quarantined is False
         assert adapter.has_fatal_error is False
         assert not adapter._poll_task.done(), "poll loop died on a bounded turn failure"
-        assert st.get("processed") == [PEER_MSG["id"]]
+        assert st.get("processed") in (None, []), (
+            "round 4: the cap no longer acks/commits locally -- the pot's "
+            "own reaper resolves it, not this adapter's processed list"
+        )
+        assert client.acked is False
         assert st.get("pending") is None
 
         dlq = st.get("dlq") or []
@@ -480,50 +518,103 @@ async def test_turn_timeout_with_live_lease_bounds_retries_then_dlq(tmp_path: Pa
         ]
         assert reported["reconciling"] is False
 
-        # No further executions after the cap: the message is processed, so
-        # redelivery just re-acks without ever calling the handler again.
-        attempts_at_cap = client.lease_calls
+        # No further executions after the cap: `dead_letter_after` (round 4)
+        # models the pot's own reaper refusing to hand this row out again
+        # once its cap-attempt's lease is due to have expired and nothing
+        # acked it -- the poll loop keeps polling (still alive/leasing), it
+        # just never sees this message again.
+        assert client.dead_lettered is True
         await asyncio.sleep(0.2)
         assert len(handled) == adapter.max_delivery_attempts
-        assert client.lease_calls > attempts_at_cap, "poll loop must still be alive/leasing"
     finally:
         await adapter.disconnect()
 
 
+@pytest.mark.parametrize("kind", ["turn_timeout", "no_custody", "handler_error"])
 @pytest.mark.asyncio
-async def test_resolve_turn_failure_at_cap_acks_directly_not_via_later_reack(
-    tmp_path: Path,
+async def test_resolve_turn_failure_at_cap_defers_without_acking_for_pot_reaper(
+    tmp_path: Path, kind: str
 ) -> None:
-    """M-M (kasra re-gate round 3, 2026-09-15): `_resolve_turn_failure`'s
-    at-cap branch must itself call the terminal ack -- proven here in
-    ISOLATION, with no poll loop running at all, so there is no LATER,
-    benign re-ack of an already-`processed` message on redelivery available
-    to mask a mutation that deletes/skips the direct
-    `await self._ack_expected(...)` call at the cap. Every existing
-    end-to-end test (`test_turn_timeout_with_live_lease_bounds_retries_then_
-    dlq` etc.) lets the poll loop keep running past the cap "to let the
-    terminal ack/DLQ/commit tick settle" -- exactly the redelivery window
-    that would eventually re-ack the message anyway via
-    `_process_leased_message`'s own "already processed" branch, leaving
-    every one of those tests' final-state assertions green even with the
-    direct ack call removed."""
+    """Round 4 (Athena second eye, head c68e0839, MED "cap surface"):
+    `_resolve_turn_failure`'s at-cap branch must NOT ack -- proven here in
+    ISOLATION, with no poll loop running at all, so there is no network call
+    of any kind to observe other than the ones this function itself makes.
+    An ack sets `read_at` on the pot's row; the pot's own reaper
+    (`mupot/src/agents/messages.ts`, dead-letter step) requires `read_at IS
+    NULL` to ever set `dead_lettered_at` -- acking here (the pre-round-4
+    behavior, see `test_resolve_turn_failure_at_cap_acks_directly_not_via_
+    later_reack` in git history) permanently prevented the pot from ever
+    recording the dead-letter itself, moving that fact to this host's local
+    `dlq` file only. The local `dlq` row is still recorded (idempotent, same
+    as before) for operator visibility; the message is deliberately left
+    OFF `processed` and its lease is left to expire naturally so the pot's
+    own reaper -- which runs on every subsequent `inbox_lease` call for this
+    agent, before handing out a lease -- dead-letters it server-side the
+    next time this adapter polls."""
     state_path = tmp_path / "state.json"
     message = dict(PEER_MSG, lease_expires_at=_iso_in(30))
     client = ExpiryDriverClient(message)
     adapter = make_adapter(tmp_path, client)
     message_at_cap = dict(message, delivery_attempts=adapter.max_delivery_attempts)
 
-    await adapter._resolve_turn_failure(message_at_cap, None, "turn_timeout")
+    with pytest.raises(_TurnFailureDeferred) as exc_info:
+        await adapter._resolve_turn_failure(message_at_cap, None, kind)
 
-    assert client.calls == [("inbox_ack", {"ids": [message_at_cap["id"]]})], (
-        "the cap branch must ack directly, exactly once, with no other "
-        "network call involved"
+    assert exc_info.value.kind == kind
+    assert exc_info.value.terminal is True
+    assert client.calls == [], (
+        "the cap branch must not ack (or make ANY other network call) -- "
+        "acking sets read_at and permanently blocks the pot's own reaper "
+        "from ever dead-lettering this row"
     )
-    assert client.acked is True
+    assert client.acked is False
     st = _state(state_path)
-    assert st.get("processed") == [message_at_cap["id"]]
+    assert st.get("processed") in (None, []), (
+        "the message must not be marked processed locally -- the pot's own "
+        "reaper, not this adapter, is what resolves it once the lease "
+        "expires"
+    )
+    assert st.get("pending") is None
     dlq = st.get("dlq") or []
-    assert len(dlq) == 1 and dlq[0]["reason"] == "turn_timeout"
+    assert len(dlq) == 1 and dlq[0]["reason"] == kind
+    await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_resolve_turn_failure_at_cap_preserves_pending_for_staged_reply(
+    tmp_path: Path,
+) -> None:
+    """The same custody guard applies at the cap as below it (round 4, P0
+    fix): a `handler_error` that already staged a non-complete reply must
+    not have `pending` cleared out from under `_replay_reply_outbox`, even
+    on the terminal, no-ack path."""
+    state_path = tmp_path / "state.json"
+    message = dict(PEER_MSG, lease_expires_at=_iso_in(30))
+    client = ExpiryDriverClient(message)
+    adapter = make_adapter(tmp_path, client)
+    message_at_cap = dict(message, delivery_attempts=adapter.max_delivery_attempts)
+    adapter._state["pending"] = {"message": message_at_cap}
+    adapter._state["reply_outbox"] = {
+        message_at_cap["id"]: {
+            "version": 2,
+            "status": "custodied",
+            "source": {"chat_id": "hadi-codex"},
+            "arguments": {"to": "hadi-codex", "body": "err"},
+            "receipt": {"id": "out-1"},
+            "source_fingerprint": _reply_source_fingerprint(message_at_cap),
+        }
+    }
+    adapter.store.save(adapter._state)
+
+    with pytest.raises(_TurnFailureDeferred):
+        await adapter._resolve_turn_failure(message_at_cap, None, "handler_error")
+
+    st = _state(state_path)
+    assert st.get("pending") is not None, (
+        "a staged non-complete reply must survive the at-cap clear too, "
+        "same guard as the below-cap path"
+    )
+    assert client.acked is False
     await adapter.cancel_background_tasks()
 
 
@@ -537,6 +628,7 @@ async def test_no_custody_bounds_retries_then_dlq(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     client = RollingLiveLeaseClient(dict(PEER_MSG, lease_expires_at=_iso_in(30)))
     adapter = make_adapter(tmp_path, client)
+    client.dead_letter_after = adapter.max_delivery_attempts
     handled: list[str] = []
 
     async def empty_handler(event):
@@ -557,7 +649,10 @@ async def test_no_custody_bounds_retries_then_dlq(tmp_path: Path) -> None:
         assert not adapter._poll_task.done()
         dlq = st.get("dlq") or []
         assert len(dlq) == 1 and dlq[0]["reason"] == "no_custody"
-        assert st.get("processed") == [PEER_MSG["id"]]
+        # Round 4: the cap no longer acks/commits locally -- the pot's own
+        # reaper (modeled here by `dead_letter_after`) resolves it.
+        assert st.get("processed") in (None, [])
+        assert client.acked is False
     finally:
         await adapter.disconnect()
 
@@ -582,6 +677,7 @@ async def test_handler_error_bounds_retries_then_dlq(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     client = RollingLiveLeaseClient(dict(PEER_MSG, lease_expires_at=_iso_in(30)))
     adapter = make_adapter(tmp_path, client)
+    client.dead_letter_after = adapter.max_delivery_attempts
     handled: list[str] = []
 
     async def raising_handler(event):
@@ -606,9 +702,90 @@ async def test_handler_error_bounds_retries_then_dlq(tmp_path: Path) -> None:
         assert not adapter._poll_task.done()
         dlq = st.get("dlq") or []
         assert len(dlq) == 1 and dlq[0]["reason"] == "handler_error"
-        assert st.get("processed") == [PEER_MSG["id"]]
+        # Round 4: the cap no longer acks/commits locally -- the pot's own
+        # reaper (modeled here by `dead_letter_after`) resolves it.
+        assert st.get("processed") in (None, [])
+        assert client.acked is False
     finally:
         await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_handler_error_with_custody_completes_via_reply_replay(
+    tmp_path: Path,
+) -> None:
+    """Round 4 (Athena second eye, head c68e0839) P0 -- THE decisive
+    regression test, driving the REAL `_poll_loop` end to end past the
+    FIRST deferral (unlike `test_handler_error_bounds_retries_then_dlq`,
+    which deliberately stubs `send()` to isolate the bounded-retry-then-DLQ
+    property from this exact confounding case).
+
+    Hermes's `BasePlatformAdapter` catches a raising handler itself and
+    calls `_notify_turn_error` -> `self.send(...)` BEFORE `_resolve_turn_
+    failure` ever runs, staging `reply_outbox[id]` at a non-"complete"
+    status (`"custodied"`, with a real receipt) via the adapter's own real
+    `send()` -> `_prepare_final_reply`/`_transmit_final_reply` path.
+    `_resolve_turn_failure`'s custody guard must leave `pending` set so the
+    VERY NEXT poll tick's `_replay_reply_outbox` (statement #2 of every
+    iteration, before the next `inbox_lease`) matches it (same message
+    dict, same `_reply_source_fingerprint`) and completes the reply through
+    the ordinary path: ack the original leased attempt, `_commit()` (marks
+    `processed`, clears `pending`), `_mark_reply_complete()`.
+
+    Pre-fix (round 3's unconditional clear): the next tick found `pending
+    is None`, the source id no longer matched, `_replay_reply_outbox`
+    flipped the record to `"reconciliation_required"` and raised a genuine
+    `_protocol_error()` -- the poll loop died and `connect()` refused
+    FOREVER on every subsequent restart, before `_is_lease_reconcile_
+    reachable()` even ran (Athena's exact finding)."""
+    state_path = tmp_path / "state.json"
+    message = dict(PEER_MSG, lease_expires_at=_iso_in(30))
+    client = ExpiryDriverClient(message)
+    adapter = make_adapter(tmp_path, client)
+
+    async def raising_handler(_event):
+        raise RuntimeError("handler exploded")
+
+    adapter.set_message_handler(raising_handler)
+    assert await adapter.connect()
+    try:
+        assert await _await_until(lambda: len(client.sent) >= 1, n=1000), (
+            "Hermes's own crash handler never sent the error reply"
+        )
+        assert await _await_until(
+            lambda: PEER_MSG["id"] in (_state(state_path).get("processed") or []),
+            n=1000,
+        ), "error reply staged with custody never completed via reply replay"
+        await asyncio.sleep(0.2)
+
+        st = _state(state_path)
+        assert st.get("lease_reconciliation") is None, (
+            "must never quarantine -- an error reply with custody is Delivered"
+        )
+        assert adapter._lease_quarantined is False
+        assert adapter.has_fatal_error is False
+        assert not adapter._poll_task.done(), (
+            "poll loop died on a Delivered handler_error"
+        )
+        assert st.get("processed") == [PEER_MSG["id"]]
+        assert st.get("pending") is None, "pending must clear once _commit() runs"
+        reply = st.get("reply_outbox", {}).get(PEER_MSG["id"])
+        assert reply is not None and reply.get("status") == "complete"
+        assert not (st.get("dlq") or []), "a Delivered outcome is not a DLQ entry"
+        assert len(client.sent) == 1, "the error reply must be sent exactly once"
+        assert client.acked is True
+    finally:
+        await adapter.disconnect()
+
+    # RESTART: the whole point of the fix -- connect() must succeed, not
+    # refuse forever the way the pre-fix brick did.
+    client2 = ExpiryDriverClient(message)
+    adapter2 = make_adapter(tmp_path, client2)
+    assert await adapter2.connect(), (
+        "connect() refused after a Delivered handler_error -- the exact "
+        "brick this fix exists to close"
+    )
+    await adapter2.disconnect()
 
 
 async def _pending_scenario_pre_turn_lease_expired(tmp_path: Path):

@@ -42,6 +42,21 @@ docstrings in `mupot_gateway/adapter.py` for the full class rationale:
     failed" path (both return `False`; the OBSERVABLE difference this test
     pins is the log line, per the standing "verify the PROPERTY, not just
     the return value" rule -- state alone survives the M9 mutation).
+
+Round 3 (kasra re-gate, head 7295e057, 2026-09-15) BLOCK-A:
+  - `test_pending_cleared_at_every_delivery_deferred_raise_site`: `pending`
+    is the "a turn is running RIGHT NOW in this process" record and NOTHING
+    else -- parametrized over all 5 ways a `_DeliveryDeferred` can escape
+    `_deliver` (pre-turn lease expiry, mid-turn lease expiry,
+    turn_timeout/no_custody/handler_error each below
+    `max_delivery_attempts`). `_resolve_turn_failure` used to leave
+    `pending` set on all 3 turn-failure kinds (crash-ambiguity theory,
+    since rejected -- see its docstring); this is the invariant test that
+    would have caught it, distinct from `test_turn_timeout_with_live_lease_
+    bounds_retries_then_dlq`/`test_no_custody_bounds_retries_then_dlq`/
+    `test_handler_error_bounds_retries_then_dlq`, which only ever checked
+    `pending` AFTER the cap, where `_commit()` already clears it
+    unconditionally regardless of whether the below-cap path does.
 """
 from __future__ import annotations
 
@@ -476,6 +491,43 @@ async def test_turn_timeout_with_live_lease_bounds_retries_then_dlq(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_resolve_turn_failure_at_cap_acks_directly_not_via_later_reack(
+    tmp_path: Path,
+) -> None:
+    """M-M (kasra re-gate round 3, 2026-09-15): `_resolve_turn_failure`'s
+    at-cap branch must itself call the terminal ack -- proven here in
+    ISOLATION, with no poll loop running at all, so there is no LATER,
+    benign re-ack of an already-`processed` message on redelivery available
+    to mask a mutation that deletes/skips the direct
+    `await self._ack_expected(...)` call at the cap. Every existing
+    end-to-end test (`test_turn_timeout_with_live_lease_bounds_retries_then_
+    dlq` etc.) lets the poll loop keep running past the cap "to let the
+    terminal ack/DLQ/commit tick settle" -- exactly the redelivery window
+    that would eventually re-ack the message anyway via
+    `_process_leased_message`'s own "already processed" branch, leaving
+    every one of those tests' final-state assertions green even with the
+    direct ack call removed."""
+    state_path = tmp_path / "state.json"
+    message = dict(PEER_MSG, lease_expires_at=_iso_in(30))
+    client = ExpiryDriverClient(message)
+    adapter = make_adapter(tmp_path, client)
+    message_at_cap = dict(message, delivery_attempts=adapter.max_delivery_attempts)
+
+    await adapter._resolve_turn_failure(message_at_cap, None, "turn_timeout")
+
+    assert client.calls == [("inbox_ack", {"ids": [message_at_cap["id"]]})], (
+        "the cap branch must ack directly, exactly once, with no other "
+        "network call involved"
+    )
+    assert client.acked is True
+    st = _state(state_path)
+    assert st.get("processed") == [message_at_cap["id"]]
+    dlq = st.get("dlq") or []
+    assert len(dlq) == 1 and dlq[0]["reason"] == "turn_timeout"
+    await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
 async def test_no_custody_bounds_retries_then_dlq(tmp_path: Path) -> None:
     """WARN (kasra-review re-gate round 2, 2026-09-15): a handler that
     completes but produces nothing with human custody used to `return`
@@ -557,6 +609,146 @@ async def test_handler_error_bounds_retries_then_dlq(tmp_path: Path) -> None:
         assert st.get("processed") == [PEER_MSG["id"]]
     finally:
         await adapter.disconnect()
+
+
+async def _pending_scenario_pre_turn_lease_expired(tmp_path: Path):
+    """Raise site 1/5: `_expire_if_needed`'s pre-turn check, lease already expired."""
+    state_path = tmp_path / "state.json"
+    message = dict(PEER_MSG)  # PEER_MSG's own lease is already expired
+    client = ExpiryDriverClient(message)
+    adapter = make_adapter(tmp_path, client)
+
+    async def handler(_event):
+        return "{ack_for:req-7} accepted"
+
+    adapter.set_message_handler(handler)
+    with pytest.raises(_LeaseExpiredDeferred):
+        await adapter._deliver(message)
+    return state_path, adapter
+
+
+async def _pending_scenario_mid_turn_lease_expired(tmp_path: Path):
+    """Raise site 2/5: post-`asyncio.wait_for` timeout, LEASE is the binding
+    constraint (short lease, long turn_timeout, a handler that hangs)."""
+    state_path = tmp_path / "state.json"
+    message = dict(PEER_MSG, lease_expires_at=_iso_in(0.2))
+    client = ExpiryDriverClient(message)
+    adapter = make_adapter(tmp_path, client)
+    adapter.turn_timeout = 5.0  # far longer than the lease -- the LEASE binds
+
+    async def hung(_event):
+        await asyncio.Event().wait()
+
+    adapter.set_message_handler(hung)
+    with pytest.raises(_LeaseExpiredDeferred):
+        await adapter._deliver(message)
+    return state_path, adapter
+
+
+async def _pending_scenario_turn_timeout_below_cap(tmp_path: Path):
+    """Raise site 3/5: post-timeout, TURN_TIMEOUT is the binding constraint
+    (long lease, short turn_timeout, a handler that hangs), below
+    `max_delivery_attempts` -- `_resolve_turn_failure(kind="turn_timeout")`."""
+    state_path = tmp_path / "state.json"
+    message = dict(PEER_MSG, lease_expires_at=_iso_in(30))
+    client = ExpiryDriverClient(message)
+    adapter = make_adapter(tmp_path, client)
+    adapter.turn_timeout = 0.02
+
+    async def hung(_event):
+        await asyncio.Event().wait()
+
+    adapter.set_message_handler(hung)
+    with pytest.raises(_TurnFailureDeferred) as excinfo:
+        await adapter._deliver(message)
+    assert excinfo.value.kind == "turn_timeout"
+    return state_path, adapter
+
+
+async def _pending_scenario_no_custody_below_cap(tmp_path: Path):
+    """Raise site 4/5: the handler completes but produces nothing with human
+    custody, below `max_delivery_attempts` --
+    `_resolve_turn_failure(kind="no_custody")`."""
+    state_path = tmp_path / "state.json"
+    message = dict(PEER_MSG, lease_expires_at=_iso_in(30))
+    client = ExpiryDriverClient(message)
+    adapter = make_adapter(tmp_path, client)
+
+    async def empty_handler(_event):
+        return ""
+
+    adapter.set_message_handler(empty_handler)
+    with pytest.raises(_TurnFailureDeferred) as excinfo:
+        await adapter._deliver(message)
+    assert excinfo.value.kind == "no_custody"
+    return state_path, adapter
+
+
+async def _pending_scenario_handler_error_below_cap(tmp_path: Path):
+    """Raise site 5/5: the handler raises, surfaced by `BasePlatformAdapter`
+    as `ProcessingOutcome.FAILURE`, below `max_delivery_attempts` --
+    `_resolve_turn_failure(kind="handler_error")`. `send()` is stubbed, same
+    reason as `test_handler_error_bounds_retries_then_dlq`: an unconfounded
+    test of `_resolve_turn_failure`'s own behavior needs the crash-
+    notification side channel neutered."""
+    state_path = tmp_path / "state.json"
+    message = dict(PEER_MSG, lease_expires_at=_iso_in(30))
+    client = ExpiryDriverClient(message)
+    adapter = make_adapter(tmp_path, client)
+
+    async def raising_handler(_event):
+        raise RuntimeError("handler exploded")
+
+    async def stub_send(*_args, **_kwargs):
+        return None
+
+    adapter.set_message_handler(raising_handler)
+    adapter.send = stub_send
+    with pytest.raises(_TurnFailureDeferred) as excinfo:
+        await adapter._deliver(message)
+    assert excinfo.value.kind == "handler_error"
+    return state_path, adapter
+
+
+_PENDING_INVARIANT_SCENARIOS = {
+    "pre_turn_lease_expired": _pending_scenario_pre_turn_lease_expired,
+    "mid_turn_lease_expired": _pending_scenario_mid_turn_lease_expired,
+    "turn_timeout_below_cap": _pending_scenario_turn_timeout_below_cap,
+    "no_custody_below_cap": _pending_scenario_no_custody_below_cap,
+    "handler_error_below_cap": _pending_scenario_handler_error_below_cap,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario_name", sorted(_PENDING_INVARIANT_SCENARIOS))
+async def test_pending_cleared_at_every_delivery_deferred_raise_site(
+    tmp_path: Path, scenario_name: str
+) -> None:
+    """Round 3 (kasra re-gate BLOCK-A): `pending` is the "a turn is running
+    RIGHT NOW in this process" record and NOTHING else -- every one of the 5
+    ways a `_DeliveryDeferred` can escape `_deliver` must clear it before
+    raising, or a restart's `_legacy_pending_ambiguous` check refuses
+    `connect()` forever over a perfectly bounded, in-flight redelivery (the
+    exact durable-brick shape this whole class of fix exists to close).
+    `test_no_custody_bounds_retries_then_dlq` and
+    `test_handler_error_bounds_retries_then_dlq` only ever asserted
+    `pending is None` AFTER `max_delivery_attempts` was reached (where
+    `_commit()` already clears it unconditionally) -- neither exercised the
+    BELOW-cap deferral branch where this bug actually lived
+    (`_resolve_turn_failure` left `pending` set on purpose, on a since-
+    rejected crash-ambiguity theory; see that function's docstring).
+    Mutating the `self._state["pending"] = None` line back out at any one of
+    these 5 sites must fail exactly this parametrized case for that site."""
+    scenario = _PENDING_INVARIANT_SCENARIOS[scenario_name]
+    state_path, adapter = await scenario(tmp_path)
+    try:
+        st = _state(state_path)
+        assert st.get("pending") is None, (
+            f"{scenario_name}: _DeliveryDeferred escaped _deliver without "
+            "clearing pending"
+        )
+    finally:
+        await adapter.cancel_background_tasks()
 
 
 @pytest.mark.asyncio

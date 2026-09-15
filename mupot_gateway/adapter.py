@@ -58,6 +58,20 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _REPLY_OUTBOX_VERSION = 2
 _LEGACY_REPLY_OUTBOX_VERSION = 1
 _LEASE_ATTEMPT_MARKER_VERSION = 3
+# OPEN-D (kasra re-gate round 3, 2026-09-15): safety margin a configured
+# `lease_seconds` must clear above `turn_timeout + mcp_tool_timeout`, same
+# value the unconfigured default (see the constructor) already uses.
+_LEASE_SAFETY_MARGIN_SECONDS = 60.0
+# OPEN-D: the SERVER's own hard ceiling on `delivery_attempts` before it
+# stops redelivering entirely (mupot/src/agents/messages.ts:879,
+# `MAX_DELIVERY_ATTEMPTS`). An operator-configured `max_delivery_attempts`
+# above this is not a bigger local retry budget -- it is dead configuration
+# past attempt 5: the server never delivers a 6th attempt for this adapter
+# to see, so `_resolve_turn_failure` would defer forever waiting for a
+# `delivery_attempts` value that never arrives, with no local DLQ row and no
+# `mupot_gateway_status` visibility (the exact "durable brick, just moved"
+# shape this whole class of fix exists to close).
+_SERVER_MAX_DELIVERY_ATTEMPTS = 5
 # _LEASE_ATTEMPT_ID_RE itself is imported above from .lease_ownership (single shared
 # pattern -- see the comment there) rather than redefined here.
 _PROFILE_OWNER_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -331,14 +345,27 @@ class _TurnFailureDeferred(_DeliveryDeferred):
     Below `self.max_delivery_attempts`, `_deliver` raises this (see
     `_resolve_turn_failure`) so `_poll_loop`/`reconcile_inbox_polling`
     release the lease and let the server redeliver, same as any
-    `_DeliveryDeferred` -- `pending` is left exactly as `_deliver` set it
-    (unchanged, real crash-ambiguity: unlike a clean lease expiry, a hung or
-    raising handler MAY have taken real side effects mid-turn, so this
-    fences it for a human exactly like a genuine crash would, pinned by
-    `test_timeout_invalidates_generation_before_bounded_cancellation`). At
-    the cap, `_deliver` does NOT raise: it acks the source, appends a DLQ
-    row tagged with `kind`, logs one WARNING, and commits (clearing
-    `pending`) -- a terminal disposition visible in
+    `_DeliveryDeferred`.
+
+    Kasra re-gate round 3 (2026-09-15, head 7295e057) BLOCK-A: this raise
+    used to leave `pending` set (the theory being that a hung or raising
+    handler MAY have taken real side effects mid-turn, so it should fence
+    for a human exactly like a genuine crash would -- previously pinned by
+    `test_timeout_invalidates_generation_before_bounded_cancellation`).
+    That reasoning does not hold: `pending` is the "a turn is running RIGHT
+    NOW in this process" record and nothing else, `delivery_attempts` (the
+    SERVER's count, not local state) is what tracks how many times this has
+    been tried, and this raise site is only ever reached after the turn has
+    already ended (successfully far enough to observe its outcome, or
+    definitively timed out) -- there is no live turn left to describe.
+    Leaving `pending` set instead reproduced the exact durable-brick shape
+    this whole fix exists to close: the next restart's
+    `_legacy_pending_ambiguous` check read the survivor as ambiguous crash
+    state and `connect()` refused forever. Fix: `_resolve_turn_failure`
+    clears `pending` before raising, for all three `kind`s, same as the
+    lease-expiry sites. At the cap, `_deliver` does NOT raise: it acks the
+    source, appends a DLQ row tagged with `kind`, logs one WARNING, and
+    commits (clearing `pending`) -- a terminal disposition visible in
     `mupot_gateway_status`'s existing DLQ surface, never a durable
     quarantine and never unbounded re-execution.
     """
@@ -1078,6 +1105,20 @@ class StateStore:
                 pass
 
 
+# OPEN-E (kasra re-gate round 3, 2026-09-15): the ONE fallback value for
+# every way `_configured_mcp_tool_timeout` can fail to learn a real,
+# operator-configured number -- the server absent from `mcp_servers`
+# entirely, present but missing an explicit `timeout` key, or any exception
+# reading/resolving the config at all. These used to be two DIFFERENT
+# hardcoded numbers (300.0 for "absent"/"any exception", 30.0 for
+# "configured but no timeout key") with no reasoning tying them together --
+# picking the SMALLER of the two as a per-server default risks under-sizing
+# `lease_seconds` (see OPEN-D) for a server an operator only partially
+# configured, reproducing the exact class of incident this whole fix exists
+# to close. One named constant, the LARGER/safer of the two former values.
+_DEFAULT_MCP_TOOL_TIMEOUT_SECONDS = 300.0
+
+
 def _configured_mcp_tool_timeout(server_name: str) -> float:
     """Read the mupot MCP server's own configured request timeout.
 
@@ -1089,8 +1130,15 @@ def _configured_mcp_tool_timeout(server_name: str) -> float:
     hardcoded guess -- an operator can still override via `mcp_tool_timeout`
     in `extra`. Any failure here (server not yet configured, config file
     unreadable, import error in a unit-test sandbox with no `hermes_cli`
-    package on the path) is non-fatal: falls back to 300.0s, the same
-    default this module used before this fix.
+    package on the path) is non-fatal: falls back to
+    `_DEFAULT_MCP_TOOL_TIMEOUT_SECONDS`.
+
+    Scope (OPEN-E): this reads ONLY the mupot MCP server's own budget
+    (`self.server_name`, i.e. `extra["mcp_server"]`, default `"mupot"`) --
+    not any other MCP server's configured timeout, and not Hermes's own
+    global default MCP timeout if one exists. An operator running several
+    MCP servers with different budgets gets lease sizing based on the one
+    this adapter actually calls through.
     """
     try:
         from hermes_cli.config import load_config
@@ -1098,11 +1146,11 @@ def _configured_mcp_tool_timeout(server_name: str) -> float:
 
         raw_cfg = (load_config().get("mcp_servers") or {}).get(server_name)
         if not isinstance(raw_cfg, dict):
-            return 300.0
+            return _DEFAULT_MCP_TOOL_TIMEOUT_SECONDS
         cfg = _resolve_mcp_server_config(raw_cfg)
-        return float(cfg.get("timeout") or 30.0)
+        return float(cfg.get("timeout") or _DEFAULT_MCP_TOOL_TIMEOUT_SECONDS)
     except Exception:
-        return 300.0
+        return _DEFAULT_MCP_TOOL_TIMEOUT_SECONDS
 
 
 class HermesMCPClient:
@@ -1293,6 +1341,11 @@ class MupotAdapter(BasePlatformAdapter):
         # could ride in through it. The dead-line removal above is correct only
         # because of that scoping, not because the tree-wide grep is empty.
         self.server_name = str(extra.get("mcp_server") or "mupot")
+        # Round 3 (kasra re-gate BLOCK-C): set BEFORE the `mcp_tool_timeout`
+        # resolution below, which needs `self._profile_scope()` to read
+        # `_resolve_mcp_server_config` inside the correct (possibly
+        # multi-tenant) secret scope rather than the ambient process one.
+        self._secret_owner = secret_owner
         self.expected_agent_id = extra.get("expected_agent_id")
         self.expected_tenant = extra.get("expected_tenant")
         self.poll_interval = max(0.01, float(extra.get("poll_interval") or 2.0))
@@ -1335,18 +1388,80 @@ class MupotAdapter(BasePlatformAdapter):
         # `mcp_tool_timeout` in `extra` still wins when an operator wants to
         # size the lease against something other than the raw MCP client
         # timeout (e.g. a known-slower specific tool).
-        self.mcp_tool_timeout = max(
-            0.0,
-            float(
-                extra.get("mcp_tool_timeout")
-                or _configured_mcp_tool_timeout(self.server_name)
-            ),
+        #
+        # Round 3 (kasra re-gate BLOCK-C): only resolved from config (never
+        # called at all when `extra["mcp_tool_timeout"]` is already
+        # explicit) and, when it IS resolved, done inside `self._profile_
+        # scope()` -- `_configured_mcp_tool_timeout` -> `load_config()` ->
+        # `hermes_cli.mcp_config._resolve_mcp_server_config` loads secrets
+        # from `.env` into `os.environ` as a side effect (confirmed:
+        # `MUPOT_AGENT_TOKEN` appeared in `os.environ` after construction,
+        # even under `scripts/test.sh`'s own `unset MUPOT_AGENT_TOKEN ...`).
+        # Calling this OUTSIDE any profile scope reads the AMBIENT Hermes
+        # home (`~/.hermes`, not necessarily this adapter's own scoped
+        # `secret_owner`) and leaves whatever it loads sitting in
+        # `os.environ` permanently -- `HermesMCPClient._ensure_client`
+        # already gets this right via its own `_profile_scope()`; this
+        # constructor read was the one place that didn't.
+        explicit_mcp_tool_timeout = extra.get("mcp_tool_timeout")
+        if explicit_mcp_tool_timeout:
+            resolved_mcp_tool_timeout = explicit_mcp_tool_timeout
+        else:
+            with self._profile_scope():
+                resolved_mcp_tool_timeout = _configured_mcp_tool_timeout(self.server_name)
+        self.mcp_tool_timeout = max(0.0, float(resolved_mcp_tool_timeout))
+        minimum_safe_lease = (
+            self.turn_timeout + self.mcp_tool_timeout + _LEASE_SAFETY_MARGIN_SECONDS
         )
-        requested_lease = float(
-            extra.get("lease_seconds")
-            or (self.turn_timeout + self.mcp_tool_timeout + 60.0)
-        )
+        explicit_lease_seconds = extra.get("lease_seconds")
+        requested_lease = float(explicit_lease_seconds or minimum_safe_lease)
+        # OPEN-D (kasra re-gate round 3, 2026-09-15): the unconfigured
+        # default already computes `turn_timeout + mcp_tool_timeout +
+        # margin`, but an EXPLICIT `lease_seconds` in `extra` bypassed that
+        # arithmetic entirely and went straight to the `[1, 3600]` clamp
+        # below -- an operator (or a stale/copied config) could set a
+        # `lease_seconds` smaller than a legitimately-slow turn's own
+        # budget, reproducing the exact live incident this whole class of
+        # fix exists to close (the message's own visibility lease expiring
+        # before the turn could finish) on every single turn, not just an
+        # unlucky slow one. Clamp up rather than refuse construction --
+        # self-healing, consistent with this fix's whole "recover
+        # automatically" bias -- but log loudly: a smaller explicit value
+        # is silently discarded, and an operator who set it deliberately
+        # for some other reason needs to know it did not take effect.
+        if explicit_lease_seconds is not None and requested_lease < minimum_safe_lease:
+            logger.warning(
+                "[mupot] configured lease_seconds=%.1f is smaller than the safe "
+                "minimum turn_timeout(%.1f) + mcp_tool_timeout(%.1f) + "
+                "margin(%.1f) = %.1f; clamping up to the safe minimum instead "
+                "of honoring the smaller explicit value",
+                requested_lease,
+                self.turn_timeout,
+                self.mcp_tool_timeout,
+                _LEASE_SAFETY_MARGIN_SECONDS,
+                minimum_safe_lease,
+            )
+            requested_lease = minimum_safe_lease
         self.lease_seconds = max(1, min(3600, int(requested_lease)))
+        if self.lease_seconds < minimum_safe_lease:
+            # The [1, 3600] ceiling above is the server's own hard cap on a
+            # lease, not negotiable here -- but a `turn_timeout`/
+            # `mcp_tool_timeout` combination large enough to exceed it means
+            # the safety property this whole class of fix relies on
+            # (lease outlives the turn) cannot hold for this configuration.
+            # Nothing to clamp UP to any further; surface it loudly instead
+            # of leaving an operator to discover it via a live incident.
+            logger.warning(
+                "[mupot] lease_seconds=%s is capped at the server's 3600s "
+                "ceiling but turn_timeout(%.1f) + mcp_tool_timeout(%.1f) + "
+                "margin(%.1f) = %.1f exceeds it; a turn using its own full "
+                "budget may still outlive its own message lease",
+                self.lease_seconds,
+                self.turn_timeout,
+                self.mcp_tool_timeout,
+                _LEASE_SAFETY_MARGIN_SECONDS,
+                minimum_safe_lease,
+            )
         # Bound for _TurnFailureDeferred's class of defect (round 2,
         # 2026-09-15, see that class's docstring): a turn_timeout, a
         # no-custody handler result, or a handler exception -- ALL with the
@@ -1354,7 +1469,18 @@ class MupotAdapter(BasePlatformAdapter):
         # this many `delivery_attempts` (the server's own count, validated
         # non-negative-int elsewhere in this module), defer for natural
         # lease-driven redelivery; at it, ack + DLQ + commit, terminal.
-        self.max_delivery_attempts = max(1, int(extra.get("max_delivery_attempts") or 3))
+        #
+        # OPEN-D (kasra re-gate round 3, 2026-09-15): also clamped DOWN to
+        # `_SERVER_MAX_DELIVERY_ATTEMPTS` -- see that constant's own
+        # docstring for why a value above the server's own hard ceiling is
+        # dead configuration, not a bigger retry budget.
+        self.max_delivery_attempts = max(
+            1,
+            min(
+                _SERVER_MAX_DELIVERY_ATTEMPTS,
+                int(extra.get("max_delivery_attempts") or 3),
+            ),
+        )
         state_path = extra.get("state_path") or str(get_hermes_home() / "platforms" / "mupot" / "state.json")
         self.store = StateStore(Path(str(state_path)))
         loaded, state_valid = self.store.load_checked()
@@ -1365,7 +1491,6 @@ class MupotAdapter(BasePlatformAdapter):
             raise ValueError("routine_events_enabled must be a boolean")
         self.routine_events_enabled = routine_events_enabled
         self.message_injector = message_injector
-        self._secret_owner = secret_owner
         self._profile_owner_fingerprint = _profile_owner_fingerprint(secret_owner)
         self._state: dict[str, Any] = copy.deepcopy(loaded) if state_valid else {}
         loaded_reply_outbox = loaded.get("reply_outbox")
@@ -1448,9 +1573,7 @@ class MupotAdapter(BasePlatformAdapter):
             if isinstance(pending_message, dict)
             else ""
         )
-        self._legacy_pending_ambiguous = pending is not None and (
-            not pending_id or pending_id not in self._state["reply_outbox"]
-        )
+        self._legacy_pending_ambiguous = self._compute_legacy_pending_ambiguous()
         self._reply_reconciliation_required = any(
             not isinstance(record, dict)
             or record.get("status") == "reconciliation_required"
@@ -1473,6 +1596,19 @@ class MupotAdapter(BasePlatformAdapter):
             except MupotProtocolError:
                 self._reply_state_invalid = True
         self._log_stranded_notifications_at_startup()
+
+    def _profile_scope(self):
+        """Same shape as `HermesMCPClient._profile_scope`: a no-op context
+        when there is no scoped `secret_owner` (e.g. a unit test constructing
+        this adapter directly), or `self._secret_owner.activate()` otherwise.
+        Round 3 (kasra re-gate BLOCK-C): every read of `.env`/secret-bearing
+        config this constructor performs must go through this, not the
+        ambient process environment -- see the `mcp_tool_timeout` resolution
+        above for the incident this closes.
+        """
+        if self._secret_owner is None:
+            return nullcontext()
+        return self._secret_owner.activate()
 
     def stranded_notifications(self) -> list[dict[str, Any]]:
         """Notices parked in a terminal state that nothing else ever reconciles.
@@ -1565,7 +1701,12 @@ class MupotAdapter(BasePlatformAdapter):
             "required": True,
             "version": proof.get("version"),
             "attempt_id": proof.get("attempt_id"),
-            "connect_will_attempt_auto_reconcile": bool(self._lease_quarantined),
+            # Round 3 (kasra re-gate BLOCK-B): computed by the SAME
+            # predicate `connect()` uses to decide whether it reaches the
+            # reconcile attempt (`_is_lease_reconcile_reachable`), not a
+            # separate re-derivation of `_lease_quarantined` alone -- see
+            # that method's docstring for why the two must not drift.
+            "connect_will_attempt_auto_reconcile": self._is_lease_reconcile_reachable(),
         }
 
     def _log_stranded_notifications_at_startup(self) -> None:
@@ -1632,8 +1773,19 @@ class MupotAdapter(BasePlatformAdapter):
     @staticmethod
     def _lease_is_binding(turn_deadline: float, lease_deadline: Optional[float]) -> bool:
         """True when the message's own lease -- not `turn_timeout` -- is the
-        constraint that governs `min(turn_deadline, lease_deadline)`."""
-        return lease_deadline is not None and lease_deadline <= turn_deadline
+        constraint that governs `min(turn_deadline, lease_deadline)`.
+
+        OPEN-D (kasra re-gate round 3, 2026-09-15): strict `<`, not `<=`. At
+        an EXACT tie, classify as a TURN failure (`_TurnFailureDeferred`,
+        bounded by `delivery_attempts` and DLQ'd at the cap), not a lease
+        expiry (`_LeaseExpiredDeferred`, retried unboundedly by design --
+        see that class's own docstring). Neither reading is more "correct"
+        at an exact tie -- there is no way to know from here which deadline
+        would have fired first -- so this picks the side that fails
+        BOUNDED rather than the side that fails OPEN to unbounded
+        redelivery, same bias as everywhere else in this class of fix.
+        """
+        return lease_deadline is not None and lease_deadline < turn_deadline
 
     def _begin_delivery(
         self,
@@ -2179,6 +2331,65 @@ class MupotAdapter(BasePlatformAdapter):
             self._commit(source_id)
             self._mark_reply_complete(source_id)
 
+    def _compute_legacy_pending_ambiguous(self) -> bool:
+        """Is the CURRENT `self._state["pending"]` genuinely ambiguous crash
+        state (v1/legacy detection, pre-dating the v3 `lease_reconciliation`
+        marker)?
+
+        Round 3 (kasra re-gate BLOCK-B): this used to be computed exactly
+        once, in `__init__`, off the state loaded from disk at construction
+        time. That is stale the moment anything else in this process
+        mutates `self._state["pending"]` afterwards -- in particular,
+        `_reconcile_inbox_polling_with_active_scope`'s own terminal-tombstone
+        branch drops an unrelated, unstaged `pending` itself (see that
+        method: "nothing was consumed and nothing is waiting to be delivered
+        for the pending source ... drop it rather than leave it to fence a
+        future, unrelated crash as ambiguous") -- a real, existing "deferral
+        tombstone" that can explain away an ambiguous `pending` the
+        constructor saw. `connect()` re-calls this method AFTER attempting
+        that reconcile (not the cached `__init__`-time attribute) so a
+        tombstone applied during THIS `connect()` call is picked up
+        immediately, in the same call, rather than requiring a second
+        restart. `self._legacy_pending_ambiguous` (the cached attribute) is
+        left as the `__init__`-time snapshot for anything that wants to know
+        what was true when the adapter was constructed.
+        """
+        pending = self._state.get("pending")
+        pending_message = pending.get("message") if isinstance(pending, dict) else None
+        pending_id = (
+            str(pending_message.get("id") or "").strip()
+            if isinstance(pending_message, dict)
+            else ""
+        )
+        return pending is not None and (
+            not pending_id or pending_id not in self._state.get("reply_outbox", {})
+        )
+
+    def _is_lease_reconcile_reachable(self) -> bool:
+        """Would `connect()`, for CURRENT state, actually attempt the
+        `_lease_quarantined` auto-reconcile step?
+
+        Round 3 (kasra re-gate BLOCK-B): `lease_reconciliation_status()`'s
+        `connect_will_attempt_auto_reconcile` field used to be a bare
+        `bool(self._lease_quarantined)` -- true whenever a v3 marker
+        existed, regardless of whether an EARLIER `connect()` gate (reply
+        state invalid, Routine reconciliation required) would refuse first
+        and never let execution reach the reconcile attempt at all. That let
+        status report a self-heal as imminent when it structurally could not
+        run. This is the ONE function both `_connect_with_active_scope` and
+        `lease_reconciliation_status()` call, so the two can never drift out
+        of sync again -- reflects only the gates that run BEFORE the
+        reconcile attempt in `connect()`'s current order; deliberately does
+        NOT include `_legacy_pending_ambiguous`, which (same fix) now runs
+        AFTER the reconcile attempt, not before it.
+        """
+        return bool(self._lease_quarantined) and not (
+            self._reply_state_invalid
+            or self._reply_reconciliation_required
+            or self._routine_state_invalid
+            or self._routine_reconciliation_required
+        )
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if self._secret_owner is not None:
             try:
@@ -2200,11 +2411,7 @@ class MupotAdapter(BasePlatformAdapter):
         ):
             logger.error("[mupot] connect blocked; profile owner unavailable")
             return False
-        if (
-            self._reply_state_invalid
-            or self._legacy_pending_ambiguous
-            or self._reply_reconciliation_required
-        ):
+        if self._reply_state_invalid or self._reply_reconciliation_required:
             logger.error("[mupot] connect blocked; reply reconciliation required")
             return False
         if self._routine_state_invalid:
@@ -2215,7 +2422,20 @@ class MupotAdapter(BasePlatformAdapter):
                 "[mupot] connect blocked; Routine events are disabled with pending custody"
             )
             return False
-        if self._lease_quarantined:
+        # Round 3 (kasra re-gate BLOCK-B): the `_lease_quarantined` auto-
+        # reconcile attempt below used to run AFTER the legacy-pending-
+        # ambiguous check that used to be bundled into the first `if` above.
+        # A restart carrying BOTH a stale `pending` (ambiguous) AND a v3
+        # `lease_reconciliation` marker refused at the pending check and
+        # NEVER reached this block, so the marker's self-heal never got a
+        # chance to run even though `lease_reconciliation_status()` reported
+        # `connect_will_attempt_auto_reconcile: True` -- an operator fixing
+        # the pending ambiguity by hand would then hit a SECOND, separate
+        # manual-reconcile requirement that a prior restart could already
+        # have cleared on its own. Moved here, before the pending check, so
+        # the two failure classes are independent: this always gets its
+        # shot regardless of what the pending check below decides.
+        if self._is_lease_reconcile_reachable():
             # Class fix (2026-09-15): a `required: true` marker left by
             # `_LeaseExpiredDeferred`'s class of defect (or any other
             # genuinely-empty terminal tombstone -- see
@@ -2242,6 +2462,14 @@ class MupotAdapter(BasePlatformAdapter):
             logger.info(
                 "[mupot] inbox lease reconciliation cleared automatically at connect"
             )
+        # Re-evaluated live, not the `__init__`-time `self._legacy_pending_
+        # ambiguous` snapshot: the reconcile attempt just above can itself
+        # have cleared `pending` via its own terminal-tombstone branch (see
+        # `_compute_legacy_pending_ambiguous`'s docstring) in THIS call.
+        self._legacy_pending_ambiguous = self._compute_legacy_pending_ambiguous()
+        if self._legacy_pending_ambiguous:
+            logger.error("[mupot] connect blocked; reply reconciliation required")
+            return False
         try:
             require_supported_profile_runtime({})
             if self._running:
@@ -2718,11 +2946,12 @@ class MupotAdapter(BasePlatformAdapter):
                         # comment previously claimed the same for `_deliver`
                         # unconditionally, which is false) `_deliver` itself
                         # writes `pending` to durable state BEFORE it can raise
-                        # `_LeaseExpiredDeferred`/`_TurnFailureDeferred` -- both
-                        # of those raise sites explicitly clear `pending` back
-                        # (lease expiry) or leave it set on purpose (turn
-                        # failure, real crash-ambiguity; see each class's own
-                        # docstring) rather than never having written it at
+                        # `_LeaseExpiredDeferred`/`_TurnFailureDeferred` -- (round
+                        # 3, kasra re-gate BLOCK-A) both of those raise sites now
+                        # explicitly clear `pending` back to `None` before
+                        # raising, same invariant as every other
+                        # `_DeliveryDeferred` site (see each class's own
+                        # docstring), rather than never having written it at
                         # all. `_process_leased_message`'s own sender_policy DLQ
                         # branch and `_handle_ack_envelope`'s invalid_ack_envelope
                         # branch each write a DLQ row BEFORE reaching the ack
@@ -3071,10 +3300,11 @@ class MupotAdapter(BasePlatformAdapter):
             # `_poll_loop` releases and the server immediately redelivers --
             # an unbounded re-execution loop for a turn that will very
             # likely hang again (A/B measured 1 turn before this fix vs 11+
-            # and climbing). `pending` is left exactly as set above
-            # (unchanged): a hung handler may have taken real side effects,
-            # so this fences it for a human exactly like a genuine crash
-            # would, same as pre-fix.
+            # and climbing). Bounded here by `_resolve_turn_failure` instead,
+            # which (round 3, BLOCK-A) clears `pending` itself before
+            # deferring -- see that function's docstring for why a below-cap
+            # deferral is not the crash-ambiguity case `pending` exists to
+            # fence.
             await self._resolve_turn_failure(message, attempt_id, "turn_timeout")
             return
         self._invalidate_delivery(
@@ -3127,12 +3357,29 @@ class MupotAdapter(BasePlatformAdapter):
 
         See `_TurnFailureDeferred` for the full class rationale. Below
         `self.max_delivery_attempts`, defer for natural lease-driven
-        redelivery (raise, same shape as any `_DeliveryDeferred`; `pending`
-        is left untouched -- real crash-ambiguity, unlike a clean lease
-        expiry). At the cap, resolve it here and now: ack the source, DLQ it
-        with `kind` as the reason, log one WARNING, and commit -- terminal,
-        visible in `mupot_gateway_status`'s DLQ, never a durable quarantine
-        and never unbounded re-execution.
+        redelivery (raise, same shape as any `_DeliveryDeferred`).
+
+        Round 3 (kasra re-gate BLOCK-A): `pending` is not a side-effect
+        ledger -- it is the "a turn is running right now in this process"
+        record and NOTHING else. This raise, like every `_DeliveryDeferred`
+        raise site, means the turn is no longer running in this process, so
+        `pending` MUST be cleared here, same as the lease-expiry sites
+        above. Leaving it set (the pre-round-3 behavior, on the theory that
+        a hung handler might have taken real side effects worth fencing for
+        a human) instead reproduced the exact durable-brick shape this
+        whole fix exists to close: the next restart reads a stale `pending`
+        as `_legacy_pending_ambiguous` and `connect()` refuses forever,
+        because nothing about a below-cap deferral is actually "ambiguous"
+        -- `delivery_attempts` (the server's count, not local state) already
+        tracks how many times this has been tried, and the lease that will
+        expire and trigger redelivery is what makes this bounded. Crash
+        ambiguity -- the process dying mid-turn with no raise at all -- is
+        the only case `_legacy_pending_ambiguous` needs to catch, and this
+        is not that case: this function's own raise IS the proof the turn
+        ended cleanly enough to reach this line. At the cap, resolve it here
+        and now: ack the source, DLQ it with `kind` as the reason, log one
+        WARNING, and commit -- terminal, visible in `mupot_gateway_status`'s
+        DLQ, never a durable quarantine and never unbounded re-execution.
         """
         message_id = str(message.get("id") or "")
         raw_attempts = message.get("delivery_attempts")
@@ -3146,6 +3393,7 @@ class MupotAdapter(BasePlatformAdapter):
                 attempts,
                 self.max_delivery_attempts,
             )
+            self._state["pending"] = None
             self.store.save(self._state)
             raise _TurnFailureDeferred(message_id, kind)
         logger.warning(

@@ -107,7 +107,7 @@ class _LiveDelivery:
     source: Mapping[str, Any]
     # None if the message carried no server lease_expires_at. Kept apart from
     # `expires_at` (min of turn+lease) so `_deliver` can tell which fired --
-    # see `_LeaseExpiredDeferred`.
+    # see `_DeliveryDeferred`.
     lease_deadline: Optional[float] = None
     completion_event: asyncio.Event = field(default_factory=asyncio.Event)
     outcome: Optional[ProcessingOutcome] = None
@@ -212,18 +212,43 @@ class _EstopDeferred(Exception):
     """
 
 
-class _LeaseExpiredDeferred(_EstopDeferred):
-    """A leased message's own lease expired mid-delivery -- not a violation.
+class _DeliveryDeferred(_EstopDeferred):
+    """A turn ended without custody -- not a violation.
 
     2026-09-15 incident: `_deliver` used to return silently on expiry, so
     `_poll_loop`'s "message not in processed" read that as a violation and
     durably quarantined `connect()` forever. Same temporal-condition class as
     `_EstopDeferred` (subclassed here for that reason): the poll loop's and
     `reconcile_inbox_polling`'s existing `except _EstopDeferred:` clauses
-    catch this for free and let the lease expire for natural redelivery. A
-    turn timeout with a still-LIVE lease is explicitly NOT this class -- see
-    `_deliver`'s post-timeout branch.
+    catch this for free and let the lease expire for natural redelivery.
+
+    Round 2 (Athena BLOCK, PR #11, 2026-09-15): the PR's OWN shipped 17:06
+    incident fixture proved a second, un-fixed instance of the exact same
+    class -- `lease_expires_at` 41s AFTER the quarantine snapshot's own
+    mtime, i.e. the lease was still LIVE when `turn_timeout` (300s, smaller
+    than `lease_seconds`) fired first. A turn timeout with a still-live
+    lease is "turn ended without custody" exactly as much as a lease expiry
+    is: neither ever produced a reply, neither should ever be read as a
+    protocol violation. `reason` (`"lease_expired"` or `"turn_timeout"`)
+    records which fired, for logging only -- both are handled identically:
+    no ack, no processed mark, no durable marker; the message's own
+    visibility lease (still running either way) is left to expire so Mupot
+    redelivers it, and the pot's own reaper dead-letters at the server's
+    MAX_DELIVERY_ATTEMPTS if this repeats (local attempt bounding is a
+    separate, explicitly out-of-scope concern -- issue #10).
     """
+
+    def __init__(self, message_id: str, *, reason: str = "lease_expired") -> None:
+        super().__init__(message_id)
+        if reason not in {"lease_expired", "turn_timeout"}:
+            raise ValueError(f"unknown _DeliveryDeferred reason: {reason!r}")
+        self.reason = reason
+
+
+# Back-compat alias: earlier rounds of this fix (and their tests) named this
+# class for its original, narrower scope (lease expiry only). Same class --
+# `isinstance`/`pytest.raises(_LeaseExpiredDeferred)` still work unchanged.
+_LeaseExpiredDeferred = _DeliveryDeferred
 
 
 def _protocol_error() -> MupotProtocolError:
@@ -1166,20 +1191,43 @@ class MupotAdapter(BasePlatformAdapter):
         # could ride in through it. The dead-line removal above is correct only
         # because of that scoping, not because the tree-wide grep is empty.
         self.server_name = str(extra.get("mcp_server") or "mupot")
+        # P1-5 (Athena gate, PR #11 round 2, 2026-09-15 -- verbatim repeat of
+        # PR #9 round 3's BLOCK-C): set BEFORE the lease_seconds resolution
+        # below, which needs `self._profile_scope()` to read
+        # `_configured_mcp_tool_timeout` inside the correct secret scope
+        # instead of the ambient process one (see that method's docstring).
+        self._secret_owner = secret_owner
         self.expected_agent_id = extra.get("expected_agent_id")
         self.expected_tenant = extra.get("expected_tenant")
         self.poll_interval = max(0.01, float(extra.get("poll_interval") or 2.0))
         self.rpc_timeout = max(5.0, float(extra.get("rpc_timeout") or 20.0))
         self.turn_timeout = max(10.0, float(extra.get("turn_timeout") or 300.0))
         self.cancel_timeout = max(0.01, float(extra.get("cancel_timeout") or 6.0))
-        requested_lease = float(
-            extra.get("lease_seconds")
-            or (
-                self.turn_timeout
-                + _configured_mcp_tool_timeout(self.server_name)
-                + 60.0
-            )
-        )
+        explicit_lease_seconds = extra.get("lease_seconds")
+        if explicit_lease_seconds:
+            requested_lease = float(explicit_lease_seconds)
+        else:
+            # Item 5's formula itself is unchanged (and, after the turn-timeout
+            # deferral above, no longer load-bearing for the incident this PR
+            # closes -- a live lease no longer needs to physically outlast
+            # `turn_timeout` for `_deliver` to defer safely). Only HOW the
+            # configured MCP tool timeout is read is fixed here:
+            # `_configured_mcp_tool_timeout` -> `_resolve_mcp_server_config`
+            # loads `.env` into `os.environ` as a side effect whenever no
+            # secret scope is active (its documented fallback for callers
+            # without scope support). Calling it unscoped here read the
+            # AMBIENT Hermes home instead of this adapter's own scoped
+            # `secret_owner` and leaked whatever it loaded into `os.environ`
+            # permanently, on every single construction -- `HermesMCPClient.
+            # _ensure_client` already gets this right via its own
+            # `_profile_scope()`; this constructor read was the one place
+            # that didn't.
+            with self._profile_scope():
+                requested_lease = (
+                    self.turn_timeout
+                    + _configured_mcp_tool_timeout(self.server_name)
+                    + 60.0
+                )
         self.lease_seconds = max(1, min(3600, int(requested_lease)))
         state_path = extra.get("state_path") or str(get_hermes_home() / "platforms" / "mupot" / "state.json")
         self.store = StateStore(Path(str(state_path)))
@@ -1191,7 +1239,8 @@ class MupotAdapter(BasePlatformAdapter):
             raise ValueError("routine_events_enabled must be a boolean")
         self.routine_events_enabled = routine_events_enabled
         self.message_injector = message_injector
-        self._secret_owner = secret_owner
+        # self._secret_owner was already set above, before the lease_seconds
+        # resolution -- see the P1-5 comment there.
         self._profile_owner_fingerprint = _profile_owner_fingerprint(secret_owner)
         self._state: dict[str, Any] = copy.deepcopy(loaded) if state_valid else {}
         loaded_reply_outbox = loaded.get("reply_outbox")
@@ -1290,6 +1339,19 @@ class MupotAdapter(BasePlatformAdapter):
                 self._reply_state_invalid = True
         self._log_stranded_notifications_at_startup()
 
+    def _profile_scope(self):
+        """Same shape as `HermesMCPClient._profile_scope`: a no-op context
+        when there is no scoped `secret_owner` (e.g. a unit test constructing
+        this adapter directly), or `self._secret_owner.activate()` otherwise.
+
+        Every read of `.env`/secret-bearing config this class performs must
+        go through this, not the ambient process environment -- see the
+        `lease_seconds` resolution in `__init__` (P1-5).
+        """
+        if self._secret_owner is None:
+            return nullcontext()
+        return self._secret_owner.activate()
+
     def stranded_notifications(self) -> list[dict[str, Any]]:
         """Notices parked in a terminal state that nothing else ever reconciles.
 
@@ -1333,6 +1395,17 @@ class MupotAdapter(BasePlatformAdapter):
             "required": marker is not None,
             "attempt_id": marker.get("attempt_id") if marker else None,
         }
+
+    def reply_reconciliation_required(self) -> bool:
+        """Whether a reply-outbox record needs operator reconciliation.
+
+        Item E (Athena gate, PR #11 round 2, 2026-09-15): `_reply_
+        reconciliation_required` already gated `connect()`, but nothing
+        surfaced it through `mupot_gateway_status` -- an operator had no way
+        to see this refusal reason without reading `connect()`'s own error
+        log line.
+        """
+        return self._reply_reconciliation_required
 
     def _log_stranded_notifications_at_startup(self) -> None:
         stranded = self.stranded_notifications()
@@ -1989,14 +2062,18 @@ class MupotAdapter(BasePlatformAdapter):
             logger.error("[mupot] connect blocked; profile owner unavailable")
             return False
         if self._lease_quarantined and not _estop_engaged():
-            # A durable lease marker (see `_LeaseExpiredDeferred`) is not a
+            # A durable lease marker (see `_DeliveryDeferred`) is not a
             # protocol violation: attempt one bounded self-heal BEFORE the
             # ambiguous-pending refusal below reads pre-reconcile state.
             # Every countercase leaves `_lease_quarantined` set and falls
             # through unchanged. Call the scoped variant directly -- already
             # inside the active secret scope here. Paused: skip the network
             # self-heal entirely (F3) -- fall to the loud refusal below.
-            await self._reconcile_inbox_polling_with_active_scope()
+            # `execute_leased=False` (P1-4, Athena gate, PR #11 round 2,
+            # 2026-09-15): this automatic call must never re-execute a turn
+            # -- only an operator's own explicit `reconcile_inbox_polling()`
+            # may process a still-`leased` attempt.
+            await self._reconcile_inbox_polling_with_active_scope(execute_leased=False)
         if (
             self._reply_state_invalid
             or self._legacy_pending_ambiguous
@@ -2190,6 +2267,28 @@ class MupotAdapter(BasePlatformAdapter):
         )
         logger.error("[mupot] inbox polling quarantined; reconciliation required")
 
+    def _reply_staged_incomplete(self, message_id: str) -> bool:
+        """True when a non-complete reply record is staged for this message.
+
+        The ONE predicate every "safe to drop custody of this message"
+        call site must share (Athena F1, PR #11 round 2, 2026-09-15): before
+        this fix, `_staged_reply_blocks_reconcile`'s self-heal check and the
+        `_deliver` deferral sites (lease expiry, and now turn timeout with a
+        live lease) asked DIFFERENT questions and disagreed -- the deferral
+        sites used the narrower `_has_validated_reply_receipt` (status in
+        {sent, custodied, complete} + a receipt), so a "prepared"
+        (never-transmitted) staged reply did NOT block clearing `pending`,
+        while `reconcile_inbox_polling`'s self-heal treated that exact same
+        staged record as unsafe to drop. One process's deferral could clear
+        `pending` out from under a reply a background handler was still in
+        the middle of staging, then a later reconcile (this same process
+        restarting, or an operator) would see no `pending` to protect it and
+        self-heal past the still-staged, non-complete record. Both call
+        sites now ask this one question and agree on the answer.
+        """
+        staged = self._state.get("reply_outbox", {}).get(message_id)
+        return isinstance(staged, dict) and staged.get("status") != "complete"
+
     def _staged_reply_blocks_reconcile(self, state: str, attempt_id: str) -> bool:
         """Unsafe to drop pending: staged reply, wrong attempt, or unhandled ack."""
         pending = self._state.get("pending")
@@ -2206,8 +2305,7 @@ class MupotAdapter(BasePlatformAdapter):
             return True
         if state == "acked" and pending_id not in self._state.get("processed", []):
             return True
-        staged = self._state.get("reply_outbox", {}).get(pending_id)
-        return isinstance(staged, dict) and staged.get("status") != "complete"
+        return self._reply_staged_incomplete(pending_id)
 
     async def reconcile_inbox_polling(self) -> bool:
         """Reconcile a durable attempt through its authoritative server receipt."""
@@ -2220,7 +2318,9 @@ class MupotAdapter(BasePlatformAdapter):
                 return False
         return await self._reconcile_inbox_polling_with_active_scope()
 
-    async def _reconcile_inbox_polling_with_active_scope(self) -> bool:
+    async def _reconcile_inbox_polling_with_active_scope(
+        self, *, execute_leased: bool = True
+    ) -> bool:
         marker = _lease_reconciliation_proof(
             self._state.get("lease_reconciliation")
         )
@@ -2278,6 +2378,27 @@ class MupotAdapter(BasePlatformAdapter):
                 marker["attempt_id"],
                 marker,
             )
+            if outcome["state"] == "leased" and not execute_leased:
+                # P1-4 (Athena gate, PR #11 round 2, 2026-09-15): `connect()`'s
+                # OWN automatic self-heal call (see `_connect_with_active_scope`)
+                # passes `execute_leased=False` -- a still-`leased` attempt is
+                # NOT a clean tombstone, it is exactly the "FENCED" case this
+                # whole marker exists to protect: the server is telling us the
+                # message may still be outstanding. Processing it here would
+                # re-execute an agent turn (and every network/egress call that
+                # implies) as a SIDE EFFECT of a supposedly bounded, safe
+                # `connect()` bootstrap call -- and still leaves `connect()`
+                # refusing below (nothing here changes `_lease_quarantined`).
+                # Leave the marker exactly as it was and let the operator's
+                # own explicit `reconcile_inbox_polling()` (unchanged,
+                # `execute_leased=True` by default) make that call on purpose.
+                logger.error(
+                    "[mupot] inbox reconciliation still fenced; attempt=%s is "
+                    "still leased server-side -- refusing to re-execute the "
+                    "turn from connect()'s automatic self-heal",
+                    marker["attempt_id"],
+                )
+                return False
             if outcome["state"] == "leased":
                 message = outcome["messages"][0]
                 try:
@@ -2461,7 +2582,29 @@ class MupotAdapter(BasePlatformAdapter):
                     )
                     try:
                         await self._process_leased_message(message, attempt_id=attempt_id)
-                    except _EstopDeferred as exc:
+                    except _DeliveryDeferred as exc:
+                        # Own clause, checked BEFORE the generic `_EstopDeferred`
+                        # clause below -- `_DeliveryDeferred` is a subclass, so
+                        # without this Python would match that one first and
+                        # this always logged "emergency stop" even when the
+                        # true cause was the message's own lease or turn
+                        # timeout (F4, then round 2: now covers both
+                        # `_DeliveryDeferred` reasons, not just lease expiry).
+                        cause = (
+                            "its own lease expired"
+                            if exc.reason == "lease_expired"
+                            else "its own turn_timeout with a still-live lease"
+                        )
+                        logger.info(
+                            "[mupot] deferring leased message=%s mid-poll: %s; "
+                            "leaving lease to expire for redelivery",
+                            message_id,
+                            cause,
+                        )
+                        self._clear_lease_fence()
+                        await asyncio.sleep(self.poll_interval)
+                        continue
+                    except _EstopDeferred:
                         # The e-stop engaged between this iteration's pre-lease check
                         # above and the message actually being handled (a narrow race,
                         # not the common case, but the SAME class: a pause is never a
@@ -2478,19 +2621,12 @@ class MupotAdapter(BasePlatformAdapter):
                         # genuine protocol violation left dangling) and let the
                         # server-side lease expire on its own so `inbox_lease`
                         # redelivers the exact same message once `hermes resume` lifts
-                        # the pause. F4: this catch also absorbs `_LeaseExpiredDeferred`
-                        # (a subclass) -- log the true cause instead of always naming
-                        # the e-stop.
-                        cause = (
-                            "its own lease expired"
-                            if isinstance(exc, _LeaseExpiredDeferred)
-                            else "Hermes global emergency stop is engaged"
-                        )
+                        # the pause.
                         logger.info(
                             "[mupot] deferring leased message=%s mid-poll: %s; "
                             "leaving lease to expire for redelivery",
                             message_id,
-                            cause,
+                            "Hermes global emergency stop is engaged",
                         )
                         self._clear_lease_fence()
                         await asyncio.sleep(self.poll_interval)
@@ -2757,14 +2893,14 @@ class MupotAdapter(BasePlatformAdapter):
         self.store.save(self._state)
         event, runtime = self._begin_delivery(message, attempt_id=attempt_id)
         if self._expire_if_needed(runtime):
-            # Pre-turn lease expiry (site 1 of 2, see `_LeaseExpiredDeferred`):
+            # Pre-turn lease expiry (site 1 of 2, see `_DeliveryDeferred`):
             # never ack, never mark processed, never quarantine -- leave the
             # lease to expire naturally so Mupot redelivers.
             logger.warning("[mupot] deferring expired leased message=%s", message_id)
-            if not self._has_validated_reply_receipt(message_id):
+            if not self._reply_staged_incomplete(message_id):
                 self._state["pending"] = None
             self.store.save(self._state)
-            raise _LeaseExpiredDeferred(message_id)
+            raise _DeliveryDeferred(message_id, reason="lease_expired")
         token = _delivery_context.set(runtime.context)
         try:
             await self.handle_message(event)
@@ -2789,16 +2925,26 @@ class MupotAdapter(BasePlatformAdapter):
             await self._cancel_delivery_processing(runtime)
             self.store.save(self._state)
             raise
-        if lease_expired:
-            # Post-timeout lease expiry (site 2 of 2): the message's OWN
-            # lease fired, not `turn_timeout`. A turn timeout with a
-            # still-live lease falls through unchanged (base behaviour).
+        if timed_out:
+            # Post-timeout deferral (site 2 of 2): the turn ended without
+            # custody either way -- the message's OWN lease fired
+            # (`lease_expired`), or `turn_timeout` fired first while that
+            # lease was still live (Athena BLOCK, PR #11 round 2,
+            # 2026-09-15: the PR's own 17:06 fixture is exactly this shape --
+            # `lease_expires_at` 41s after the quarantine snapshot's mtime).
+            # Same handling regardless of which fired: no ack, no processed
+            # mark, no durable marker; release this delivery and let the
+            # message's lease (still running for the turn_timeout case) run
+            # out naturally so Mupot redelivers -- the pot's own reaper
+            # dead-letters at MAX_DELIVERY_ATTEMPTS if this recurs (local
+            # attempt bounding stays issue #10, not added here).
             await self._cancel_delivery_processing(runtime)
-            if not self._has_validated_reply_receipt(message_id):
+            if not self._reply_staged_incomplete(message_id):
                 self._state["pending"] = None
             self.store.save(self._state)
-            raise _LeaseExpiredDeferred(message_id)
-        if timed_out or runtime.invalidated and runtime.outcome != ProcessingOutcome.SUCCESS:
+            reason = "lease_expired" if lease_expired else "turn_timeout"
+            raise _DeliveryDeferred(message_id, reason=reason)
+        if runtime.invalidated and runtime.outcome != ProcessingOutcome.SUCCESS:
             await self._cancel_delivery_processing(runtime)
             self.store.save(self._state)
             return
@@ -3210,6 +3356,7 @@ def register(
                 "stranded_notifications": adapter.stranded_notifications(),
                 "lease_reconciliation": adapter.lease_reconciliation_status(),
                 "invalid_reply_receipts": adapter.invalid_reply_receipts(),
+                "reply_reconciliation_required": adapter.reply_reconciliation_required(),
             }
         return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
 

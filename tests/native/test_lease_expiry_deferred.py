@@ -1,4 +1,4 @@
-"""Lease expiry is a deferral, not a violation (2026-09-15 minimal fix).
+"""A turn ending without custody is a deferral, not a violation.
 
 Live incident (4 bricks, 2026-09-15, master 6c86c2b0): a turn outlives the
 lease -> `_deliver` returns silently at either expiry checkpoint ->
@@ -7,12 +7,24 @@ lease -> `_deliver` returns silently at either expiry checkpoint ->
 refuses `connect()` across every subsequent restart, because nothing ever
 called `reconcile_inbox_polling()` for it.
 
-Covers items 1-6 of the minimal fix through the REAL `_poll_loop`/`connect()`/
-`reconcile_inbox_polling()` machinery wherever practical -- direct method
-calls only where a full poll-loop drive would duplicate existing coverage
-(see tests/native/test_lease_attempt_reconciliation.py, unchanged) or depend
-on Hermes internals outside this module's scope (turn_timeout/handler_error
-bounding -- explicitly NOT this PR's class).
+Round 2 (Athena BLOCK, 2026-09-15): round 1's fix covered only the message's
+OWN lease expiring. Athena executed the class against this PR's OWN shipped
+17:06 incident fixture and found a SECOND, un-fixed instance of it:
+`turn_timeout` firing first while that same lease was still live is "turn
+ended without custody" exactly the same way -- round 1 explicitly declared it
+out of scope ("keeps base behaviour"), but master and round 1 are IDENTICAL
+on that branch, and it is what the 17:06 fixture actually shows. Both
+deferral reasons (`lease_expired`, `turn_timeout` -- see `_DeliveryDeferred`)
+are covered here now.
+
+Covers items 1-6 of the minimal fix (plus the turn_timeout branch above)
+through the REAL `_poll_loop`/`connect()`/`reconcile_inbox_polling()`
+machinery wherever practical -- direct method calls only where a full
+poll-loop drive would duplicate existing coverage (see
+tests/native/test_lease_attempt_reconciliation.py, unchanged) or depend on
+Hermes internals outside this module's scope (handler_error bounding --
+explicitly NOT this PR's class; local delivery-attempt bounding -- issue #10,
+also explicitly not this PR's class, the pot's own reaper bounds instead).
 """
 
 from __future__ import annotations
@@ -34,6 +46,7 @@ from plugin.mupot_gateway.adapter import (
     MupotAdapter,
     MupotProtocolError,
     StateStore,
+    _DeliveryDeferred,
     _LeaseExpiredDeferred,
     _configured_mcp_tool_timeout,
     _final_request_id,
@@ -391,23 +404,81 @@ async def test_pre_turn_expiry_preserves_pending_when_a_reply_is_staged(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_turn_timeout_with_live_lease_keeps_base_behaviour(tmp_path: Path) -> None:
-    """Out of this class by design (see `_LeaseExpiredDeferred`'s docstring):
-    a plain turn timeout while the message's own lease is still live must
-    NOT raise the deferral -- it keeps returning, pending intact, exactly as
-    on master today."""
+async def test_turn_timeout_with_live_lease_defers_not_returns(tmp_path: Path) -> None:
+    """Round 2 (Athena BLOCK on PR #11, 2026-09-15): this branch was
+    explicitly OUT of round 1's class ("keeps base behaviour" -- returns
+    silently, pending intact) -- but the PR's OWN shipped 17:06 incident
+    fixture (`tests/fixtures/state.json.bak-quarantine-20260915170649`) is
+    exactly this shape: `lease_expires_at` 41s AFTER the quarantine
+    snapshot's own mtime, i.e. `turn_timeout` (300s, smaller than
+    `lease_seconds`) fired first while the lease was still live. Master and
+    round 1 are IDENTICAL there: `_deliver` returns silently ->
+    `_poll_loop`'s "message not in processed" reads that as a protocol
+    violation -> durable quarantine. Turn ended without custody is turn
+    ended without custody regardless of which deadline fired -- this must
+    now defer, the same as a lease expiry, not silently return."""
     state_path = tmp_path / "state.json"
-    adapter = make_adapter(state_path, object(), turn_timeout=0.05)
+    adapter = make_adapter(state_path, object())
+    # __init__ floors turn_timeout at 10.0 -- set it directly, post-construction,
+    # to get a genuinely short timeout for this test (same technique
+    # test_adapter.py's own turn-timeout tests already use).
+    adapter.turn_timeout = 0.05
 
     async def handler(_event: Any) -> None:
         await asyncio.Event().wait()
 
     adapter.set_message_handler(handler)
-    await adapter._deliver(message_at("msg-1", 1, far_future()))  # no raise
+    with pytest.raises(_DeliveryDeferred) as exc_info:
+        await adapter._deliver(message_at("msg-1", 1, far_future()))
+    assert exc_info.value.reason == "turn_timeout"
 
     state = StateStore(state_path).load()
-    assert state["pending"]["message"]["id"] == "msg-1"
+    assert state["pending"] is None  # no reply staged for it -- safe to clear
+    assert state.get("lease_reconciliation") is None  # never quarantined
     await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_turn_timeout_with_live_lease_defers_then_redelivers_and_completes_once(
+    tmp_path: Path,
+) -> None:
+    """The same class, through the REAL `_poll_loop`/redelivery machinery
+    (not just a direct `_deliver` call) -- the end-to-end proof the
+    lease-expiry siblings above already have. Mirrors the PR's own shipped
+    17:06 fixture's shape: the lease stays live throughout, `turn_timeout`
+    is what fires."""
+    state_path = tmp_path / "state.json"
+    client = RedeliveringLeaseClient([(far_future(), 1), (far_future(), 2)])
+    adapter = make_adapter(state_path, client)
+    # __init__ floors turn_timeout at 10.0 -- set it directly, post-
+    # construction, so the FIRST delivery attempt's turn_timeout genuinely
+    # fires (short) well before its handler ever resolves and lets
+    # `on_processing_complete` set `completion_event` on its own.
+    adapter.turn_timeout = 0.05
+    handled: list[str] = []
+    stuck = asyncio.Event()
+
+    async def handler(event: Any) -> None:
+        handled.append(event.message_id)
+        if len(handled) == 1:
+            await stuck.wait()  # outlive turn_timeout while the lease stays live
+            return
+        await adapter.send(event.source.chat_id, "ok")
+
+    adapter.set_message_handler(handler)
+    assert await adapter.connect() is True
+    try:
+        await wait_until(lambda: client.lease_calls >= 2)
+        stuck.set()
+        await wait_until(lambda: "msg-1" in StateStore(state_path).load().get("processed", []))
+    finally:
+        stuck.set()
+        await adapter.disconnect()
+
+    state = StateStore(state_path).load()
+    assert "msg-1" in state["processed"]
+    assert state.get("lease_reconciliation") is None  # never quarantined
+    assert len(client.acked_attempt_ids) == 1  # deferral itself never acked; redelivery did once
 
 
 # ---------------------------------------------------------------------------

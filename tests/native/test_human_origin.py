@@ -1100,3 +1100,118 @@ def test_session_end_hook_drops_records_via_the_real_session_id_kwarg_shape():
     )
     assert _peek(session_key, "T1") is None
     assert len(human_origin._STASH) == 0
+
+
+# ---------------------------------------------------------------------------
+# Round 7 item 1 (kasra-review round-6 P1): tool_call_id is model-supplied,
+# never trusted for identity -- no idempotent re-entry for a repeated id.
+# ---------------------------------------------------------------------------
+
+def test_real_dispatcher_repeated_same_tool_call_id_in_one_turn_is_stripped_p1():
+    """Through the real hermes_cli.plugins dispatcher: a model steered to
+    emit the SAME tool_call_id on two DISTINCT task_verdict calls in one turn
+    must not get the human's identity stamped on both -- tool_call_id is not
+    an identity Hermes itself mints and verifies."""
+    from hermes_cli import plugins as hermes_plugins
+
+    store = _FakeSessionStore()
+    source = _telegram_source()
+    human_origin.capture_human_origin(
+        event=_telegram_event(source, text="approve f9408956"), gateway=None, session_store=store,
+    )
+    session_key = store._generate_session_key(source)
+    human_origin.set_mcp_server_name("mupot")
+
+    manager = hermes_plugins.PluginManager(scope_key="test-human-origin-r7-repeated-id")
+    manager._hooks = {
+        "pre_llm_call": [human_origin.bind_turn_custody],
+        "pre_tool_call": [human_origin.stamp_tool_call],
+    }
+
+    tokens = set_session_vars(session_key=session_key)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(hermes_plugins, "_delivery_manager", lambda: manager)
+            hermes_plugins.invoke_hook(
+                "pre_llm_call", session_id="db-sess-6", task_id="t", turn_id="T-repeated-id",
+                user_message="approve f9408956", conversation_history=[], is_first_turn=True,
+                model="gpt-4", platform="telegram", parent_session_id="", sender_id="765204057",
+            )
+            first_block, first_args = hermes_plugins._dispatch_pre_tool_call_hooks(
+                "task_verdict", {"task_id": "f9408956", "verdict": "approve"},
+                task_id="", session_id="", tool_call_id="TC-SAME", turn_id="T-repeated-id",
+                api_request_id="", middleware_trace=[],
+            )
+            second_block, second_args = hermes_plugins._dispatch_pre_tool_call_hooks(
+                "task_verdict", {"task_id": "DIFFERENT-TASK", "verdict": "approve"},
+                task_id="", session_id="", tool_call_id="TC-SAME", turn_id="T-repeated-id",
+                api_request_id="", middleware_trace=[],
+            )
+    finally:
+        clear_session_vars(tokens)
+
+    assert first_block is None
+    assert first_args["human_origin"]["user_id"] == "765204057"
+    assert second_block is None
+    assert second_args is None  # the repeated id got nothing, not a second copy
+
+
+# ---------------------------------------------------------------------------
+# Round 7 item 5 (kasra-review round-6): register() must refuse a runtime
+# whose VALID_HOOKS doesn't include what this module depends on.
+# ---------------------------------------------------------------------------
+
+def test_register_succeeds_against_the_real_current_valid_hooks():
+    """Sanity/positive case: the pinned Hermes checkout this suite runs
+    against DOES declare pre_llm_call and post_tool_call in VALID_HOOKS, so
+    register() must not spuriously refuse against the real runtime."""
+    calls = []
+
+    class Ctx:
+        def register_hook(self, name, callback):
+            calls.append(name)
+
+    human_origin.register(Ctx())
+    assert "post_tool_call" in calls
+    assert "pre_llm_call" in calls
+
+
+def test_register_refuses_when_runtime_valid_hooks_lacks_post_tool_call(monkeypatch, caplog):
+    """kasra-review round-6 item 5: an older runtime whose VALID_HOOKS predates
+    post_tool_call would otherwise accept register_hook("post_tool_call", ...)
+    as a silent, callable-shaped no-op that is simply never invoked --
+    quietly reverting round 6's fix to round 5's premature-consumption defect
+    with no signal at all. register() must refuse outright instead."""
+    from hermes_cli import plugins as hermes_plugins
+
+    monkeypatch.setattr(
+        hermes_plugins, "VALID_HOOKS",
+        {"pre_gateway_dispatch", "pre_llm_call", "pre_tool_call", "on_session_reset", "on_session_end"},
+    )
+
+    class Ctx:
+        def register_hook(self, name, callback):
+            pass
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError):
+            human_origin.register(Ctx())
+    assert any("VALID_HOOKS" in r.message for r in caplog.records)
+
+
+def test_register_refuses_when_runtime_valid_hooks_lacks_pre_llm_call(monkeypatch, caplog):
+    from hermes_cli import plugins as hermes_plugins
+
+    monkeypatch.setattr(
+        hermes_plugins, "VALID_HOOKS",
+        {"pre_gateway_dispatch", "pre_tool_call", "post_tool_call", "on_session_reset", "on_session_end"},
+    )
+
+    class Ctx:
+        def register_hook(self, name, callback):
+            pass
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError):
+            human_origin.register(Ctx())
+    assert any("VALID_HOOKS" in r.message for r in caplog.records)

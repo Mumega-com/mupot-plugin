@@ -181,7 +181,15 @@ from `mupot_gateway/adapter.py`'s `register()`, only when `native_gateway_enable
 Registration fails **closed**: a Hermes runtime whose `PluginContext` cannot `register_hook`
 (or whose hook registration itself raises) gets no native-gateway registration at all — there
 is no other choke point in this plugin able to keep a model-supplied `human_origin` from
-reaching mupot verbatim.
+reaching mupot verbatim. Round 7 (kasra-review round-6 item 5) extends the same fail-closed
+posture one step earlier: when the runtime's own `hermes_cli.plugins.VALID_HOOKS` is
+introspectable, `register()` also refuses outright if it is missing `pre_llm_call` or
+`post_tool_call` — an older runtime would otherwise accept `register_hook("post_tool_call",
+...)` as a silent, callable-shaped no-op that is simply never invoked, quietly reverting round
+6's reserve/resolve fix back to round 5's premature-consumption defect with no signal at all.
+(When `VALID_HOOKS` cannot be introspected at all — not a real runtime shape, only this
+module's own test doubles — this extra check is skipped; the `register_hook`-callable check
+above is still the primary gate.)
 
 - `pre_gateway_dispatch` fires once per inbound message, straight off the platform adapter,
   before Hermes's own sender-authorization check runs. It is therefore this module's own
@@ -224,15 +232,22 @@ reaching mupot verbatim.
   stamping, but not to any other concurrent call) without removing it, and only `post_tool_call`
   (below) decides whether the reservation is actually spent. One human message still
   authenticates AT MOST one `task_verdict` call *that actually dispatches* — a call that never
-  reaches mupot no longer burns the credit. A model-supplied `human_origin` is stripped on
-  **every** tool that looks like it belongs to mupot at all (any `mcp__<configured mupot
-  server>__*` wire name once the server name is resolved — sanitized the same way Hermes
-  sanitizes one with punctuation in it — plus a small named fallback for a handful of other
-  decision-adjacent mupot tools while the server name is still unresolved, and the server name
-  itself is scoped per Hermes profile so two multiplexed profiles with different `mcp_server`
-  values can't clobber each other's resolution), and only ever *replaced* with the bound origin
-  for the one-tool stamp allowlist on an exact wire match with a turn that actually bound
-  something and a call carrying a `tool_call_id`.
+  reaches mupot no longer burns the credit. Round 7 (kasra-review round-6 P1): reservation is
+  **not** trusted to `tool_call_id` identity across repeat calls — round 6 briefly treated a
+  repeat call carrying the identical `tool_call_id` as an idempotent retry and handed the same
+  record out again, but `tool_call_id` rides in on the model's own tool-call output; Hermes does
+  not mint or verify it. A model steered to emit two DISTINCT `task_verdict` calls in one turn
+  could simply copy the same id onto both and get the human's identity stamped twice. Now, once a
+  record is reserved by anyone — same id or not — every further reservation attempt for that turn
+  is stripped until `post_tool_call` (below) explicitly releases it. A model-supplied
+  `human_origin` is stripped on **every** tool that looks like it belongs to mupot at all (any
+  `mcp__<configured mupot server>__*` wire name once the server name is resolved — sanitized the
+  same way Hermes sanitizes one with punctuation in it — plus a small named fallback for a
+  handful of other decision-adjacent mupot tools while the server name is still unresolved, and
+  the server name itself is scoped per Hermes profile so two multiplexed profiles with different
+  `mcp_server` values can't clobber each other's resolution), and only ever *replaced* with the
+  bound origin for the one-tool stamp allowlist on an exact wire match with a turn that actually
+  bound something and a call carrying a `tool_call_id`.
 - `post_tool_call` (round 6) fires once per tool dispatch outcome and resolves whatever
   reservation that call's `tool_call_id` holds: `status == "blocked"` (Hermes's own block gate,
   a guardrail, or a denied/erroring human-approval escalation — anything that stopped the call
@@ -240,15 +255,31 @@ reaching mupot verbatim.
   turn — a new `tool_call_id` — can reserve and stamp it again; any other status (`ok`, `error`,
   `cancelled`, …) is a genuine dispatch attempt and *permanently* consumes it — mupot has seen
   the field (or would have) either way. A non-governed tool, or a turn/call that never reserved
-  anything, is a no-op.
+  anything, is a no-op. **Known limitation (kasra-review round-6 item 4):** Hermes's own
+  `invoke_hook` skips a callback invocation entirely while a PRIOR invocation of that SAME
+  callback is still running (its own timeout/re-entrancy protection) — a slow `finalize_tool_call`
+  for one `tool_call_id` can therefore cause a concurrent `post_tool_call` for a DIFFERENT
+  `tool_call_id` to never fire at all, leaving that reservation permanently outstanding on its
+  own. This module does not solve that (it cannot, from inside one of the callbacks Hermes might
+  skip) — instead, the NEXT `pre_llm_call` on that session (round 7) scans for any reservation
+  left over from an earlier turn, drops it, and logs it at WARNING with reason
+  `stale_reservation`, exactly like any other burn — so the skipped-callback case leaves an
+  operator-visible signal instead of a silently immortal reservation.
 - `on_session_reset`/`on_session_end` drop any pending or bound record for a session the moment
   Hermes itself ends it, rather than relying solely on the TTL backstop.
 
-The stamped `human_origin` object also carries a `text` field (round 6): the human's own
-message, truncated to 2048 characters independently of what gets hashed for the bind-time
-equality check (the full text is always hashed). Mupot's server side requires the task id to
-appear in it, binding the stamp to the intent the human actually expressed, not just his
+The stamped `human_origin` object also carries a `text` field (round 6, sized in round 7): the
+human's own message, truncated to 4096 characters — Telegram's own maximum message length, so a
+legitimate full-length message is never truncated — independently of what gets hashed for the
+bind-time equality check (the full text is always hashed). Mupot's server side requires the task
+id to appear in it, binding the stamp to the intent the human actually expressed, not just his
 identity.
+
+`_OriginStash`'s internal lock (round 7, kasra-review round-6 P2) is an `RLock`, held for the
+full body of every mutating method — `capture`, `bind`, `peek_and_reserve`, `resolve`,
+`drop_session`, `clear` — not only `peek_and_reserve`/`resolve` as in round 6, so concurrent tool
+dispatch cannot double-spend a reservation AND concurrent captures/binds cannot race the
+underlying pending/bound dicts either.
 
 Only Telegram is supported today. Every other platform is a recorded, not silent, gap: the
 first inbound message on an unsupported platform logs one INFO line naming it, and every

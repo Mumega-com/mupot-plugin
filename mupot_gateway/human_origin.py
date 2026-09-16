@@ -242,8 +242,10 @@ _CAPTURE_TTL_SECONDS = 120.0
 # INTENT the human expressed, not just his identity. Capped independently of
 # what gets hashed for the bind-time equality check (the FULL text is always
 # hashed) -- this bound only limits how much of a long message rides along in
-# the stamped payload.
-_MAX_STAMPED_TEXT_CHARS = 2048
+# the stamped payload. 4096 (round 7, kasra-review round-6 item 3): Telegram's
+# OWN maximum message length, so a legitimate full-length message is never
+# truncated in the field mupot's server checks the task id against.
+_MAX_STAMPED_TEXT_CHARS = 4096
 
 _WARNED_UNSUPPORTED_PLATFORMS: set[str] = set()
 
@@ -319,6 +321,26 @@ class _OriginStash:
     error, mupot has now seen the field or would have). One human message still
     authenticates AT MOST one ``task_verdict`` call THAT ACTUALLY DISPATCHES;
     a call that never reaches mupot no longer burns the credit.
+
+    Round 7 (kasra-review round-6 P1): ``peek_and_reserve`` used to grant the
+    SAME record again to a repeat call carrying the identical ``tool_call_id``
+    ("idempotent re-entry"), reasoning that a genuine hook re-dispatch or retry
+    would reuse its own id. But ``tool_call_id`` is not an identity Hermes
+    itself mints and verifies -- it rides in on the model's own tool-call
+    output, so nothing stops a model steered to emit two DISTINCT
+    ``task_verdict`` calls in one turn from simply copying the same id onto
+    both, exploiting the "same id" allowance to get the human's identity
+    stamped on a second, forged call. ``peek_and_reserve`` no longer trusts
+    ``tool_call_id`` for identity at all: once a record is reserved by ANYONE,
+    every further ``peek_and_reserve`` for that ``(session_key, turn_id)`` --
+    same id or not -- returns ``None`` until ``resolve(spent=False)`` releases
+    it. Also round 7: every mutator (``capture``, ``bind``, ``drop_session``,
+    ``clear``) now holds :attr:`_lock` for its full body, not just
+    ``peek_and_reserve``/``resolve``/``bind``'s final write -- concurrent tool
+    dispatch already needed serialized reserve/resolve (kasra-review round-6
+    P2); a concurrent capture/bind racing the SAME underlying dicts needed it
+    too. ``_lock`` is an ``RLock`` so ``bind()``'s single top-level acquisition
+    covers its own internal writes without a second, nested acquisition.
     """
 
     def __init__(
@@ -338,7 +360,11 @@ class _OriginStash:
         # tool_call_id currently holding this record for stamping, or None
         # when it is available to be reserved by the next pre_tool_call.
         self._bound: "OrderedDict[tuple[str, str], tuple[float, dict[str, Any], Optional[str]]]" = OrderedDict()
-        self._lock = threading.Lock()
+        # RLock (round 7, kasra-review round-6 P2), not a plain Lock: bind()
+        # acquires it once for its ENTIRE body (drain + write), so a plain
+        # Lock would deadlock on bind()'s own re-entry into the section that
+        # used to be a second, nested `with self._lock:`.
+        self._lock = threading.RLock()
 
     def _expired(self, stamped_at: float) -> bool:
         return (time.monotonic() - stamped_at) > self._ttl_seconds
@@ -348,27 +374,28 @@ class _OriginStash:
     ) -> None:
         if not session_key:
             return
-        dq = self._pending.setdefault(session_key, deque())
-        dq.append((time.monotonic(), dict(record)))
-        self._pending_count += 1
-        while len(dq) > self._max_pending_per_session:
-            _, evicted = dq.popleft()
-            self._pending_count -= 1
-            if evict_callback is not None:
-                evict_callback(evicted, "capture_overflow_session")
-        if not dq:
-            self._pending.pop(session_key, None)
-        else:
-            self._pending.move_to_end(session_key)
-        while self._pending_count > self._max_pending_total and self._pending:
-            oldest_session, oldest_dq = next(iter(self._pending.items()))
-            if oldest_dq:
-                _, evicted = oldest_dq.popleft()
+        with self._lock:
+            dq = self._pending.setdefault(session_key, deque())
+            dq.append((time.monotonic(), dict(record)))
+            self._pending_count += 1
+            while len(dq) > self._max_pending_per_session:
+                _, evicted = dq.popleft()
                 self._pending_count -= 1
                 if evict_callback is not None:
-                    evict_callback(evicted, "capture_overflow_global")
-            if not oldest_dq:
-                self._pending.pop(oldest_session, None)
+                    evict_callback(evicted, "capture_overflow_session")
+            if not dq:
+                self._pending.pop(session_key, None)
+            else:
+                self._pending.move_to_end(session_key)
+            while self._pending_count > self._max_pending_total and self._pending:
+                oldest_session, oldest_dq = next(iter(self._pending.items()))
+                if oldest_dq:
+                    _, evicted = oldest_dq.popleft()
+                    self._pending_count -= 1
+                    if evict_callback is not None:
+                        evict_callback(evicted, "capture_overflow_global")
+                if not oldest_dq:
+                    self._pending.pop(oldest_session, None)
 
     def bind(
         self, session_key: str, turn_id: str, *, sender_id: str, text_sha256: str,
@@ -383,57 +410,85 @@ class _OriginStash:
         if not session_key or not turn_id:
             return False
         key = (session_key, turn_id)
-        if key in self._bound:
-            return True  # idempotent: pre_llm_call firing twice for one turn is a no-op
-        dq = self._pending.pop(session_key, None)
-        if dq:
-            self._pending_count -= len(dq)
-        if not dq:
-            return False
-        found: Optional[tuple[float, dict[str, Any]]] = None
-        while dq:
-            stamped_at, record = dq.popleft()
-            if self._expired(stamped_at):
-                if burn_callback is not None:
-                    burn_callback(record, "expired")
-                continue
-            if (
-                found is None
-                and record.get("user_id") == sender_id
-                and record.get("text_sha256") == text_sha256
-            ):
-                found = (stamped_at, record)
-                continue  # bound below -- not a burn
-            if record.get("user_id") != sender_id:
-                reason = "sender_mismatch"
-            elif record.get("text_sha256") != text_sha256:
-                reason = "text_mismatch"
-            else:
-                reason = "superseded"  # matched, but an earlier record already won this bind
-            if burn_callback is not None:
-                burn_callback(record, reason)
-        if found is None:
-            return False
-        stamped_at, record = found
         with self._lock:
+            if key in self._bound:
+                return True  # idempotent: pre_llm_call firing twice for one turn is a no-op
+            # Round 7 (kasra-review round-6 item 4): a reservation from an
+            # EARLIER turn on this same session that is STILL outstanding here
+            # means its post_tool_call never resolved it -- most likely
+            # Hermes's own "skip a callback while a prior invocation of the
+            # SAME callback is still running" behavior swallowed our
+            # finalize_tool_call dispatch for it (post_tool_call is invoked
+            # per-CALLBACK, not per-tool-call: a slow finalize_tool_call for
+            # one tool_call_id can cause a concurrent invocation for a
+            # DIFFERENT tool_call_id to be skipped entirely, never firing).
+            # A new turn starting means that reservation's window is over
+            # regardless of why it never resolved -- drop it and log it
+            # exactly like any other burn, so an operator investigating "my
+            # approval didn't count" has a signal instead of a silently
+            # permanent, un-stampable reservation.
+            for stale_key in [k for k in self._bound if k[0] == session_key and k != key]:
+                _stale_stamped_at, stale_record, stale_reserved_by = self._bound[stale_key]
+                if stale_reserved_by is not None:
+                    del self._bound[stale_key]
+                    if burn_callback is not None:
+                        burn_callback(stale_record, "stale_reservation")
+            dq = self._pending.pop(session_key, None)
+            if dq:
+                self._pending_count -= len(dq)
+            if not dq:
+                return False
+            found: Optional[tuple[float, dict[str, Any]]] = None
+            while dq:
+                stamped_at, record = dq.popleft()
+                if self._expired(stamped_at):
+                    if burn_callback is not None:
+                        burn_callback(record, "expired")
+                    continue
+                if (
+                    found is None
+                    and record.get("user_id") == sender_id
+                    and record.get("text_sha256") == text_sha256
+                ):
+                    found = (stamped_at, record)
+                    continue  # bound below -- not a burn
+                if record.get("user_id") != sender_id:
+                    reason = "sender_mismatch"
+                elif record.get("text_sha256") != text_sha256:
+                    reason = "text_mismatch"
+                else:
+                    reason = "superseded"  # matched, but an earlier record already won this bind
+                if burn_callback is not None:
+                    burn_callback(record, reason)
+            if found is None:
+                return False
+            stamped_at, record = found
             self._bound[key] = (stamped_at, record, None)  # unreserved: available to stamp
             self._bound.move_to_end(key)
             while len(self._bound) > self._max_bound:
                 evicted_key, (_, evicted_record, _) = self._bound.popitem(last=False)
                 if burn_callback is not None:
                     burn_callback(evicted_record, "bound_overflow")
-        return True
+            return True
 
     def peek_and_reserve(
         self, session_key: str, turn_id: str, tool_call_id: str,
     ) -> Optional[dict[str, Any]]:
         """``pre_tool_call``: return the bound record and mark it reserved by
-        *tool_call_id* iff it is bound, unexpired, and either unreserved or
-        already reserved by this SAME ``tool_call_id`` (idempotent re-entry --
-        a hook re-dispatch or a retry with the identical id). Reserved by a
-        DIFFERENT ``tool_call_id`` (a concurrent call) returns ``None`` --
-        never hands the same credential to two calls at once. Does NOT
-        consume: the record is only ever removed by :meth:`resolve`."""
+        *tool_call_id* iff it is bound, unexpired, and currently UNRESERVED.
+
+        Round 7 (kasra-review round-6 P1): there is no idempotent re-entry for
+        a repeat call with the SAME ``tool_call_id`` any more. ``tool_call_id``
+        is not an identity Hermes itself mints and verifies -- it rides in on
+        the model's own tool-call output, so treating "same id" as proof of
+        "this is genuinely the same in-flight call retrying" let a model
+        steered to emit two DISTINCT ``task_verdict`` calls in one turn simply
+        copy the same id onto both and get the human's identity stamped on a
+        SECOND, forged call. Once a record is reserved by ANYONE, every
+        further call here for this ``(session_key, turn_id)`` -- same id or
+        not -- returns ``None`` until :meth:`resolve` (``spent=False``)
+        releases it. Does NOT consume on its own: the record is only ever
+        removed by :meth:`resolve`."""
         if not session_key or not turn_id or not tool_call_id:
             return None
         key = (session_key, turn_id)
@@ -445,7 +500,7 @@ class _OriginStash:
             if self._expired(stamped_at):
                 del self._bound[key]
                 return None
-            if reserved_by is not None and reserved_by != tool_call_id:
+            if reserved_by is not None:
                 return None
             self._bound[key] = (stamped_at, record, tool_call_id)
             return dict(record)
@@ -477,19 +532,21 @@ class _OriginStash:
     def drop_session(self, session_key: str) -> None:
         if not session_key:
             return
-        dq = self._pending.pop(session_key, None)
-        if dq:
-            self._pending_count -= len(dq)
-        for key in [k for k in self._bound if k[0] == session_key]:
-            del self._bound[key]
+        with self._lock:
+            dq = self._pending.pop(session_key, None)
+            if dq:
+                self._pending_count -= len(dq)
+            for key in [k for k in self._bound if k[0] == session_key]:
+                del self._bound[key]
 
     def __len__(self) -> int:
         return self._pending_count + len(self._bound)
 
     def clear(self) -> None:
-        self._pending.clear()
-        self._pending_count = 0
-        self._bound.clear()
+        with self._lock:
+            self._pending.clear()
+            self._pending_count = 0
+            self._bound.clear()
 
 
 # Process-global: one gateway process serves every concurrent session, exactly
@@ -917,6 +974,38 @@ def register(ctx: Any) -> None:
         raise RuntimeError(
             "mupot native gateway requires a Hermes runtime with PluginContext.register_hook "
             "(human_origin attestation integrity cannot otherwise be enforced)"
+        )
+    # Round 7 (kasra-review round-6 item 5): register_hook() being CALLABLE is
+    # not proof the runtime actually DISPATCHES the hooks this module depends
+    # on -- an older Hermes whose VALID_HOOKS predates "post_tool_call" (or,
+    # defensively, "pre_llm_call") would accept register_hook("post_tool_call",
+    # ...) as a silent, callable-shaped no-op that is simply never invoked,
+    # quietly degrading round 6's reserve/resolve fix back to round 5's
+    # premature-consumption defect with no signal at all. Checked only when
+    # VALID_HOOKS is actually introspectable (the real native gateway path
+    # always has hermes_cli.plugins importable, since hermes_cli itself is
+    # what calls into this register()); an environment where it is NOT
+    # importable at all (e.g. this module's own plain-suite fake-Ctx tests) is
+    # a different case than "an old real runtime" and is left to the
+    # register_hook callability check above.
+    try:
+        from hermes_cli.plugins import VALID_HOOKS as _runtime_valid_hooks
+        _required_hooks = {"pre_llm_call", "post_tool_call"}
+        _missing_hooks = _required_hooks - set(_runtime_valid_hooks)
+    except Exception:
+        _missing_hooks = None
+    if _missing_hooks:
+        logger.error(
+            "mupot plugin: this Hermes runtime's VALID_HOOKS is missing %s -- "
+            "human_origin's round-6 reserve/resolve integrity cannot be enforced "
+            "on it (an older runtime would silently never invoke post_tool_call, "
+            "reverting to round-5's premature-consumption defect with no signal). "
+            "Refusing native-gateway registration entirely rather than degrade silently.",
+            sorted(_missing_hooks),
+        )
+        raise RuntimeError(
+            "mupot native gateway requires a Hermes runtime whose VALID_HOOKS includes "
+            f"{sorted({'pre_llm_call', 'post_tool_call'})} (missing: {sorted(_missing_hooks)})"
         )
     try:
         register_hook("pre_gateway_dispatch", capture_human_origin)

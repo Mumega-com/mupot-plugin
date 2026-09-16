@@ -24,6 +24,7 @@ permanently spent once Hermes reports the call genuinely dispatched (status != "
 from __future__ import annotations
 
 import logging
+import threading
 import types
 
 import pytest
@@ -208,12 +209,30 @@ def test_captured_text_field_is_truncated_independently_of_the_hash(monkeypatch)
     """The stamped text field is capped at _MAX_STAMPED_TEXT_CHARS, but bind's
     equality check always hashes the FULL text -- truncation here can never
     turn a real match into a false one."""
-    long_text = "approve f9408956 " + ("x" * 3000)
+    long_text = "approve f9408956 " + ("x" * (human_origin._MAX_STAMPED_TEXT_CHARS + 1000))
     _capture("sk-text-2", text=long_text)
     _bind("sk-text-2", "T1", text=long_text, monkeypatch=monkeypatch)
     bound = _peek("sk-text-2", "T1")
     assert len(bound["text"]) == human_origin._MAX_STAMPED_TEXT_CHARS
     assert bound["text"] == long_text[: human_origin._MAX_STAMPED_TEXT_CHARS]
+
+
+def test_a_4096_char_message_telegram_max_keeps_its_task_id_p2_3(monkeypatch):
+    """kasra-review round-6 item 3: 4096 is Telegram's own maximum message
+    length -- a legitimate, full-length message must never be truncated in
+    the stamped text field mupot's server checks the task id against."""
+    assert human_origin._MAX_STAMPED_TEXT_CHARS == 4096
+    task_id = "f9408956"
+    prefix = f"approve {task_id} "
+    long_text = prefix + ("x" * (4096 - len(prefix)))
+    assert len(long_text) == 4096
+    _capture("sk-4096", text=long_text)
+    _bind("sk-4096", "T1", text=long_text, monkeypatch=monkeypatch)
+    directive = _stamp(args={"task_id": task_id}, turn_id="T1", tool_call_id="C1")
+    assert directive is not None
+    stamped_text = directive["args"]["human_origin"]["text"]
+    assert stamped_text == long_text
+    assert task_id in stamped_text
 
 
 def test_stamped_human_origin_carries_the_text_field_not_the_internal_hash(monkeypatch):
@@ -856,20 +875,37 @@ def test_stash_bind_consumes_oldest_matching_record_only_second_is_superseded():
 
 def test_stash_peek_and_reserve_does_not_consume_but_resolve_does():
     """Round 6, kasra-review round-5 P1-1: peek_and_reserve() only RESERVES --
-    calling it again with the SAME tool_call_id is idempotent re-entry, a
-    DIFFERENT tool_call_id cannot also reserve it, and the record survives
-    until resolve(spent=True) actually removes it."""
+    it never removes the record on its own; only resolve(spent=True) does."""
     stash = human_origin._OriginStash()
     stash.capture("sk", {"user_id": "u1", "text_sha256": "h1", "message_id": "m1"})
     stash.bind("sk", "T1", sender_id="u1", text_sha256="h1")
     first = stash.peek_and_reserve("sk", "T1", "C1")
     assert first is not None
     assert first["message_id"] == "m1"
-    again = stash.peek_and_reserve("sk", "T1", "C1")  # idempotent re-entry, same id
-    assert again is not None
-    assert stash.peek_and_reserve("sk", "T1", "C2") is None  # a different id cannot also reserve it
     stash.resolve("sk", "T1", "C1", spent=True)
-    assert stash.peek_and_reserve("sk", "T1", "C2") is None  # gone, not just released
+    assert stash.peek_and_reserve("sk", "T1", "C2") is None  # gone
+
+
+def test_stash_peek_and_reserve_repeated_same_tool_call_id_is_stripped_not_idempotent_p1():
+    """kasra-review round-6 P1: a regression in round 6's OWN P1-1 fix.
+    tool_call_id rides in on the model's own tool-call output -- Hermes does
+    not mint or verify it as an identity token. Round 6 treated a REPEAT call
+    carrying the SAME tool_call_id as proof of "the same in-flight call
+    retrying" and handed the record out again (idempotent re-entry); a model
+    steered to emit two DISTINCT task_verdict calls in one turn could simply
+    copy the same id onto both and get the human's identity stamped on a
+    second, forged call. Round 7: once reserved, ANY further peek -- same id
+    or not -- is stripped until resolve(spent=False) releases it."""
+    stash = human_origin._OriginStash()
+    stash.capture("sk", {"user_id": "u1", "text_sha256": "h1"})
+    stash.bind("sk", "T1", sender_id="u1", text_sha256="h1")
+    first = stash.peek_and_reserve("sk", "T1", "C1")
+    assert first is not None
+    second = stash.peek_and_reserve("sk", "T1", "C1")  # SAME id, no resolve in between
+    assert second is None
+    assert stash.peek_and_reserve("sk", "T1", "C2") is None  # a different id fares no better
+    stash.resolve("sk", "T1", "C1", spent=False)
+    assert stash.peek_and_reserve("sk", "T1", "C2") is not None  # only resolve() frees it
 
 
 def test_stash_resolve_with_spent_false_releases_for_a_different_tool_call_id():
@@ -889,7 +925,11 @@ def test_stash_resolve_is_a_noop_for_a_mismatched_tool_call_id():
     stash.bind("sk", "T1", sender_id="u1", text_sha256="h1")
     stash.peek_and_reserve("sk", "T1", "C1")
     stash.resolve("sk", "T1", "SOME-OTHER-ID", spent=True)  # does not touch C1's reservation
-    assert stash.peek_and_reserve("sk", "T1", "C1") is not None
+    # if the mismatched resolve() above HAD wrongly removed the record, this
+    # legitimate resolve of C1's own reservation would now be a no-op (nothing
+    # left to release), and the peek below would find nothing bound at all:
+    stash.resolve("sk", "T1", "C1", spent=False)
+    assert stash.peek_and_reserve("sk", "T1", "C2") is not None
 
 
 def test_stash_pending_is_bounded_per_session():
@@ -1052,8 +1092,11 @@ def test_stash_returns_independent_copies_not_shared_references():
     assert got["user_id"] == "u"  # bind()'s own copy was unaffected by mutating the caller's dict
     got["user_id"] = "mutated-after-peek"
     # peek_and_reserve() hands back a FRESH copy every call -- mutating one
-    # returned dict never affects the stored record or a later peek:
-    again = stash.peek_and_reserve("sk", "T1", "C1")
+    # returned dict never affects the stored record or a later peek. Release
+    # the reservation first (round 7: a repeat peek with the same id no
+    # longer re-grants it) so the next peek is a genuinely separate call:
+    stash.resolve("sk", "T1", "C1", spent=False)
+    again = stash.peek_and_reserve("sk", "T1", "C2")
     assert again["user_id"] == "u"
 
 
@@ -1072,6 +1115,115 @@ def test_stash_bind_relies_on_the_callback_being_safe_log_burn_is():
 
     with pytest.raises(RuntimeError):
         stash.bind("sk", "T1", sender_id="u", text_sha256="WRONG", burn_callback=_boom)
+
+
+def test_stamp_tool_call_repeated_same_tool_call_id_in_one_turn_is_stripped_p1(monkeypatch):
+    """kasra-review round-6 P1, at the stamp_tool_call level: the SAME
+    tool_call_id used twice in one turn, with no post_tool_call resolution
+    between the two calls, must not be treated as an idempotent retry --
+    tool_call_id is model-supplied and not trustworthy for identity."""
+    _capture("sk-repeat-call-id", text="approve f9408956")
+    _bind("sk-repeat-call-id", "T1", text="approve f9408956", monkeypatch=monkeypatch)
+    first = _stamp(args={"task_id": "f9408956"}, turn_id="T1", tool_call_id="C1")
+    assert first is not None
+    second_args = {"task_id": "f9408956"}
+    second = human_origin.stamp_tool_call(
+        tool_name="task_verdict", args=second_args, turn_id="T1", tool_call_id="C1",
+    )
+    assert second is None
+    assert "human_origin" not in second_args
+    # only resolving the FIRST reservation (released, not spent) makes the
+    # SAME id stampable again -- this is not a permanent lockout, just not an
+    # unconditional idempotent re-entry any more:
+    _finalize(turn_id="T1", tool_call_id="C1", status="blocked")
+    third = human_origin.stamp_tool_call(
+        tool_name="task_verdict", args={"task_id": "f9408956"}, turn_id="T1", tool_call_id="C1",
+    )
+    assert third is not None
+
+
+def test_concurrent_peek_and_reserve_grants_exactly_one_winner():
+    """kasra-review round-6 P2: prove the lock actually serializes
+    peek_and_reserve with REAL threads and a REAL rendezvous -- not just "all
+    tests still pass with a lock object sitting there". Hooks
+    _OriginStash._expired (called from INSIDE peek_and_reserve's locked
+    section, right after acquiring the lock) with a threading.Barrier(2): if
+    the lock genuinely holds two threads apart, the second thread cannot
+    reach _expired until the first has finished its ENTIRE critical section
+    and released the lock -- so the first thread's rendezvous attempt always
+    times out alone (nobody else has arrived yet), and once it does arrive
+    the barrier is already broken. If the lock is a no-op, both threads reach
+    _expired within the same instant and the barrier's 2-party rendezvous
+    genuinely SUCCEEDS for both -- a positive proof of an unlocked race, not
+    a timing guess."""
+    stash = human_origin._OriginStash()
+    stash.capture("sk", {"user_id": "u", "text_sha256": "h"})
+    stash.bind("sk", "T1", sender_id="u", text_sha256="h")
+
+    barrier = threading.Barrier(2)
+    rendezvous_happened = threading.Event()
+    real_expired = human_origin._OriginStash._expired
+
+    def hooked_expired(self, stamped_at):
+        try:
+            barrier.wait(timeout=0.5)
+            rendezvous_happened.set()
+        except threading.BrokenBarrierError:
+            pass
+        return real_expired(self, stamped_at)
+
+    results: dict[str, object] = {}
+
+    def worker(tool_call_id):
+        results[tool_call_id] = stash.peek_and_reserve("sk", "T1", tool_call_id)
+
+    original_expired = human_origin._OriginStash._expired
+    human_origin._OriginStash._expired = hooked_expired
+    try:
+        t1 = threading.Thread(target=worker, args=("C1",))
+        t2 = threading.Thread(target=worker, args=("C2",))
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+    finally:
+        human_origin._OriginStash._expired = original_expired
+
+    assert not rendezvous_happened.is_set(), (
+        "peek_and_reserve let two threads run its critical section concurrently "
+        "-- the lock is not serializing reserve/resolve"
+    )
+    granted = [v for v in results.values() if v is not None]
+    assert len(granted) == 1
+
+
+def test_bind_drops_and_warns_on_a_stale_unresolved_reservation_from_an_earlier_turn(monkeypatch, caplog):
+    """kasra-review round-6 item 4: a reservation from an EARLIER turn on this
+    session that is STILL outstanding when the NEXT pre_llm_call fires means
+    its post_tool_call never resolved it (most likely Hermes's own
+    skip-while-a-prior-invocation-of-the-SAME-callback-is-running behavior
+    swallowed finalize_tool_call for it). The new turn starting closes that
+    reservation's window regardless -- bind() must drop it and log it at
+    WARNING, exactly like any other burn, so the skipped-callback case leaves
+    a visible signal instead of a silently immortal reservation."""
+    _capture("sk-stale-reservation", text="approve f9408956", message_id="M-stale")
+    _bind("sk-stale-reservation", "T1", text="approve f9408956", monkeypatch=monkeypatch)
+    reserved = _stamp(args={"task_id": "f9408956"}, turn_id="T1", tool_call_id="C1")
+    assert reserved is not None  # T1's record is now reserved by C1, never resolved
+
+    _capture("sk-stale-reservation", text="approve second-task", message_id="M-second")
+    with caplog.at_level(logging.WARNING):
+        _bind("sk-stale-reservation", "T2", text="approve second-task", monkeypatch=monkeypatch)
+
+    assert any(
+        "M-stale" in r.message and "stale_reservation" in r.message and r.levelno == logging.WARNING
+        for r in caplog.records
+    )
+    # the stale reservation is GONE, not merely released -- T1 can no longer
+    # be stamped by anyone:
+    assert _stamp(args={}, turn_id="T1", tool_call_id="C-late") is None
+    # the NEW turn's own record is unaffected and stamps normally:
+    assert _stamp(args={"task_id": "second-task"}, turn_id="T2", tool_call_id="C2") is not None
 
 
 # ---------------------------------------------------------------------------

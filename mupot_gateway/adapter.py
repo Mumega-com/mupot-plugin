@@ -36,6 +36,7 @@ from ..profile_scope import (
     read_profile_secret,
     require_supported_profile_runtime,
 )
+from . import human_origin as _human_origin
 from .human_origin import register as register_human_origin_hooks
 from .lease_ownership import (
     ATTEMPT_ID_RE as _LEASE_ATTEMPT_ID_RE,
@@ -3288,6 +3289,15 @@ def register(
     expected_tenant=None,
     secret_owner: ProfileSecretOwner | None = None,
 ) -> None:
+    # FIRST, before anything else: human-origin capture/stamp is this plugin's
+    # only choke point for keeping a model-supplied human_origin from reaching
+    # mupot verbatim on task_verdict/needs_you_list. register_human_origin_hooks
+    # raises when it cannot enforce that (see human_origin.register's docstring),
+    # and nothing else in the native gateway should register either in that case
+    # -- a platform adapter + status tool with an unenforced identity-attestation
+    # surface underneath them is worse than no native gateway at all.
+    register_human_origin_hooks(ctx)
+
     # Populated by adapter_factory once Hermes actually connects the platform, so the
     # status tool below can report on the live instance's local state (stranded
     # notifications) without a second, independent path into the adapter's storage.
@@ -3297,6 +3307,12 @@ def register(
         extra = dict(config.extra or {})
         if expected_agent_id is not None or expected_tenant is not None:
             extra.update(expected_agent_id=expected_agent_id, expected_tenant=expected_tenant)
+
+        # Keep tool-name matching in sync with whatever this Hermes profile
+        # actually configures for mupot's MCP server -- the SAME resolution
+        # MupotAdapter.__init__ uses for its own client (self.server_name =
+        # str(extra.get("mcp_server") or "mupot")), not a second guess.
+        _human_origin.set_mcp_server_name(str(extra.get("mcp_server") or "mupot"))
 
         def client_factory(server_name: str) -> HermesMCPClient:
             return HermesMCPClient(server_name, secret_owner=secret_owner)
@@ -3388,9 +3404,3 @@ def register(
             },
             toolset="mupot-operator",
         )
-
-    # Human-origin capture/stamp only means anything with a live platform adapter
-    # feeding pre_gateway_dispatch real MessageEvents -- registered here, not from
-    # the top-level plugin __init__, so it is gated by native_gateway_enabled the
-    # same way every other native-gateway-only behavior in this module is.
-    register_human_origin_hooks(ctx)

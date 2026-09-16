@@ -17,17 +17,12 @@ from .profile_scope import (
     read_profile_secret,
     require_supported_profile_runtime,
 )
+from .telegram_fence import is_forwarded_telegram_message
 
 logger = logging.getLogger(__name__)
 
 
 _COMMANDS = ("start", "needs", "answer", "approve", "reject")
-_FORWARDING_MARKERS = (
-    "forward_origin",
-    "forward_from",
-    "forward_from_chat",
-    "forward_date",
-)
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,127}\Z")
 _MAX_REQUEST_BYTES = 32 * 1024
 _MAX_RESPONSE_BYTES = 64 * 1024
@@ -150,9 +145,7 @@ def _sanitized_envelope(update: Any) -> dict[str, Any]:
     if str(user_id) != str(chat_id):
         raise ValueError("telegram project control requires a private user chat")
 
-    if any(
-        getattr(message, marker, None) is not None for marker in _FORWARDING_MARKERS
-    ):
+    if is_forwarded_telegram_message(message):
         raise ValueError("forwarded telegram project control messages are refused")
 
     update_id = getattr(update, "update_id", None)

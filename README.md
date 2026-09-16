@@ -173,18 +173,29 @@ or a turn on a platform this plugin doesn't yet support), the call runs under th
 exactly as before this feature existed.
 
 This is implemented as two Hermes lifecycle hooks in `mupot_gateway/human_origin.py`,
-registered only when `native_gateway_enabled: true` (alongside every other native-gateway-only
-behavior in this plugin):
+registered FIRST (before the platform adapter or any tool) from `mupot_gateway/adapter.py`'s
+`register()`, only when `native_gateway_enabled: true`. Registration fails **closed**: a
+Hermes runtime whose `PluginContext` cannot `register_hook` (or whose hook registration
+itself raises) gets no native-gateway registration at all — there is no other choke point in
+this plugin able to keep a model-supplied `human_origin` from reaching mupot verbatim on
+`task_verdict`/`needs_you_list`.
 
 - `pre_gateway_dispatch` fires once per inbound message, straight off the platform adapter,
-  before the LLM ever sees the turn. It reads the native platform/user/chat/message ids and
-  timestamp off the event — never off text — and stashes them keyed by the exact
-  `session_key` Hermes's own gateway binds for the turn.
-- `pre_tool_call` fires once per tool dispatch. For `task_verdict` and `needs_you_list` only,
-  it reads back the stashed origin for the turn's session and overwrites — never trusts —
-  whatever `human_origin` the model itself supplied. A model-supplied value is always treated
-  as a forgery attempt and logged at WARNING. When no origin was captured for the session, any
-  model-supplied value is stripped instead of forwarded.
+  before Hermes's own sender-authorization check runs. It is therefore this module's own
+  trust fence, not a convenience filter: a message is captured only when it is a private,
+  non-forwarded, self chat (`chat_type == "dm"` and `user_id == chat_id` — Telegram's own DM
+  invariant, mirroring `telegram_control.py`'s own private/unforwarded gate). A captured
+  record is *pending*, not yet bound to any turn.
+- `pre_tool_call` fires once per tool dispatch. It matches `task_verdict`/`needs_you_list`
+  both by bare name and by the exact `mcp__<configured mupot server>__<tool>` wire name a live
+  gateway with mupot registered as an MCP server actually emits (never the bare name, once
+  mupot is an MCP server). The *first* such call from a turn claims the oldest pending capture
+  for its session and binds it to that turn's own `turn_id`; only that same turn can read it
+  again. A different turn on the same session — a plugin-injected/notification turn, a cron
+  turn, or a delegated subagent (checked directly against Hermes's own delegated-child-context
+  marker, on top of the turn_id mismatch) — gets nothing, even though it shares the session.
+  A model-supplied `human_origin` is always treated as a forgery attempt (logged at WARNING)
+  and either overwritten with the claimed origin or, when nothing is claimable, stripped.
 
 Only Telegram is supported today. Every other platform is a recorded, not silent, gap: the
 first inbound message on an unsupported platform logs one INFO line naming it, and every

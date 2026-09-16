@@ -36,6 +36,7 @@ from ..profile_scope import (
     read_profile_secret,
     require_supported_profile_runtime,
 )
+from .human_origin import register as register_human_origin_hooks
 from .lease_ownership import (
     ATTEMPT_ID_RE as _LEASE_ATTEMPT_ID_RE,
     AckOwnershipError,
@@ -3387,3 +3388,9 @@ def register(
             },
             toolset="mupot-operator",
         )
+
+    # Human-origin capture/stamp only means anything with a live platform adapter
+    # feeding pre_gateway_dispatch real MessageEvents -- registered here, not from
+    # the top-level plugin __init__, so it is gated by native_gateway_enabled the
+    # same way every other native-gateway-only behavior in this module is.
+    register_human_origin_hooks(ctx)

@@ -149,6 +149,47 @@ for setup, verification, retry, revocation, and rollback steps. A live pilot rem
 on independent review, exact deployment proof, migration readback, and protected webhook
 configuration.
 
+**This deterministic command relay is a fallback, not the primary path.** It exists for
+participants who are not bound to an owned Hermes agent seat. For an owned member, plain
+natural language through their own agent is the primary, always-live decision channel — see
+"Human-origin attestation" below. The relay also has a known gap: Hermes's own Telegram
+polling-connection rebuild (a transient reconnect after a network hiccup) re-registers only
+Hermes's core message/command handlers, never a plugin's own `CommandHandler`s
+(`plugins/platforms/telegram/adapter.py`'s `_register_handlers`, called from
+`_initialize_app_with_retries` on every rebuilt polling `Application`) — so after such a
+rebuild, `/start` `/needs` `/answer` `/approve` `/reject` can silently stop responding until
+the whole gateway process restarts, with nothing in this plugin able to detect or repair it
+(there is no hook back into that rebuild path). `register_telegram_control` logs a WARNING
+naming this limitation whenever `telegram_control_enabled: true` is configured.
+
+## Human-origin attestation for `task_verdict` / `needs_you_list`
+
+The primary decision channel for an owned member is not a deterministic command at all: they
+talk to their own agent in plain natural language, and the **harness** — never the LLM —
+stamps the triggering message's origin onto the agent's `task_verdict`/`needs_you_list` calls.
+Mupot resolves that `human_origin` object to the member and runs the call under the human's
+own identity instead of the agent seat; without it (a CLI turn, a cron turn, a subagent turn,
+or a turn on a platform this plugin doesn't yet support), the call runs under the agent seat
+exactly as before this feature existed.
+
+This is implemented as two Hermes lifecycle hooks in `mupot_gateway/human_origin.py`,
+registered only when `native_gateway_enabled: true` (alongside every other native-gateway-only
+behavior in this plugin):
+
+- `pre_gateway_dispatch` fires once per inbound message, straight off the platform adapter,
+  before the LLM ever sees the turn. It reads the native platform/user/chat/message ids and
+  timestamp off the event — never off text — and stashes them keyed by the exact
+  `session_key` Hermes's own gateway binds for the turn.
+- `pre_tool_call` fires once per tool dispatch. For `task_verdict` and `needs_you_list` only,
+  it reads back the stashed origin for the turn's session and overwrites — never trusts —
+  whatever `human_origin` the model itself supplied. A model-supplied value is always treated
+  as a forgery attempt and logged at WARNING. When no origin was captured for the session, any
+  model-supplied value is stripped instead of forwarded.
+
+Only Telegram is supported today. Every other platform is a recorded, not silent, gap: the
+first inbound message on an unsupported platform logs one INFO line naming it, and every
+`task_verdict`/`needs_you_list` call from that turn simply runs under the agent seat.
+
 ### Testing with Hermes
 
 `./scripts/test.sh` runs the standalone operator/provisioner and legacy stream tests.

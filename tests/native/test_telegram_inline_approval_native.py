@@ -163,7 +163,7 @@ async def test_real_callback_dispatch_submits_verdict_once_and_refuses_replay(
     assert callback_handlers[1].callback is core_callback_handler
 
     keyboard, on_sent = inline_module.build_approval_keyboard(
-        task_id="pending-task-1", chat_id=123, user_id=123
+        task_id="pending-task-1", presser=inline_module.VerifiedPresser(id=123)
     )
     on_sent(999)
     approve_nonce = keyboard.inline_keyboard[0][0].callback_data[len(inline_module.CALLBACK_PREFIX):]

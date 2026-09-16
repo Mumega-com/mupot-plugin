@@ -227,7 +227,6 @@ def register_telegram_control(
     settings: TelegramControlSettings,
     *,
     secret_owner: ProfileSecretOwner | None = None,
-    needs_keyboard_factory: Any = None,
 ) -> None:
     settings.validate()
     if not settings.enabled:
@@ -282,48 +281,8 @@ def register_telegram_control(
             except Exception:
                 reply = _UNAVAILABLE_REPLY
             message = getattr(update, "effective_message", None)
-            if message is None:
-                return
-            reply_markup = None
-            on_sent = None
-            # Optional inline-approval attachment (telegram_inline_approval.py,
-            # config-gated off by default): only ever considered for a
-            # successful /needs reply, never for the refusal/unavailable
-            # replies above, and any failure building it degrades to the
-            # plain-text reply this command has always sent.
-            if needs_keyboard_factory is not None and reply not in (
-                _REFUSAL_REPLY,
-                _UNAVAILABLE_REPLY,
-            ):
-                text = getattr(message, "text", None)
-                command = (
-                    text.split(maxsplit=1)[0].split("@", 1)[0]
-                    if isinstance(text, str)
-                    else ""
-                )
-                if command == "/needs":
-                    try:
-                        built = await needs_keyboard_factory(update)
-                    except Exception:
-                        logger.warning(
-                            "mupot plugin: inline-approval keyboard build failed",
-                            exc_info=True,
-                        )
-                        built = None
-                    if built is not None:
-                        reply_markup, on_sent = built
-            if reply_markup is not None:
-                sent = await message.reply_text(reply, reply_markup=reply_markup)
-            else:
-                sent = await message.reply_text(reply)
-            if on_sent is not None:
-                try:
-                    on_sent(getattr(sent, "message_id", None))
-                except Exception:
-                    logger.warning(
-                        "mupot plugin: inline-approval post-send token bind failed",
-                        exc_info=True,
-                    )
+            if message is not None:
+                await message.reply_text(reply)
 
         handlers: list[Any] = []
         for command in _COMMANDS:

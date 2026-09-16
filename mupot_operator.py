@@ -35,16 +35,19 @@ OPERATOR_ACTIONS = frozenset(
     }
 )
 
-# telegram_inline_approval.py's callback handler and its /needs keyboard
-# helper call these two directly through MupotOperatorClient.call() -- never
-# through a registered LLM tool (register_operator_tools below does not map
-# either of them to a tool name; see tests/test_operator.py's
+# telegram_inline_approval.py's callback handler calls this directly through
+# MupotOperatorClient.call() -- never through a registered LLM tool
+# (register_operator_tools below does not map it to a tool name; see
+# tests/test_operator.py's
 # test_registered_surface_contains_no_admin_or_external_action_tools, which
-# asserts no registered tool name contains "verdict"). Kept in their own
-# frozenset, not merged into OPERATOR_ACTIONS, so the two callers of a raw
-# task_verdict/needs_you_list capability stay easy to find independently of
-# the routine agent-operator surface.
-VERDICT_ACTIONS = frozenset({"task_verdict", "needs_you_list"})
+# asserts no registered tool name contains "verdict"). Kept in its own
+# frozenset, not merged into OPERATOR_ACTIONS, so this one caller of a raw
+# task_verdict capability stays easy to find independently of the routine
+# agent-operator surface. (round 2: needs_you_list was removed along with
+# the /needs auto-keyboard it only existed for -- see
+# telegram_inline_approval.py's module docstring SCOPE note and the
+# tracking follow-up issue for a presser-scoped replacement.)
+VERDICT_ACTIONS = frozenset({"task_verdict"})
 
 MANAGER_LIFECYCLE_ACTIONS = frozenset(
     {

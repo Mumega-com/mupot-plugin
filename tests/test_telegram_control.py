@@ -213,63 +213,6 @@ def test_factory_registers_only_the_five_exact_commands(
     assert all(handler.callback is handlers[0].callback for handler in handlers)
 
 
-@pytest.mark.asyncio
-async def test_needs_keyboard_factory_is_consulted_only_for_needs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The optional inline-approval hook only ever runs for a successful
-    /needs reply -- never for /start, /approve, /reject, /answer, or a
-    refusal/unavailable reply."""
-    factories: list[object] = []
-    ctx = types.SimpleNamespace(register_telegram_handler=factories.append)
-
-    class CommandHandler:
-        def __init__(self, command: str, callback: object) -> None:
-            self.command = command
-            self.callback = callback
-
-    telegram = types.ModuleType("telegram")
-    telegram_ext = types.ModuleType("telegram.ext")
-    telegram_ext.CommandHandler = CommandHandler
-    monkeypatch.setitem(sys.modules, "telegram", telegram)
-    monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
-
-    calls: list[str] = []
-
-    async def needs_keyboard_factory(update: Update) -> object:
-        calls.append(update.effective_message.text)
-        return ("fake-markup", lambda message_id: calls.append(f"bound:{message_id}"))
-
-    monkeypatch.setattr(
-        "plugin.telegram_control.relay_telegram_update",
-        lambda _settings, update: f"handled {update.effective_message.text}",
-    )
-    register_telegram_control(ctx, valid_settings(), needs_keyboard_factory=needs_keyboard_factory)
-    handlers: list[object] = []
-    application = types.SimpleNamespace(add_handler=handlers.append)
-    factories[0](application, object())
-    by_command = {handler.command: handler.callback for handler in handlers}
-
-    sent: list[tuple[str, object]] = []
-
-    async def reply_text(text: str, reply_markup: object = None) -> object:
-        sent.append((text, reply_markup))
-        return types.SimpleNamespace(message_id=4242)
-
-    for command, text in (("needs", "/needs"), ("approve", "/approve d-1")):
-        sent.clear()
-        calls.clear()
-        update = Update(message=Message(text))
-        update.effective_message.reply_text = reply_text
-        await by_command[command](update, object())
-        if command == "needs":
-            assert calls == ["/needs", "bound:4242"]
-            assert sent == [(f"handled {text}", "fake-markup")]
-        else:
-            assert calls == []
-            assert sent == [(f"handled {text}", None)]
-
-
 @pytest.mark.parametrize(
     "update",
     [

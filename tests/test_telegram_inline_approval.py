@@ -8,17 +8,18 @@ from typing import Any
 
 import pytest
 
+import plugin.telegram_inline_approval as inline_approval
 from plugin.telegram_inline_approval import (
     CALLBACK_PREFIX,
     TOKEN_VERSION,
     ApprovalReceiptStore,
+    MintRateLimited,
     TelegramInlineApprovalSettings,
+    VerifiedPresser,
     _ApprovalTokenStore,
     _handle_callback,
     _passes_callback_fence,
-    _single_pending_task_id,
     build_approval_keyboard,
-    maybe_build_needs_keyboard,
     register_telegram_inline_approval,
 )
 
@@ -127,6 +128,32 @@ def valid_settings(**changes: object) -> TelegramInlineApprovalSettings:
     return replace(TelegramInlineApprovalSettings(enabled=True), **changes)
 
 
+def presser(id_: object = 123) -> VerifiedPresser:
+    return VerifiedPresser(id=id_)
+
+
+# ---------------------------------------------------------------------------
+# VerifiedPresser -- structural chat_id/user_id collapse (round 2, P1-A)
+# ---------------------------------------------------------------------------
+
+
+def test_verified_presser_exposes_the_same_value_as_both_ids() -> None:
+    identity = VerifiedPresser(id=100)
+    assert identity.chat_id == "100"
+    assert identity.user_id == "100"
+    # There is no constructor parameter that could make these disagree --
+    # this is the structural closure of round-1's PoC
+    # (send_approval_prompt(chat_id=100, user_id=200, ...) minted a token
+    # attesting to a different member than the one who could ever press it).
+    assert "chat_id" not in VerifiedPresser.__dataclass_fields__
+    assert "user_id" not in VerifiedPresser.__dataclass_fields__
+
+
+def test_verified_presser_rejects_empty_id() -> None:
+    with pytest.raises(ValueError):
+        VerifiedPresser(id="")
+
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -162,7 +189,7 @@ def test_settings_bound_ttl(bad_ttl: float) -> None:
 
 def test_mint_triplet_produces_three_distinct_unbound_nonces() -> None:
     store = _ApprovalTokenStore()
-    nonces = store.mint_triplet(task_id="task-1", chat_id=123, user_id=123, ttl_seconds=60)
+    nonces = store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
     assert len(set(nonces.values())) == 3
     assert set(nonces) == {"approve", "reject", "details"}
     # Unbound (no prompt_message_id yet) tokens refuse to claim.
@@ -171,10 +198,19 @@ def test_mint_triplet_produces_three_distinct_unbound_nonces() -> None:
     assert record is None
 
 
+def test_mint_triplet_stores_the_same_chat_and_user_id_from_one_presser() -> None:
+    store = _ApprovalTokenStore()
+    nonces = store.mint_triplet(task_id="task-1", presser=presser(777), ttl_seconds=60)
+    store.bind_message(nonces.values(), "999")
+    _status, record = store.claim(nonces["approve"])
+    assert record.chat_id == "777"
+    assert record.user_id == "777"
+
+
 def test_claim_after_bind_succeeds_exactly_once_then_replay_is_refused() -> None:
     """Negative test: replay of a used token."""
     store = _ApprovalTokenStore()
-    nonces = store.mint_triplet(task_id="task-1", chat_id=123, user_id=123, ttl_seconds=60)
+    nonces = store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
     store.bind_message(nonces.values(), "999")
 
     status, record = store.claim(nonces["approve"])
@@ -191,7 +227,7 @@ def test_claim_after_bind_succeeds_exactly_once_then_replay_is_refused() -> None
 def test_claim_refuses_an_expired_token() -> None:
     """Negative test: expired token."""
     store = _ApprovalTokenStore()
-    nonces = store.mint_triplet(task_id="task-1", chat_id=123, user_id=123, ttl_seconds=60)
+    nonces = store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
     store.bind_message(nonces.values(), "999")
     nonce = nonces["approve"]
     # Force expiry without sleeping.
@@ -204,10 +240,32 @@ def test_claim_refuses_an_expired_token() -> None:
     assert nonce not in store._entries
 
 
-def test_claim_refuses_a_version_mismatch() -> None:
-    """Negative test: version mismatch."""
+def test_expiry_boundary_refuses_at_the_exact_expiry_instant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pins kasra-review's round-1 mutation survivor M2: claim()'s expiry
+    comparison must be `>=`, not `>` -- the exact expiry instant is already
+    refused, not valid for one more claim."""
+    fixed_time = 1_000.0
+    monkeypatch.setattr(inline_approval.time, "monotonic", lambda: fixed_time)
     store = _ApprovalTokenStore()
-    nonces = store.mint_triplet(task_id="task-1", chat_id=123, user_id=123, ttl_seconds=60)
+    nonces = store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
+    store.bind_message(nonces.values(), "999")
+    # expires_at == fixed_time + 60 exactly; advance the mocked clock to land
+    # on that exact instant, not past it.
+    monkeypatch.setattr(inline_approval.time, "monotonic", lambda: fixed_time + 60)
+    status, record = store.claim(nonces["approve"])
+    assert status == "expired"
+    assert record is None
+
+
+def test_claim_refuses_a_version_mismatch() -> None:
+    """Negative test: version mismatch. Documented as unreachable-by-design
+    in production (TOKEN_VERSION's own docstring, P3-H) -- this only proves
+    the guard itself works when a record is hand-built with a stale
+    version, not that anything in production can produce one."""
+    store = _ApprovalTokenStore()
+    nonces = store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
     store.bind_message(nonces.values(), "999")
     nonce = nonces["reject"]
     store._entries[nonce].version = TOKEN_VERSION + 1
@@ -224,9 +282,16 @@ def test_claim_refuses_an_unknown_nonce() -> None:
     assert record is None
 
 
+def test_nonce_entropy_floor_is_pinned() -> None:
+    """Pins kasra-review's round-1 mutation survivor M6: _NONCE_BYTES must
+    stay high enough that the callback-data bearer token isn't
+    brute-forceable (>=128 bits -- 16 bytes)."""
+    assert inline_approval._NONCE_BYTES >= 16
+
+
 def test_burn_removes_and_logs(caplog: pytest.LogCaptureFixture) -> None:
     store = _ApprovalTokenStore()
-    nonces = store.mint_triplet(task_id="task-1", chat_id=123, user_id=123, ttl_seconds=60)
+    nonces = store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
     with caplog.at_level("WARNING"):
         store.burn(nonces.values(), reason="send_failed")
     for nonce in nonces.values():
@@ -237,10 +302,65 @@ def test_burn_removes_and_logs(caplog: pytest.LogCaptureFixture) -> None:
 def test_overflow_eviction_is_logged(caplog: pytest.LogCaptureFixture) -> None:
     store = _ApprovalTokenStore(max_entries=3)
     with caplog.at_level("WARNING"):
-        store.mint_triplet(task_id="task-old", chat_id=1, user_id=1, ttl_seconds=60)
-        store.mint_triplet(task_id="task-new", chat_id=1, user_id=1, ttl_seconds=60)
+        store.mint_triplet(task_id="task-old", presser=presser(1), ttl_seconds=60)
+        store.mint_triplet(task_id="task-new", presser=presser(2), ttl_seconds=60)
     assert len(store) == 3
     assert "overflow" in caplog.text
+
+
+def test_bind_message_refuses_to_rebind_to_a_different_message_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """P2-E: a second on_sent() call (retry / re-send) must not silently
+    repoint a live nonce at a different message id -- human_origin.message_id
+    is the server's own one-decision-per-message replay key."""
+    store = _ApprovalTokenStore()
+    nonces = store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
+    store.bind_message(nonces.values(), "999")
+    with caplog.at_level("WARNING"):
+        store.bind_message(nonces.values(), "4242")
+    assert "refused to rebind" in caplog.text
+    _status, record = store.claim(nonces["approve"])
+    assert record.prompt_message_id == "999"
+
+
+def test_bind_message_rebinding_the_same_id_is_a_harmless_no_op() -> None:
+    store = _ApprovalTokenStore()
+    nonces = store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
+    store.bind_message(nonces.values(), "999")
+    store.bind_message(nonces.values(), "999")  # idempotent retry, not a rebind
+    _status, record = store.claim(nonces["approve"])
+    assert record.prompt_message_id == "999"
+
+
+def test_mint_rate_limit_refuses_a_fourth_triplet_within_the_window() -> None:
+    """P2-F: one chat cannot mint unbounded triplets into the shared 512-entry
+    FIFO -- capped per chat, independent of any particular caller."""
+    store = _ApprovalTokenStore()
+    same_presser = presser(555)
+    for _ in range(3):
+        store.mint_triplet(task_id="task-1", presser=same_presser, ttl_seconds=60)
+    with pytest.raises(MintRateLimited):
+        store.mint_triplet(task_id="task-1", presser=same_presser, ttl_seconds=60)
+
+
+def test_mint_rate_limit_is_scoped_per_chat() -> None:
+    store = _ApprovalTokenStore()
+    for _ in range(3):
+        store.mint_triplet(task_id="task-1", presser=presser(1), ttl_seconds=60)
+    # A different chat is unaffected by another chat's rate limit.
+    store.mint_triplet(task_id="task-1", presser=presser(2), ttl_seconds=60)
+
+
+def test_mint_rate_limit_logs_a_warning(caplog: pytest.LogCaptureFixture) -> None:
+    store = _ApprovalTokenStore()
+    same_presser = presser(555)
+    for _ in range(3):
+        store.mint_triplet(task_id="task-1", presser=same_presser, ttl_seconds=60)
+    with caplog.at_level("WARNING"):
+        with pytest.raises(MintRateLimited):
+            store.mint_triplet(task_id="task-1", presser=same_presser, ttl_seconds=60)
+    assert "rate-limited" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +392,22 @@ def test_fence_refuses_a_different_user_in_the_same_chat() -> None:
     assert _passes_callback_fence(query) is False
 
 
+def test_fence_refuses_non_private_chat_even_when_ids_happen_to_match(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """P2-C: the two negative-test angles above are each proven against a
+    fence where only ONE half could plausibly be doing the work (the group
+    test's ids never match; the mismatched-id test claims to be private).
+    This proves the chat.type check is independently load-bearing even in
+    the (unreal, but code-reachable) case where a group's id equals the
+    presser's id -- deleting `chat.type != "private"` alone must fail this,
+    not just the id-mismatch test."""
+    query = CallbackQuery(
+        message=Message(Chat(chat_id=555, chat_type="group")), from_user=User(555)
+    )
+    assert _passes_callback_fence(query) is False
+
+
 # ---------------------------------------------------------------------------
 # _handle_callback: end-to-end refusal + verdict-submission behavior
 # ---------------------------------------------------------------------------
@@ -293,7 +429,7 @@ async def test_handle_callback_refuses_a_group_press_before_touching_the_client(
     tmp_path: Any,
 ) -> None:
     token_store = _ApprovalTokenStore()
-    nonces = token_store.mint_triplet(task_id="task-1", chat_id=123, user_id=123, ttl_seconds=60)
+    nonces = token_store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
     token_store.bind_message(nonces.values(), "999")
     query = CallbackQuery(
         data=CALLBACK_PREFIX + nonces["approve"],
@@ -318,7 +454,7 @@ async def test_handle_callback_refuses_a_group_press_before_touching_the_client(
 async def test_handle_callback_details_never_mutates(tmp_path: Any) -> None:
     """Details = answerCallbackQuery with a summary, no state change."""
     token_store = _ApprovalTokenStore()
-    nonces = token_store.mint_triplet(task_id="task-1", chat_id=123, user_id=123, ttl_seconds=60)
+    nonces = token_store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
     token_store.bind_message(nonces.values(), "999")
     message = Message(Chat(chat_id=123, chat_type="private"))
     query = CallbackQuery(
@@ -343,7 +479,7 @@ async def test_handle_callback_details_never_mutates(tmp_path: Any) -> None:
 @pytest.mark.asyncio
 async def test_handle_callback_approve_success_records_and_clears_keyboard(tmp_path: Any) -> None:
     token_store = _ApprovalTokenStore()
-    nonces = token_store.mint_triplet(task_id="task-abc123", chat_id=123, user_id=123, ttl_seconds=60)
+    nonces = token_store.mint_triplet(task_id="task-abc123", presser=presser(), ttl_seconds=60)
     token_store.bind_message(nonces.values(), "999")
     message = Message(Chat(chat_id=123, chat_type="private"))
     query = CallbackQuery(
@@ -389,7 +525,7 @@ async def test_handle_callback_surfaces_applied_false_without_corrupting_local_s
     """Token for task A used after task A left review -> server applied:false
     surfaced, no local state corruption (the token stays consumed either way)."""
     token_store = _ApprovalTokenStore()
-    nonces = token_store.mint_triplet(task_id="task-1", chat_id=123, user_id=123, ttl_seconds=60)
+    nonces = token_store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
     token_store.bind_message(nonces.values(), "999")
     message = Message(Chat(chat_id=123, chat_type="private"))
     query = CallbackQuery(
@@ -417,7 +553,7 @@ async def test_handle_callback_surfaces_applied_false_without_corrupting_local_s
 @pytest.mark.asyncio
 async def test_handle_callback_transport_exception_is_caught_and_surfaced(tmp_path: Any) -> None:
     token_store = _ApprovalTokenStore()
-    nonces = token_store.mint_triplet(task_id="task-1", chat_id=123, user_id=123, ttl_seconds=60)
+    nonces = token_store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
     token_store.bind_message(nonces.values(), "999")
     message = Message(Chat(chat_id=123, chat_type="private"))
     query = CallbackQuery(
@@ -436,6 +572,37 @@ async def test_handle_callback_transport_exception_is_caught_and_surfaced(tmp_pa
     assert receipt["applied"] is False
 
 
+@pytest.mark.asyncio
+async def test_handle_callback_non_mapping_transport_result_still_answers(
+    tmp_path: Any,
+) -> None:
+    """P2-D: a transport that hands back a non-Mapping result (no exception
+    raised) must not leave the callback silently unanswered. The token is
+    already burned by claim() either way; the human must see an error, not
+    a spinner that never resolves."""
+    token_store = _ApprovalTokenStore()
+    nonces = token_store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
+    token_store.bind_message(nonces.values(), "999")
+    message = Message(Chat(chat_id=123, chat_type="private"))
+    query = CallbackQuery(
+        data=CALLBACK_PREFIX + nonces["approve"], message=message, from_user=User(123)
+    )
+    update = Update(query)
+    client = FakeClient(result=["not", "a", "mapping"])
+    store = ApprovalReceiptStore(tmp_path / "receipts.json")
+    # Must not raise.
+    await _handle_callback(
+        update, client=client, secret_owner=None, receipt_store=store, token_store=token_store
+    )
+    assert query.answers  # answered, not silently eaten
+    assert query.answers[-1][1] is True
+    data, valid = store.load_checked()
+    assert valid
+    receipt = next(iter(data["receipts"].values()))
+    assert receipt["applied"] is False
+    assert receipt["reason"] == "invalid_response"
+
+
 # ---------------------------------------------------------------------------
 # build_approval_keyboard / send_approval_prompt
 # ---------------------------------------------------------------------------
@@ -444,9 +611,7 @@ async def test_handle_callback_transport_exception_is_caught_and_surfaced(tmp_pa
 def test_build_approval_keyboard_binds_via_on_sent(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_telegram(monkeypatch)
     store = _ApprovalTokenStore()
-    keyboard, on_sent = build_approval_keyboard(
-        task_id="task-1", chat_id=123, user_id=123, store=store
-    )
+    keyboard, on_sent = build_approval_keyboard(task_id="task-1", presser=presser(), store=store)
     row = keyboard.rows[0]
     assert [button.callback_data[: len(CALLBACK_PREFIX)] for button in row] == [
         CALLBACK_PREFIX
@@ -465,84 +630,54 @@ def test_build_approval_keyboard_on_sent_burns_when_no_message_id(
 ) -> None:
     _install_fake_telegram(monkeypatch)
     store = _ApprovalTokenStore()
-    keyboard, on_sent = build_approval_keyboard(
-        task_id="task-1", chat_id=123, user_id=123, store=store
-    )
+    keyboard, on_sent = build_approval_keyboard(task_id="task-1", presser=presser(), store=store)
     nonce = keyboard.rows[0][0].callback_data[len(CALLBACK_PREFIX):]
     on_sent(None)
     status, _record = store.claim(nonce)
     assert status == "unknown"
 
 
-# ---------------------------------------------------------------------------
-# /needs keyboard (needs_you_list-driven, conservative single-task shape)
-# ---------------------------------------------------------------------------
+def test_build_approval_keyboard_propagates_mint_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_telegram(monkeypatch)
+    store = _ApprovalTokenStore()
+    same_presser = presser(999)
+    for _ in range(3):
+        build_approval_keyboard(task_id="task-1", presser=same_presser, store=store)
+    with pytest.raises(MintRateLimited):
+        build_approval_keyboard(task_id="task-1", presser=same_presser, store=store)
 
 
-def test_single_pending_task_id_requires_exactly_one_task() -> None:
-    assert _single_pending_task_id({"ok": True, "result": []}) is None
-    assert (
-        _single_pending_task_id({"ok": True, "result": [{"id": "a"}, {"id": "b"}]})
-        is None
+@pytest.mark.asyncio
+async def test_send_approval_prompt_sends_to_the_presser_chat_and_binds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_telegram(monkeypatch)
+    store = _ApprovalTokenStore()
+    sent: list[dict[str, Any]] = []
+
+    async def adapter_send(**kwargs: Any) -> Any:
+        sent.append(kwargs)
+        return types.SimpleNamespace(message_id=555)
+
+    result = await inline_approval.send_approval_prompt(
+        adapter_send,
+        presser=presser(321),
+        task_id="task-1",
+        text="Please decide",
+        store=store,
     )
-    assert _single_pending_task_id({"ok": True, "result": [{"id": "only-one"}]}) == "only-one"
-    assert (
-        _single_pending_task_id({"ok": True, "result": {"tasks": [{"task_id": "t-1"}]}})
-        == "t-1"
-    )
-    assert _single_pending_task_id({"ok": False}) is None
-    assert _single_pending_task_id({"ok": True, "result": {"tasks": "not-a-list"}}) is None
-    assert _single_pending_task_id("not-a-dict") is None
-
-
-@pytest.mark.asyncio
-async def test_maybe_build_needs_keyboard_builds_for_exactly_one_task(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_fake_telegram(monkeypatch)
-    client = FakeClient({"ok": True, "result": [{"id": "solo-task"}]})
-    update = Update()
-    update.effective_chat = Chat(chat_id=123)
-    update.effective_user = User(123)
-    built = await maybe_build_needs_keyboard(client, secret_owner=None, update=update)
-    assert built is not None
-    keyboard, _on_sent = built
-    assert len(keyboard.rows[0]) == 3
-    assert client.calls == [("needs_you_list", {})]
-
-
-@pytest.mark.asyncio
-async def test_maybe_build_needs_keyboard_none_for_zero_or_many_tasks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_fake_telegram(monkeypatch)
-    update = Update()
-    update.effective_chat = Chat(chat_id=123)
-    update.effective_user = User(123)
-    for payload in ([], [{"id": "a"}, {"id": "b"}]):
-        client = FakeClient({"ok": True, "result": payload})
-        assert await maybe_build_needs_keyboard(client, secret_owner=None, update=update) is None
-
-
-@pytest.mark.asyncio
-async def test_maybe_build_needs_keyboard_never_raises_on_transport_failure() -> None:
-    client = FakeClient(raises=RuntimeError("boom"))
-    update = Update()
-    update.effective_chat = Chat(chat_id=123)
-    update.effective_user = User(123)
-    assert await maybe_build_needs_keyboard(client, secret_owner=None, update=update) is None
-
-
-@pytest.mark.asyncio
-async def test_maybe_build_needs_keyboard_refuses_non_self_chat(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_fake_telegram(monkeypatch)
-    client = FakeClient({"ok": True, "result": [{"id": "solo-task"}]})
-    update = Update()
-    update.effective_chat = Chat(chat_id=-555)  # a group chat id
-    update.effective_user = User(123)
-    assert await maybe_build_needs_keyboard(client, secret_owner=None, update=update) is None
+    assert result.message_id == 555
+    assert sent == [
+        {"chat_id": "321", "text": "Please decide", "reply_markup": sent[0]["reply_markup"]}
+    ]
+    nonce = sent[0]["reply_markup"].rows[0][0].callback_data[len(CALLBACK_PREFIX):]
+    status, record = store.claim(nonce)
+    assert status == "ok"
+    assert record.chat_id == "321"
+    assert record.user_id == "321"
+    assert record.prompt_message_id == "555"
 
 
 # ---------------------------------------------------------------------------

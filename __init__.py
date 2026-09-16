@@ -26,7 +26,6 @@ from .schemas import (
 from .telegram_control import TelegramControlSettings, register_telegram_control
 from .telegram_inline_approval import (
     TelegramInlineApprovalSettings,
-    maybe_build_needs_keyboard,
     register_telegram_inline_approval,
 )
 from .profile_scope import ProfileSecretOwner, require_supported_profile_runtime
@@ -381,17 +380,10 @@ def register(ctx: Any) -> None:
                 operator_settings,
                 secret_reader=secret_owner.read_secret,
             )
-            needs_keyboard_factory = None
-            if inline_approval_settings.enabled:
-                async def needs_keyboard_factory(update: Any) -> Any:
-                    return await maybe_build_needs_keyboard(
-                        client, secret_owner=secret_owner, update=update
-                    )
             register_telegram_control(
                 ctx,
                 telegram_control_settings,
                 secret_owner=secret_owner,
-                needs_keyboard_factory=needs_keyboard_factory,
             )
             register_telegram_inline_approval(
                 ctx,

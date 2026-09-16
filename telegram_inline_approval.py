@@ -7,6 +7,24 @@ Telegram chat, and handles the resulting button press deterministically --
 entirely outside the LLM, the same way the slash commands are a relay, not a
 model tool call.
 
+SCOPE (round 2, post-gate): this module ships ONLY the explicit primitive --
+``send_approval_prompt``/``build_approval_keyboard`` plus the callback
+handler that consumes what they mint. There is deliberately no automatic
+"attach a keyboard to whatever /needs renders" wiring: round 1 shipped one
+(``maybe_build_needs_keyboard``, driven by ``needs_you_list`` on the AGENT's
+own bearer, gated only by a plugin-local string match against the server's
+free-form reply text) and both gates (Athena P0-1/P0-2/P1-3, kasra-review
+P1-B/P2-F) found it authorized a Telegram STRANGER for the owner's pending
+decision -- the server's own "you're not registered" reply is not either of
+the plugin's two local refusal literals, so the gate that was supposed to
+keep strangers out let everyone through, and the keyboard it built was bound
+to a principal (``needs_you_list``'s own agent-scoped result) that had
+nothing to do with whoever actually typed ``/needs``. Removed rather than
+patched: the fix is a caller that has ALREADY resolved a specific member for
+a specific task invoking :func:`send_approval_prompt` directly -- see the
+follow-up issue tracking a server-side, presser-scoped "your one pending
+task" call, which does not exist yet.
+
 Design notes (why it looks the way it does):
 
 * Callback data is an opaque one-time token ``mv:<nonce>`` (>=128 bits of
@@ -24,6 +42,19 @@ Design notes (why it looks the way it does):
   history (PR #13, rounds 3-4): a match-to-consume design that leaves the
   matched record alive when the match "succeeds" degenerates from an
   attestation into a bearer credential the instant two callers can race it.
+  (Verified under real contention by Athena's and kasra-review's gates: 200
+  trials x 16-64 barrier-synchronised threads on one bound token -> exactly
+  one "ok" every time.)
+
+* :class:`VerifiedPresser` collapses "chat_id" and "user_id" into ONE value
+  at every mint call site (round 2, kasra-review P1-A): a caller that has
+  independently resolved "which member" and "which Telegram chat" for a
+  private-chat decision must supply the SAME identity for both, and the type
+  makes supplying two different values impossible to construct, not merely
+  invalid-if-checked. This closes the concrete PoC from round 1's gate
+  (``send_approval_prompt(chat_id=100, user_id=200, ...)`` minted a token
+  that recorded a verdict on member 200 when Telegram user 100 -- the actual
+  presser -- pressed it) at the API boundary, structurally.
 
 * The fence (private chat, sender is the chat owner) is evaluated against the
   raw PTB ``CallbackQuery``, not through
@@ -65,7 +96,20 @@ logger = logging.getLogger(__name__)
 
 
 CALLBACK_PREFIX = "mv:"
+
+# Forward-compatibility hook only (kasra-review round-1 gate, P3-H): the
+# token store is in-process/memory-only (see _ApprovalTokenStore's
+# docstring) and every record in a given process is minted with this same
+# constant, so claim()'s version_mismatch branch below CANNOT fire from any
+# real token within one process's lifetime -- a version bump ships as a new
+# process with an empty store. It exists so a *future* change that persists
+# the store across a restart (or shares it across processes) inherits a
+# version fence for free, not because it is an active control today. An
+# earlier revision of this module's own commit message overstated this as a
+# live "resurrection" defense; it is not one yet, and is not exercised by
+# anything a real Telegram update can produce.
 TOKEN_VERSION = 1
+
 DEFAULT_TOKEN_TTL_SECONDS = 600.0
 _MIN_TOKEN_TTL_SECONDS = 1.0
 _MAX_TOKEN_TTL_SECONDS = 600.0
@@ -73,14 +117,23 @@ _NONCE_BYTES = 18  # secrets.token_urlsafe(18) ~ 144 bits of entropy
 _MAX_PENDING_TOKENS = 512
 _MAX_RECEIPTS = 500
 
+# Per-chat mint throttle (kasra-review round-1 gate, P2-F): round 1's only
+# live flood vector was stranger /needs spam, removed along with the
+# auto-keyboard above. Kept as a hardening property of the primitive itself
+# for whenever a future caller wires it up -- one chat should never be able
+# to burn through a meaningful fraction of the global 512-entry FIFO by
+# itself, regardless of how it gets invoked.
+_MINT_RATE_LIMIT_PER_CHAT = 3
+_MINT_RATE_LIMIT_WINDOW_SECONDS = 60.0
+
 VERDICTS = ("approve", "reject")
 _ALL_BUTTON_KINDS = ("approve", "reject", "details")
 
 _REFUSAL_TEXT: Mapping[str, str] = {
     "unknown": "This button is no longer valid.",
-    "expired": "This decision has expired. Use /needs to see it again.",
+    "expired": "This decision has expired. Ask for a fresh prompt.",
     "used": "This decision was already made.",
-    "version_mismatch": "This button is from an older message. Use /needs to see the current one.",
+    "version_mismatch": "This button is from an older message. Ask for a fresh prompt.",
     "not_bound": "This button is no longer valid.",
     "fence": "This decision can only be made in your own private chat.",
 }
@@ -88,6 +141,45 @@ _REFUSAL_TEXT: Mapping[str, str] = {
 
 def _isoformat_utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# --------------------------------------------------------------------------
+# Verified presser identity
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class VerifiedPresser:
+    """A Telegram identity a caller has already resolved as the sole
+    presser in their own private chat with the bot.
+
+    ``chat_id`` and ``user_id`` are structurally the SAME value here -- not
+    two independently-supplied parameters a caller could accidentally (or
+    maliciously) construct as disagreeing. Anything downstream that needs
+    both as separate fields (the stored token record's wire shape, the
+    ``human_origin`` payload mupot expects) reads both off :attr:`id` via the
+    properties below; there is no second value that could ever disagree with
+    the first. This is round 2's structural fix for kasra-review's P1-A: a
+    concrete PoC minted a prompt with ``chat_id=100, user_id=200`` and had it
+    attest to member 200 when Telegram user 100 (the real presser) pressed
+    it -- with this type, that call could not have been written.
+    """
+
+    id: str
+
+    def __post_init__(self) -> None:
+        normalized = str(self.id).strip()
+        if not normalized:
+            raise ValueError("VerifiedPresser id must be non-empty")
+        object.__setattr__(self, "id", normalized)
+
+    @property
+    def chat_id(self) -> str:
+        return self.id
+
+    @property
+    def user_id(self) -> str:
+        return self.id
 
 
 # --------------------------------------------------------------------------
@@ -238,8 +330,12 @@ def _persist_receipt(
 
 
 # --------------------------------------------------------------------------
-# Token store: claim-or-burn, single-use, TTL-bounded
+# Token store: claim-or-burn, single-use, TTL-bounded, rate-limited mint
 # --------------------------------------------------------------------------
+
+
+class MintRateLimited(RuntimeError):
+    """Too many approval-keyboard mints requested for one chat recently."""
 
 
 @dataclass
@@ -269,18 +365,46 @@ class _ApprovalTokenStore:
         self._lock = threading.Lock()
         self._entries: "OrderedDict[str, _PendingApproval]" = OrderedDict()
         self._max_entries = max_entries
+        self._mint_times: dict[str, list[float]] = {}
+
+    def _check_mint_rate_locked(self, chat_key: str, *, task_id: str) -> None:
+        now = time.monotonic()
+        recent = [
+            t
+            for t in self._mint_times.get(chat_key, [])
+            if now - t < _MINT_RATE_LIMIT_WINDOW_SECONDS
+        ]
+        if len(recent) >= _MINT_RATE_LIMIT_PER_CHAT:
+            self._mint_times[chat_key] = recent
+            logger.warning(
+                "mupot plugin: inline-approval mint rate-limited chat_id=%s "
+                "task_id=%s (%d mints in the last %.0fs)",
+                chat_key,
+                task_id,
+                len(recent),
+                _MINT_RATE_LIMIT_WINDOW_SECONDS,
+            )
+            raise MintRateLimited(
+                f"too many approval prompts minted for chat {chat_key} recently"
+            )
+        recent.append(now)
+        self._mint_times[chat_key] = recent
 
     def mint_triplet(
         self,
         *,
         task_id: str,
-        chat_id: Any,
-        user_id: Any,
+        presser: VerifiedPresser,
         ttl_seconds: float = DEFAULT_TOKEN_TTL_SECONDS,
     ) -> dict[str, str]:
         """Mint one fresh, unbound (no prompt_message_id yet) nonce per button
         kind. Call :meth:`bind_message` once the prompt has actually been sent
-        and its message id is known, or :meth:`burn` if the send failed."""
+        and its message id is known, or :meth:`burn` if the send failed.
+
+        Raises :class:`MintRateLimited` when *presser*'s chat has minted too
+        many triplets recently (see ``_MINT_RATE_LIMIT_PER_CHAT``) -- callers
+        that want to degrade gracefully instead of erroring must catch it.
+        """
         bounded_ttl = max(
             _MIN_TOKEN_TTL_SECONDS, min(_MAX_TOKEN_TTL_SECONDS, float(ttl_seconds))
         )
@@ -288,13 +412,14 @@ class _ApprovalTokenStore:
         expires_at = now + bounded_ttl
         nonces: dict[str, str] = {}
         with self._lock:
+            self._check_mint_rate_locked(presser.chat_id, task_id=task_id)
             for verdict in _ALL_BUTTON_KINDS:
                 nonce = secrets.token_urlsafe(_NONCE_BYTES)
                 self._entries[nonce] = _PendingApproval(
                     task_id=str(task_id),
                     verdict=verdict,
-                    chat_id=str(chat_id),
-                    user_id=str(user_id),
+                    chat_id=presser.chat_id,
+                    user_id=presser.user_id,
                     version=TOKEN_VERSION,
                     issued_at=now,
                     expires_at=expires_at,
@@ -316,11 +441,34 @@ class _ApprovalTokenStore:
             )
 
     def bind_message(self, nonces: Iterable[str], message_id: Any) -> None:
+        """Bind each nonce to the prompt message it was actually sent under.
+
+        Refuses (logs + skips) rebinding a nonce that is already bound to a
+        DIFFERENT message id (kasra-review round-1 gate, P2-E): the caller's
+        ``on_sent`` closure could otherwise be invoked twice (a retry, a
+        re-send) and silently repoint a live token at a different message,
+        and ``human_origin.message_id`` is the server's own
+        one-decision-per-``(chat, message_id)`` replay key -- it must not
+        drift after the fact. Rebinding to the SAME id already bound is a
+        harmless no-op (idempotent retry), not refused.
+        """
+        target = str(message_id)
         with self._lock:
             for nonce in nonces:
                 record = self._entries.get(nonce)
-                if record is not None:
-                    record.prompt_message_id = str(message_id)
+                if record is None:
+                    continue
+                if record.prompt_message_id is not None and record.prompt_message_id != target:
+                    logger.warning(
+                        "mupot plugin: inline-approval refused to rebind nonce=%s "
+                        "task_id=%s from message_id=%s to message_id=%s",
+                        nonce[:8],
+                        record.task_id,
+                        record.prompt_message_id,
+                        target,
+                    )
+                    continue
+                record.prompt_message_id = target
 
     def burn(self, nonces: Iterable[str], *, reason: str) -> None:
         with self._lock:
@@ -346,6 +494,10 @@ class _ApprovalTokenStore:
             if record is None:
                 return "unknown", None
             if record.version != TOKEN_VERSION:
+                # See TOKEN_VERSION's module-level docstring: unreachable
+                # with today's in-process, single-constant store. Kept as a
+                # forward-compat hook for a persisted/shared store, not
+                # because anything can trigger it today.
                 return "version_mismatch", None
             if time.monotonic() >= record.expires_at:
                 del self._entries[nonce]
@@ -388,12 +540,14 @@ def _build_keyboard(nonces: Mapping[str, str]) -> Any:
 def build_approval_keyboard(
     *,
     task_id: str,
-    chat_id: Any,
-    user_id: Any,
+    presser: VerifiedPresser,
     ttl_seconds: float = DEFAULT_TOKEN_TTL_SECONDS,
     store: _ApprovalTokenStore = _STORE,
 ) -> tuple[Any, Callable[[Optional[Any]], None]]:
-    """Mint a fresh Approve/Reject/Details keyboard for *task_id*.
+    """Mint a fresh Approve/Reject/Details keyboard for *task_id*, bound to
+    *presser* -- a caller-verified single Telegram identity (see
+    :class:`VerifiedPresser`; a mismatched chat/user pair cannot be
+    constructed at all).
 
     Returns ``(reply_markup, on_sent)``. The caller MUST call
     ``on_sent(message_id)`` with the id of the message the keyboard was
@@ -402,10 +556,11 @@ def build_approval_keyboard(
     to a real prompt message id, since ``human_origin.message_id`` (the
     server's own one-decision-per-message replay key) must name that exact
     message.
+
+    Raises :class:`MintRateLimited` when *presser*'s chat has minted too many
+    prompts recently.
     """
-    nonces = store.mint_triplet(
-        task_id=task_id, chat_id=chat_id, user_id=user_id, ttl_seconds=ttl_seconds
-    )
+    nonces = store.mint_triplet(task_id=task_id, presser=presser, ttl_seconds=ttl_seconds)
     keyboard = _build_keyboard(nonces)
 
     def on_sent(message_id: Optional[Any]) -> None:
@@ -420,110 +575,30 @@ def build_approval_keyboard(
 async def send_approval_prompt(
     adapter_send: Callable[..., Awaitable[Any]],
     *,
-    chat_id: Any,
-    user_id: Any,
+    presser: VerifiedPresser,
     task_id: str,
     text: str,
     ttl_seconds: float = DEFAULT_TOKEN_TTL_SECONDS,
     store: _ApprovalTokenStore = _STORE,
 ) -> Any:
-    """Send *text* to *chat_id* with a fresh Approve/Reject/Details keyboard
-    attached, binding the minted tokens to the resulting message id (or
-    burning them if the send did not yield one)."""
+    """Send *text* to *presser*'s chat with a fresh Approve/Reject/Details
+    keyboard attached, binding the minted tokens to the resulting message id
+    (or burning them if the send did not yield one).
+
+    This is the explicit primitive: the CALLER is responsible for having
+    already resolved *presser* to the correct member for *task_id* (there is
+    no automatic "figure out who this is for" wiring in this module -- see
+    the module docstring's SCOPE note).
+    """
     keyboard, on_sent = build_approval_keyboard(
-        task_id=task_id, chat_id=chat_id, user_id=user_id, ttl_seconds=ttl_seconds, store=store
+        task_id=task_id, presser=presser, ttl_seconds=ttl_seconds, store=store
     )
-    result = await adapter_send(chat_id=chat_id, text=text, reply_markup=keyboard)
+    result = await adapter_send(chat_id=presser.chat_id, text=text, reply_markup=keyboard)
     message_id = getattr(result, "message_id", None)
     if message_id is None and isinstance(result, Mapping):
         message_id = result.get("message_id")
     on_sent(message_id)
     return result
-
-
-# --------------------------------------------------------------------------
-# needs_you_list-driven keyboard for the /needs deterministic command
-# --------------------------------------------------------------------------
-
-
-def _single_pending_task_id(result: Any) -> Optional[str]:
-    """Best-effort extraction of exactly one pending task id from a
-    ``needs_you_list`` action result.
-
-    Deliberately conservative: v1 only attaches a keyboard when there is
-    EXACTLY one pending decision (the documented pilot flow -- "/needs ->
-    /approve f9408956"). Any other shape (more than one task, zero tasks, an
-    unrecognized payload shape) returns ``None`` and /needs falls back to its
-    existing plain-text reply, unchanged. The exact `needs_you_list` result
-    schema was not available to verify against a live server in this build
-    (branch-only, no deploy) -- this reads the shapes that are consistent
-    with every other operator action result seen in this plugin
-    (``{"ok": true, "result": ...}``) and degrades to "no keyboard" rather
-    than guessing on an unrecognized one.
-    """
-    if not isinstance(result, Mapping) or result.get("ok") is not True:
-        return None
-    payload = result.get("result")
-    candidates: Any = None
-    if isinstance(payload, list):
-        candidates = payload
-    elif isinstance(payload, Mapping):
-        for key in ("tasks", "items", "results", "pending"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                candidates = value
-                break
-    if not isinstance(candidates, list) or len(candidates) != 1:
-        return None
-    entry = candidates[0]
-    if not isinstance(entry, Mapping):
-        return None
-    task_id = entry.get("task_id") or entry.get("id")
-    if not isinstance(task_id, str) or not task_id.strip():
-        return None
-    return task_id.strip()
-
-
-async def maybe_build_needs_keyboard(
-    client: Any,
-    *,
-    secret_owner: Any,
-    update: Any,
-    store: _ApprovalTokenStore = _STORE,
-    ttl_seconds: float = DEFAULT_TOKEN_TTL_SECONDS,
-) -> Optional[tuple[Any, Callable[[Optional[Any]], None]]]:
-    """Build an Approve/Reject/Details keyboard for a ``/needs`` reply, when
-    (and only when) exactly one task is pending. Never raises -- any failure
-    degrades to ``None`` (plain-text reply only)."""
-
-    def fetch() -> Any:
-        if secret_owner is None:
-            return client.call("needs_you_list", {})
-        with secret_owner.activate():
-            return client.call("needs_you_list", {})
-
-    try:
-        result = await asyncio.to_thread(fetch)
-    except Exception:
-        logger.warning(
-            "mupot plugin: needs_you_list call for inline keyboard failed", exc_info=True
-        )
-        return None
-
-    task_id = _single_pending_task_id(result)
-    if task_id is None:
-        return None
-
-    chat = getattr(update, "effective_chat", None)
-    user = getattr(update, "effective_user", None)
-    chat_id = getattr(chat, "id", None)
-    user_id = getattr(user, "id", None)
-    if chat_id is None or user_id is None or str(user_id) != str(chat_id):
-        return None
-
-    return build_approval_keyboard(
-        task_id=task_id, chat_id=chat_id, user_id=user_id, ttl_seconds=ttl_seconds, store=store
-    )
 
 
 # --------------------------------------------------------------------------
@@ -632,7 +707,17 @@ async def _submit_verdict(
         verdict_id=_extract_verdict_id(result),
     )
 
-    if result.get("ok") is True and applied:
+    # kasra-review round-1 gate, P2-D: `_origin_outcome` above already
+    # defends against a non-Mapping `result` (any transport can hand back
+    # something unexpected without raising); this check must be equally
+    # defensive rather than assume `result` is a dict just because the
+    # exception handler above always builds one. An uncaught AttributeError
+    # here would leave the press silently unanswered -- the token already
+    # burned, the receipt already written as applied:false, but the human
+    # sees nothing and the keyboard stays armed. Fail closed on the
+    # ANSWER, not just on the verdict.
+    call_ok = isinstance(result, Mapping) and result.get("ok") is True
+    if call_ok and applied:
         await answer("Recorded.")
     else:
         logger.warning(

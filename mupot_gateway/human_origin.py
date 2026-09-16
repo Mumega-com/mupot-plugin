@@ -17,10 +17,17 @@ token. Round 4's rule, and the only thing that changed: **a pending record lives
 until the next ``pre_llm_call`` that QUALIFIES for this session** (Telegram
 platform, a string ``user_message``, a resolvable session key, not a delegated
 child -- see :func:`bind_turn_custody`'s own guards, each of which returns
-*before* the drain) **-- it either binds to that turn or is burned right there,
-logged, never re-queued.** A turn that does not qualify neither binds nor burns
-anything; whatever is pending for that session is still capped by the 2-minute
-TTL backstop.
+*before* the drain, each independently proven in
+``tests/native/test_human_origin.py``'s ``test_guard_*_returns_before_the_drain_record_survives``:
+non-Telegram platform, empty ``turn_id``, non-``str`` ``user_message``, no
+resolvable session key, and a delegated child -- kasra-review round-4 P1-1)
+**-- it either binds to that turn or is burned right there, logged, never
+re-queued.** A turn that does not qualify neither binds nor burns anything;
+whatever is pending for that session is still capped by the 2-minute TTL
+backstop, and a later plugin (``pre_gateway_dispatch`` returning
+``{"action": "skip"}``, an auth refusal, an emergency-stop pause) can likewise
+consume a message without ever starting a turn at all -- those records wait for
+whatever turn comes next, up to the same TTL.
 
 1. ``pre_gateway_dispatch`` (:func:`capture_human_origin`) -- unchanged trust
    fence (private, non-forwarded, self chat; shared forwarding check in
@@ -73,6 +80,19 @@ third-party ``pre_gateway_dispatch`` plugin that can emit an unwrapped string
 would need to guess/replay the human's own recent words, and round 4's
 bind-or-burn rule means it must do so as the very next ``pre_llm_call`` on that
 session, before the human's own turn (if any) burns it first.
+
+Second documented residual (kasra-review round-4 P1-2): the pool is drained
+per SESSION, not per MESSAGE. On Hermes's own live default
+(``busy_input_mode: interrupt``), two Telegram texts sent inside the debounce
+window are MERGED into ONE turn's inbound text before that turn ever reaches
+``pre_llm_call`` -- but both were already captured as separate records first
+(capture happens at ``pre_gateway_dispatch``, upstream of busy-session
+handling entirely). The one turn that actually runs presents the
+CONCATENATED text, which matches NEITHER individual capture, so both are
+burned. This is fail-closed BY DESIGN, not a bypass: neither message
+authenticates a ``task_verdict`` call, the verdict (if the model even makes
+one) rides the agent seat, and the human's remedy is to resend one message at
+a time. The only signal is the burn WARNING, same as any other mismatch.
 """
 
 from __future__ import annotations
@@ -82,7 +102,7 @@ import logging
 import re
 import time
 from collections import OrderedDict, deque
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from ..telegram_fence import is_forwarded_telegram_message
 
@@ -117,16 +137,57 @@ _KNOWN_MUPOT_DECISION_TOOL_NAMES = frozenset({
     "approve_gate_edge", "advance_node", "objective_accept", "routine_run_answer",
 })
 
-# The mupot MCP server name this Hermes profile configures. UNSET (None) until
-# mupot_gateway/adapter.py's adapter_factory calls set_mcp_server_name() with the
-# SAME value MupotAdapter itself resolves (extra.get("mcp_server") or "mupot") --
-# kasra-review round-2 P1-2: resolving lazily (rather than defaulting to "mupot"
-# up front) means a governed call that somehow arrives before the platform adapter
-# connects can only ever be STRIPPED (via _looks_like_mupot_tool, independent
-# of server name for the named fallback list), never wrongly STAMPED under a
-# guessed name.
+# The mupot MCP server name each Hermes PROFILE configures. UNSET (no entry)
+# until mupot_gateway/adapter.py's adapter_factory calls set_mcp_server_name()
+# with the SAME value MupotAdapter itself resolves (extra.get("mcp_server") or
+# "mupot") -- kasra-review round-2 P1-2: resolving lazily (rather than
+# defaulting to "mupot" up front) means a governed call that somehow arrives
+# before the platform adapter connects can only ever be STRIPPED (via
+# _looks_like_mupot_tool, independent of server name for the named fallback
+# list), never wrongly STAMPED under a guessed name.
+#
+# Keyed by PROFILE, not a single process-wide value (round 5, kasra-review
+# round-4 P2-2): under Hermes multiplexing, one process can serve several
+# profiles, each with its own mupot_gateway platform config and potentially a
+# DIFFERENT configured mcp_server name -- a single module-level string would
+# let whichever profile's adapter_factory ran last silently overwrite every
+# other profile's resolution. Defence-in-depth only (neither round-2 nor
+# round-4's gate found a path from a wrong server-name resolution to an actual
+# STAMP, only to a missed one -- HUMAN_ORIGIN_TOOL_NAMES's exact-match-only
+# stamp gate never fires for the wrong profile's tools either way), but cheap
+# to make correct.
 DEFAULT_MCP_SERVER_NAME = "mupot"
-_mcp_server_name: Optional[str] = None
+_mcp_server_name_by_profile: Dict[str, str] = {}
+
+
+def _default_profile_key() -> str:
+    """Best-effort identity for 'whichever profile is active right now', used
+    on BOTH sides: at set time (adapter_factory, called while Hermes is
+    establishing that profile's platform) and, as a fallback, at read time for
+    a turn whose session carries no explicit profile (the common
+    non-multiplexed case, where this is simply the one active profile)."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
+def _current_profile_key() -> str:
+    """The profile a TURN is running under, read the same way
+    gateway/session_context.py's HERMES_SESSION_PROFILE contextvar is read
+    elsewhere in this codebase (_set_session_env binds it per turn from
+    context.source.profile) -- the per-turn analogue of _current_session_key().
+    Falls back to _default_profile_key() when no session profile is bound
+    (non-multiplexed Hermes never sets one)."""
+    try:
+        from gateway.session_context import get_session_env
+        profile = get_session_env("HERMES_SESSION_PROFILE", "")
+        if profile:
+            return profile
+    except Exception:
+        pass
+    return _default_profile_key()
 
 # kasra-review round-2 P1-1: Hermes SANITIZES the server component of the wire name
 # (tools/mcp_tool_schema.py's sanitize_mcp_name_component, re.sub(r"[^A-Za-z0-9_]",
@@ -151,9 +212,17 @@ def _hash_text(text: str) -> str:
 
 
 # Bounded: a gateway running for weeks cannot grow these without limit.
-#  - per-session pending queue: guards a burst of rapid messages before any turn
-#    binds/burns them.
-#  - total pending count across every session.
+#  - per-session pending queue: this many UNCLAIMED captures may exist for one
+#    session at once, between the moment they're captured and the next
+#    pre_llm_call that qualifies for that session (which drains ALL of them in
+#    one call -- kasra-review round-4 P1-2: this cap does NOT protect against a
+#    burst destroying attestation for every message but one, since bind()
+#    empties the whole queue on the very next qualifying turn regardless of
+#    depth; it only bounds how much memory a session that never reaches such a
+#    turn at all can consume before the TTL backstop catches it). Overflow
+#    evicts the OLDEST record and logs it exactly like a burn
+#    (kasra-review round-4 P2-1).
+#  - total pending count across every session (same eviction/logging).
 #  - total bound-record count across every (session_key, turn_id) pair.
 # TTL is now ONLY a backstop for a session that never reaches pre_llm_call at all
 # (round 4, kasra-review round-3 P0-1/Athena round-3): the mechanism that bounds
@@ -174,9 +243,9 @@ _WARNED_UNSUPPORTED_PLATFORMS: set[str] = set()
 # hook this module registers that receives BOTH). on_session_reset/on_session_end
 # only ever receive session_id, never session_key, so this is what lets those two
 # hooks find the right stash entries to drop. A session that captured a record but
-# never ran any turn at all is not in this map -- the 10-minute TTL alone bounds
-# that (extremely unlikely: capturing IS part of processing an inbound message,
-# which necessarily starts a turn).
+# never ran any turn at all is not in this map -- the 2-minute TTL backstop alone
+# bounds that (extremely unlikely: capturing IS part of processing an inbound
+# message, which necessarily starts a turn).
 _MAX_SESSION_ID_MAP = 512
 _SESSION_ID_TO_KEY: "OrderedDict[str, str]" = OrderedDict()
 
@@ -220,9 +289,15 @@ class _OriginStash:
     the OLDER of the two message ids: content-correct, id-drifted. Named P2
     residual, unchanged severity from round 3.
 
-    ``read(session_key, turn_id)`` is the ONLY read path (``pre_tool_call``): it
-    returns whatever is bound to that exact turn, or ``None`` -- never touches the
-    pending queue, never falls back to "whatever is left".
+    ``read(session_key, turn_id)`` is the ONLY read path (``pre_tool_call``) and
+    is ONE-SHOT (round 5, kasra-review round-4 P1-3): it CONSUMES the bound
+    record on the first call, returning ``None`` to every later call for the
+    same turn. Without this, one bound record stamped EVERY ``task_verdict`` call
+    in the turn -- so a model steered into calling it twice with two different
+    ``task_id``s got the human's identity on both, and mupot's own replay guard
+    (keyed on the message, not the task) would apply whichever call reached it
+    first, not necessarily the one the human actually named. One human message
+    now authenticates AT MOST one ``task_verdict`` call.
     """
 
     def __init__(
@@ -243,15 +318,19 @@ class _OriginStash:
     def _expired(self, stamped_at: float) -> bool:
         return (time.monotonic() - stamped_at) > self._ttl_seconds
 
-    def capture(self, session_key: str, record: Mapping[str, Any]) -> None:
+    def capture(
+        self, session_key: str, record: Mapping[str, Any], *, evict_callback: Optional[Any] = None,
+    ) -> None:
         if not session_key:
             return
         dq = self._pending.setdefault(session_key, deque())
         dq.append((time.monotonic(), dict(record)))
         self._pending_count += 1
         while len(dq) > self._max_pending_per_session:
-            dq.popleft()
+            _, evicted = dq.popleft()
             self._pending_count -= 1
+            if evict_callback is not None:
+                evict_callback(evicted, "capture_overflow_session")
         if not dq:
             self._pending.pop(session_key, None)
         else:
@@ -259,8 +338,10 @@ class _OriginStash:
         while self._pending_count > self._max_pending_total and self._pending:
             oldest_session, oldest_dq = next(iter(self._pending.items()))
             if oldest_dq:
-                oldest_dq.popleft()
+                _, evicted = oldest_dq.popleft()
                 self._pending_count -= 1
+                if evict_callback is not None:
+                    evict_callback(evicted, "capture_overflow_global")
             if not oldest_dq:
                 self._pending.pop(oldest_session, None)
 
@@ -315,17 +396,19 @@ class _OriginStash:
         return True
 
     def read(self, session_key: str, turn_id: str) -> Optional[dict[str, Any]]:
+        """One-shot: pops the bound record on the FIRST call for this turn (round
+        5, kasra-review round-4 P1-3). A second ``task_verdict`` call in the same
+        turn -- whether the model made it deliberately or was steered into it --
+        finds nothing, exactly like a turn nothing was ever bound to."""
         if not session_key or not turn_id:
             return None
         key = (session_key, turn_id)
-        entry = self._bound.get(key)
+        entry = self._bound.pop(key, None)
         if entry is None:
             return None
         stamped_at, record = entry
         if self._expired(stamped_at):
-            del self._bound[key]
             return None
-        self._bound.move_to_end(key)
         return dict(record)
 
     def drop_session(self, session_key: str) -> None:
@@ -351,16 +434,19 @@ class _OriginStash:
 _STASH = _OriginStash()
 
 
-def set_mcp_server_name(name: Optional[str]) -> None:
+def set_mcp_server_name(name: Optional[str], *, profile: Optional[str] = None) -> None:
     """Called from mupot_gateway/adapter.py's adapter_factory with the SAME value
-    MupotAdapter itself resolves. A falsy *name* explicitly UNSETS resolution
-    (prefix matching refused entirely until set again) rather than falling back to
-    a guessed default -- see the module-level ``_mcp_server_name`` docstring note."""
-    global _mcp_server_name
+    MupotAdapter itself resolves. Scoped to *profile* (defaulting to whichever
+    profile is active right now -- see :func:`_default_profile_key`) so two
+    multiplexed profiles with different ``mcp_server`` values never clobber each
+    other (round 5, kasra-review round-4 P2-2). A falsy *name* explicitly UNSETS
+    resolution for that profile (prefix matching refused entirely until set
+    again) rather than falling back to a guessed default."""
+    key = profile or _default_profile_key()
     if not name:
-        _mcp_server_name = None
+        _mcp_server_name_by_profile.pop(key, None)
         return
-    _mcp_server_name = _sanitize_mcp_name_component(name)
+    _mcp_server_name_by_profile[key] = _sanitize_mcp_name_component(name)
 
 
 def _looks_like_mupot_tool(tool_name: Any) -> bool:
@@ -383,7 +469,8 @@ def _looks_like_mupot_tool(tool_name: Any) -> bool:
         return False
     if tool_name in _KNOWN_MUPOT_DECISION_TOOL_NAMES:
         return True
-    if _mcp_server_name and tool_name.startswith(f"mcp__{_mcp_server_name}__"):
+    server_name = _mcp_server_name_by_profile.get(_current_profile_key())
+    if server_name and tool_name.startswith(f"mcp__{server_name}__"):
         return True
     if tool_name.startswith("mcp__"):
         for name in _KNOWN_MUPOT_DECISION_TOOL_NAMES:
@@ -403,9 +490,10 @@ def _resolve_governed_tool_name(tool_name: Any) -> Optional[str]:
         return None
     if tool_name in HUMAN_ORIGIN_TOOL_NAMES:
         return tool_name
-    if not _mcp_server_name:
+    server_name = _mcp_server_name_by_profile.get(_current_profile_key())
+    if not server_name:
         return None
-    prefix = f"mcp__{_mcp_server_name}__"
+    prefix = f"mcp__{server_name}__"
     if tool_name.startswith(prefix):
         suffix = tool_name[len(prefix):]
         if suffix in HUMAN_ORIGIN_TOOL_NAMES:
@@ -537,7 +625,7 @@ def capture_human_origin(
             # returned as a stamped human_origin (see stamp_tool_call).
             "text_sha256": _hash_text(text if isinstance(text, str) else ""),
         }
-        _STASH.capture(session_key, record)
+        _STASH.capture(session_key, record, evict_callback=_log_burn)
     except Exception:
         logger.warning("mupot plugin: human-origin capture failed", exc_info=True)
     return None
@@ -616,13 +704,15 @@ def bind_turn_custody(
 
     Never raises: a bind failure just means nothing is stamped for this turn --
     fail open on the FEATURE (the turn proceeds normally, under the agent seat),
-    fail closed on the ATTESTATION (no human_origin is ever fabricated). This is
-    NOT visible as an ``applied:false`` on the server's response -- when nothing
-    binds, ``human_origin`` is never sent at all, and mupot's server omits the
-    key from its answer entirely (``applied:false`` is what a SUPPLIED but
-    unresolvable origin produces, a different case). The verdict's response is
-    therefore byte-identical to a pre-feature call; the ONLY positive
-    operator-visible signal that an approval failed to attest is the
+    fail closed on the ATTESTATION (no human_origin is ever fabricated). When
+    nothing binds, this plugin never sends a ``human_origin`` field at all; on
+    mupot's server side (branch ``kasra/human-origin-attested-verdict``, #1425)
+    an agent-bound call with no supplied origin gets back
+    ``human_origin: {applied: false, reason: "absent"}`` in its response --
+    distinct from what a SUPPLIED-but-unresolvable origin would produce, but
+    still not a distinguishing signal a casual reader would recognize as
+    "your approval didn't count as yours". The ONLY operator-visible signal
+    that specifically NAMES what happened is the
     ``burning unconsumed human-origin capture`` WARNING this function logs via
     :func:`_log_burn`.
     """

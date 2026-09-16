@@ -61,12 +61,12 @@ def _clean_state():
     human_origin._STASH.clear()
     human_origin._WARNED_UNSUPPORTED_PLATFORMS.clear()
     human_origin._SESSION_ID_TO_KEY.clear()
-    human_origin.set_mcp_server_name(None)
+    human_origin._mcp_server_name_by_profile.clear()
     yield
     human_origin._STASH.clear()
     human_origin._WARNED_UNSUPPORTED_PLATFORMS.clear()
     human_origin._SESSION_ID_TO_KEY.clear()
-    human_origin.set_mcp_server_name(None)
+    human_origin._mcp_server_name_by_profile.clear()
 
 
 def _capture(session_key, text="hello", message_id="tg-msg-1", **source_kwargs):
@@ -245,6 +245,38 @@ def test_a_failed_bind_burns_the_record_it_could_not_match_p0_1(monkeypatch, cap
     assert directive is None
 
 
+def test_busy_session_merge_burns_both_captures_neither_gets_attested(monkeypatch, caplog):
+    """kasra-review round-4 P1-2, pinned: on Hermes's own default
+    busy_input_mode: interrupt, two Telegram texts sent within the debounce
+    window are MERGED into one turn's inbound text
+    (gateway/run_inbound.py's merge path -> gateway/platforms/base.py's
+    _append_text) -- but both were already captured as SEPARATE records
+    before any merge happens (capture is at pre_gateway_dispatch, before
+    busy-session handling ever runs). The one turn that actually executes
+    presents the CONCATENATED text, which matches NEITHER individual capture,
+    so bind() burns both -- fail closed by design: the verdict, if any, rides
+    the agent seat, and the human's remedy is simply to resend one message."""
+    store = _Store("sk-merge")
+    human_origin.capture_human_origin(
+        event=_event(_source(), message_id="M-first", text="approve f9408956"),
+        gateway=None, session_store=store,
+    )
+    human_origin.capture_human_origin(
+        event=_event(_source(), message_id="M-second", text="and approve 7c1120aa"),
+        gateway=None, session_store=store,
+    )
+    merged_text = "approve f9408956\nand approve 7c1120aa"  # Hermes's own merge shape (paraphrased)
+    with caplog.at_level(logging.WARNING):
+        _bind("sk-merge", "T-merged-turn", text=merged_text, monkeypatch=monkeypatch)
+    assert len(human_origin._STASH) == 0  # both burned, neither survives for a later turn
+    assert any("M-first" in r.message and "text_mismatch" in r.message for r in caplog.records)
+    assert any("M-second" in r.message and "text_mismatch" in r.message for r in caplog.records)
+    directive = human_origin.stamp_tool_call(
+        tool_name="task_verdict", args={"task_id": "f9408956"}, turn_id="T-merged-turn",
+    )
+    assert directive is None  # the verdict, if the model even calls it, rides the agent seat
+
+
 def test_reply_quoted_approve_then_plain_approve_binds_the_seconds_own_message(monkeypatch, caplog):
     """The coordinator's required round-4 test: a reply-quoted "approve" fails to
     bind and is burned; a later plain "approve" binds its OWN message_id, never
@@ -267,7 +299,7 @@ def test_reply_quoted_approve_then_plain_approve_binds_the_seconds_own_message(m
     out = human_origin.stamp_tool_call(tool_name="task_verdict", args={"task_id": "t"}, turn_id="T-plain-turn")
     assert out is not None
     assert out["args"]["human_origin"]["message_id"] == "M200"
-    assert len(human_origin._STASH) == 1  # only the bound M200 record remains
+    assert len(human_origin._STASH) == 0  # M200's bound record was CONSUMED by the read (one-shot)
 
 
 def test_injected_turn_with_text_approve_after_the_humans_turn_finds_nothing(monkeypatch):
@@ -340,11 +372,37 @@ def test_same_text_twice_binds_oldest_match_only_second_is_superseded_not_pendin
     d1 = human_origin.stamp_tool_call(tool_name="task_verdict", args={}, turn_id="T1")
     assert d1["args"]["human_origin"]["message_id"] == "M1"
     assert any("M2" in r.message and "superseded" in r.message for r in caplog.records)
-    assert len(human_origin._STASH) == 1  # only T1's bound M1 remains; M2 is gone
+    assert len(human_origin._STASH) == 0  # M2 was burned; M1's binding was just CONSUMED by the read
     # a later turn presenting the same text finds nothing:
     _bind("sk-dup", "T2", text="approve X", monkeypatch=monkeypatch)
     d2 = human_origin.stamp_tool_call(tool_name="task_verdict", args={}, turn_id="T2")
     assert d2 is None
+
+
+def test_two_task_verdict_calls_in_one_turn_only_the_first_is_stamped(monkeypatch, caplog):
+    """kasra-review round-4 P1-3: read() must CONSUME the bound record on first
+    stamp. One human message authenticates AT MOST one task_verdict call per
+    turn -- a second call in the SAME turn (deliberate or model-steered) gets
+    nothing, not a second copy of the human's identity."""
+    _capture("sk-double-call", text="approve f9408956")
+    _bind("sk-double-call", "T1", text="approve f9408956", monkeypatch=monkeypatch)
+    first = human_origin.stamp_tool_call(
+        tool_name="task_verdict", args={"task_id": "f9408956"}, turn_id="T1",
+    )
+    assert first is not None
+    assert first["args"]["human_origin"]["user_id"] == "tg-user-1"
+
+    second_args = {"task_id": "DIFFERENT-TASK"}
+    with caplog.at_level(logging.WARNING):
+        second = human_origin.stamp_tool_call(tool_name="task_verdict", args=second_args, turn_id="T1")
+    assert second is None
+    assert second_args == {"task_id": "DIFFERENT-TASK"}  # no human_origin added
+
+    # and a forged human_origin on that second call is still stripped, not stamped:
+    forged_args = {"task_id": "DIFFERENT-TASK", "human_origin": {"user_id": "attacker"}}
+    third = human_origin.stamp_tool_call(tool_name="task_verdict", args=forged_args, turn_id="T1")
+    assert third is None
+    assert "human_origin" not in forged_args
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +514,7 @@ def test_stamp_strips_regardless_of_server_name_mismatch_p1_1(caplog):
 def test_stamp_never_stamps_when_server_name_is_unset_p1_2(monkeypatch, caplog):
     _capture("sk-unset", text="approve")
     _bind("sk-unset", "T1", text="approve", monkeypatch=monkeypatch)
-    assert human_origin._mcp_server_name is None
+    assert human_origin._mcp_server_name_by_profile == {}
     args = {"human_origin": {"user_id": "attacker"}}
     with caplog.at_level(logging.WARNING):
         directive = human_origin.stamp_tool_call(
@@ -550,8 +608,40 @@ def test_set_mcp_server_name_falsy_means_unset_not_default():
     assert human_origin._resolve_governed_tool_name("mcp__mupot__task_verdict") == "task_verdict"
     human_origin.set_mcp_server_name(None)
     assert human_origin._resolve_governed_tool_name("mcp__mupot__task_verdict") is None
+    human_origin.set_mcp_server_name("mupot")
     human_origin.set_mcp_server_name("")
     assert human_origin._resolve_governed_tool_name("mcp__mupot__task_verdict") is None
+
+
+def test_mcp_server_name_is_scoped_per_profile_p2_2(monkeypatch):
+    """kasra-review round-4 P2-2: two multiplexed profiles with different
+    mcp_server names must not clobber each other's resolution."""
+    human_origin.set_mcp_server_name("mupot", profile="profile-a")
+    human_origin.set_mcp_server_name("mupot-prod", profile="profile-b")
+
+    monkeypatch.setattr(human_origin, "_current_profile_key", lambda: "profile-a")
+    assert human_origin._resolve_governed_tool_name("mcp__mupot__task_verdict") == "task_verdict"
+    assert human_origin._resolve_governed_tool_name("mcp__mupot_prod__task_verdict") is None
+
+    monkeypatch.setattr(human_origin, "_current_profile_key", lambda: "profile-b")
+    assert human_origin._resolve_governed_tool_name("mcp__mupot_prod__task_verdict") == "task_verdict"
+    assert human_origin._resolve_governed_tool_name("mcp__mupot__task_verdict") is None
+
+    # unsetting one profile never touches the other:
+    human_origin.set_mcp_server_name(None, profile="profile-b")
+    assert human_origin._resolve_governed_tool_name("mcp__mupot_prod__task_verdict") is None
+    monkeypatch.setattr(human_origin, "_current_profile_key", lambda: "profile-a")
+    assert human_origin._resolve_governed_tool_name("mcp__mupot__task_verdict") == "task_verdict"
+
+
+def test_mcp_server_name_set_defaults_to_the_currently_active_profile(monkeypatch):
+    """When set_mcp_server_name() is called with no explicit profile= (the real
+    adapter.py call site), it must resolve to WHATEVER profile is active right
+    then, not a hardcoded default, so it lands in the same bucket
+    _current_profile_key() will later read for that profile's own turns."""
+    monkeypatch.setattr(human_origin, "_default_profile_key", lambda: "profile-x")
+    human_origin.set_mcp_server_name("mupot")
+    assert human_origin._mcp_server_name_by_profile == {"profile-x": "mupot"}
 
 
 # ---------------------------------------------------------------------------
@@ -592,18 +682,22 @@ def test_stash_bind_consumes_oldest_matching_record_only_second_is_superseded():
     burned = []
     assert stash.bind("sk", "T1", sender_id="u1", text_sha256="h1",
                       burn_callback=lambda rec, reason: burned.append((rec["message_id"], reason))) is True
-    assert stash.read("sk", "T1")["message_id"] == "M1"
+    assert stash.read("sk", "T1")["message_id"] == "M1"  # consumes it
     assert burned == [("M2", "superseded")]
-    assert len(stash) == 1  # only the bound M1
+    assert len(stash) == 0  # M2 was burned; M1's binding was just consumed by the read
 
 
-def test_stash_read_never_pops_or_consumes():
+def test_stash_read_is_one_shot_p1_3():
+    """kasra-review round-4 P1-3: read() must CONSUME on the first call so one
+    bound record cannot stamp more than one task_verdict call in the turn."""
     stash = human_origin._OriginStash()
-    stash.capture("sk", {"user_id": "u1", "text_sha256": "h1"})
+    stash.capture("sk", {"user_id": "u1", "text_sha256": "h1", "message_id": "m1"})
     stash.bind("sk", "T1", sender_id="u1", text_sha256="h1")
-    stash.read("sk", "T1")
-    stash.read("sk", "T1")
-    assert stash.read("sk", "T1") is not None
+    first = stash.read("sk", "T1")
+    assert first is not None
+    assert first["message_id"] == "m1"
+    second = stash.read("sk", "T1")
+    assert second is None
 
 
 def test_stash_pending_is_bounded_per_session():
@@ -614,6 +708,19 @@ def test_stash_pending_is_bounded_per_session():
     assert stash.bind("sk", "t2", sender_id="u", text_sha256="h0") is False  # already evicted
 
 
+def test_stash_per_session_overflow_eviction_is_logged_p2_1():
+    """kasra-review round-4 P2-1: capture() overflow used to drop the oldest
+    record with no signal at all -- unlike every bind-time burn, which is
+    logged. Now it reports through the same evict_callback."""
+    stash = human_origin._OriginStash(max_pending_per_session=1, max_pending_total=100, max_bound=100, ttl_seconds=10_000)
+    evicted = []
+    stash.capture("sk", {"user_id": "u", "text_sha256": "h0", "message_id": "M-evicted"},
+                  evict_callback=lambda rec, reason: evicted.append((rec["message_id"], reason)))
+    stash.capture("sk", {"user_id": "u", "text_sha256": "h1", "message_id": "M-kept"},
+                  evict_callback=lambda rec, reason: evicted.append((rec["message_id"], reason)))
+    assert evicted == [("M-evicted", "capture_overflow_session")]
+
+
 def test_stash_pending_is_bounded_globally_across_sessions():
     stash = human_origin._OriginStash(max_pending_per_session=10, max_pending_total=2, max_bound=100, ttl_seconds=10_000)
     stash.capture("sk-a", {"user_id": "u", "text_sha256": "a"})
@@ -622,6 +729,35 @@ def test_stash_pending_is_bounded_globally_across_sessions():
     assert stash.bind("sk-a", "t1", sender_id="u", text_sha256="a") is False
     assert stash.bind("sk-b", "t2", sender_id="u", text_sha256="b") is True
     assert stash.bind("sk-c", "t3", sender_id="u", text_sha256="c") is True
+
+
+def test_stash_global_overflow_eviction_is_logged_p2_1():
+    stash = human_origin._OriginStash(max_pending_per_session=10, max_pending_total=2, max_bound=100, ttl_seconds=10_000)
+    evicted = []
+    cb = lambda rec, reason: evicted.append((rec["message_id"], reason))
+    stash.capture("sk-a", {"user_id": "u", "text_sha256": "a", "message_id": "M-a"}, evict_callback=cb)
+    stash.capture("sk-b", {"user_id": "u", "text_sha256": "b", "message_id": "M-b"}, evict_callback=cb)
+    stash.capture("sk-c", {"user_id": "u", "text_sha256": "c", "message_id": "M-c"}, evict_callback=cb)
+    assert evicted == [("M-a", "capture_overflow_global")]
+
+
+def test_capture_human_origin_wires_the_real_burn_log_for_overflow(caplog):
+    """End-to-end through the public capture_human_origin function (not the bare
+    stash), proving a stranger-flood eviction is a real, visible WARNING."""
+    store = _Store("sk-flood")
+    stash = human_origin._OriginStash(max_pending_per_session=1, max_pending_total=100, max_bound=100, ttl_seconds=10_000)
+    human_origin._STASH = stash
+    try:
+        human_origin.capture_human_origin(
+            event=_event(_source(), message_id="M-evicted", text="first"), gateway=None, session_store=store,
+        )
+        with caplog.at_level(logging.WARNING):
+            human_origin.capture_human_origin(
+                event=_event(_source(), message_id="M-kept", text="second"), gateway=None, session_store=store,
+            )
+    finally:
+        human_origin._STASH = human_origin._OriginStash()  # restore a clean global for other tests
+    assert any("M-evicted" in r.message and "capture_overflow_session" in r.message for r in caplog.records)
 
 
 def test_stash_ttl_is_a_backstop_for_a_session_that_never_reaches_bind(monkeypatch):
@@ -644,17 +780,20 @@ def test_stash_ttl_expires_bound_records_too(monkeypatch):
     assert stash.read("sk", "T1") is None  # now expired
 
 
-def test_stash_bound_refreshes_lru_on_read():
+def test_stash_bound_lru_evicts_the_oldest_unread_binding_first():
+    """Since round 5's read() consumes on first call, LRU only matters for BOUND
+    entries nobody has read yet -- bind() still move_to_end()s on write, so the
+    oldest never-read binding is the one _max_bound eviction takes."""
     stash = human_origin._OriginStash(max_bound=2, max_pending_total=100, max_pending_per_session=100, ttl_seconds=10_000)
     stash.capture("sk-a", {"user_id": "u", "text_sha256": "a"})
     stash.capture("sk-b", {"user_id": "u", "text_sha256": "b"})
     stash.bind("sk-a", "ta", sender_id="u", text_sha256="a")
     stash.bind("sk-b", "tb", sender_id="u", text_sha256="b")
-    stash.read("sk-a", "ta")
     stash.capture("sk-c", {"user_id": "u", "text_sha256": "c"})
-    stash.bind("sk-c", "tc", sender_id="u", text_sha256="c")
-    assert stash.read("sk-a", "ta") is not None
-    assert stash.read("sk-b", "tb") is None
+    stash.bind("sk-c", "tc", sender_id="u", text_sha256="c")  # forces eviction: sk-a's binding (oldest)
+    assert stash.read("sk-a", "ta") is None
+    assert stash.read("sk-b", "tb") is not None
+    assert stash.read("sk-c", "tc") is not None
 
 
 def test_stash_drop_session_clears_pending_and_bound():
@@ -684,9 +823,13 @@ def test_stash_returns_independent_copies_not_shared_references():
     record["user_id"] = "mutated"
     stash.bind("sk", "T1", sender_id="u", text_sha256="h")
     got = stash.read("sk", "T1")
-    assert got["user_id"] == "u"
+    assert got["user_id"] == "u"  # bind()'s own copy was unaffected by mutating the caller's dict
     got["user_id"] = "mutated-after-read"
-    assert stash.read("sk", "T1")["user_id"] == "u"
+    # read() already consumed the binding (one-shot); re-bind an identical
+    # second capture and prove ITS read is independent of the first read's copy:
+    stash.capture("sk", {"user_id": "u", "text_sha256": "h"})
+    stash.bind("sk", "T2", sender_id="u", text_sha256="h")
+    assert stash.read("sk", "T2")["user_id"] == "u"
 
 
 def test_stash_bind_relies_on_the_callback_being_safe_log_burn_is():

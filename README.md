@@ -202,17 +202,27 @@ reaching mupot verbatim.
   is left pending in that case. Earlier designs (a session-keyed slot, a per-session queue, then a
   content-matched bind that re-queued failures) all left a window where a record that failed to
   bind stayed spendable by whatever turn asked next — this closes that window at its root rather
-  than narrowing it again. An internal/plugin-injected turn's text is the injected notification
-  prompt, never the human's own message, so it can never bind; a delegated subagent is refused
-  outright (checked directly against Hermes's delegated-child-context marker).
+  than narrowing it again. An internal/plugin-injected turn is handed the human's own sender id
+  and platform (Hermes resolves both from the turn's session source, a copy of the human's stored
+  origin), so text is the only discriminator: today's in-plugin injectors all prepend a fixed,
+  non-removable preamble, so their prompt never equals the human's own message and they only ever
+  *burn* a pending record, never bind it — but an injector able to emit an unwrapped string equal
+  to the human's own recent words *would* bind it with the human's identity (see "Documented
+  residual" below; this is a property of the fixed preamble, not of the binding logic itself). A
+  delegated subagent is refused outright regardless of its text, checked directly against Hermes's
+  delegated-child-context marker.
 - `pre_tool_call` fires once per tool dispatch and only ever *reads* what `pre_llm_call` already
-  bound to that exact turn — it never claims or burns anything itself. A model-supplied
-  `human_origin` is stripped on **every** tool that looks like it belongs to mupot at all (any
-  `mcp__<configured mupot server>__*` wire name once the server name is resolved — sanitized
-  the same way Hermes sanitizes one with punctuation in it — plus a small named fallback for a
-  handful of other decision-adjacent mupot tools while the server name is still unresolved), and
-  only ever *replaced* with the bound origin for the one-tool stamp allowlist on an exact wire
-  match with a turn that actually bound something.
+  bound to that exact turn — it never claims or burns anything itself, and that read is
+  **one-shot**: the first `task_verdict` call in the turn consumes the bound record, so a second
+  call in the same turn — deliberate or model-steered — gets nothing, never a second copy of the
+  human's identity. A model-supplied `human_origin` is stripped on **every** tool that looks like
+  it belongs to mupot at all (any `mcp__<configured mupot server>__*` wire name once the server
+  name is resolved — sanitized the same way Hermes sanitizes one with punctuation in it — plus a
+  small named fallback for a handful of other decision-adjacent mupot tools while the server name
+  is still unresolved, and the server name itself is scoped per Hermes profile so two multiplexed
+  profiles with different `mcp_server` values can't clobber each other's resolution), and only
+  ever *replaced* with the bound origin for the one-tool stamp allowlist on an exact wire match
+  with a turn that actually bound something.
 - `on_session_reset`/`on_session_end` drop any pending or bound record for a session the moment
   Hermes itself ends it, rather than relying solely on the TTL backstop.
 
@@ -235,11 +245,21 @@ the newer one from lingering to be (mis)claimed by a later turn (it is burned as
 instead), it does not fix which of the two ids gets named.
 
 A failed bind is invisible to the human by design (fail closed on the attestation, fail open on
-the feature): the tool call still runs, under the agent seat, and mupot's server never receives
-a `human_origin` field at all — its response is byte-identical to a pre-feature call (`applied:
-false` is a DIFFERENT case: a *supplied but unresolvable* origin, not an absent one). The only
-positive, operator-visible signal that an approval failed to attest is the plugin's own
-`burning unconsumed human-origin capture` WARNING log.
+the feature): the tool call still runs, under the agent seat, and this plugin never sends a
+`human_origin` field at all. On mupot's server side, an agent-bound call with no supplied origin
+gets back `human_origin: {applied: false, reason: "absent"}` in its response — distinct from
+what a *supplied but unresolvable* origin would produce, but not a signal an operator would read
+as "your approval didn't count as yours" on its own. The only operator-visible signal that
+specifically names what happened is the plugin's own `burning unconsumed human-origin capture`
+WARNING log.
+
+**Also documented (kasra-review round-4 P1-2): the pool drains per SESSION, not per MESSAGE.** On
+Hermes's own live default (`busy_input_mode: interrupt`), two Telegram texts sent inside the
+debounce window are merged into one turn's inbound text before that turn ever reaches
+`pre_llm_call` — but both were already captured as separate records first. The one turn that
+runs presents the concatenated text, which matches neither individual capture, so both are
+burned: fail-closed by design, not a bypass — neither message authenticates a `task_verdict`
+call, and the human's remedy is to resend one message at a time.
 
 ### Testing with Hermes
 

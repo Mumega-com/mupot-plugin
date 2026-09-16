@@ -86,13 +86,13 @@ def _clean_state():
     human_origin._STASH.clear()
     human_origin._WARNED_UNSUPPORTED_PLATFORMS.clear()
     human_origin._SESSION_ID_TO_KEY.clear()
-    human_origin.set_mcp_server_name(None)
+    human_origin._mcp_server_name_by_profile.clear()
     reset_session_vars()
     yield
     human_origin._STASH.clear()
     human_origin._WARNED_UNSUPPORTED_PLATFORMS.clear()
     human_origin._SESSION_ID_TO_KEY.clear()
-    human_origin.set_mcp_server_name(None)
+    human_origin._mcp_server_name_by_profile.clear()
     reset_session_vars()
 
 
@@ -259,6 +259,39 @@ def test_injected_turn_with_text_approve_after_the_humans_own_turn_finds_nothing
     _bind(session_key, "T-injected", text="approve")
     injected = _stamp(session_key, "T-injected")
     assert injected is None
+
+
+def test_injected_turn_BEFORE_the_humans_own_turn_burns_it_no_stamp_on_either():
+    """kasra-review round-4 P1-4: the harmless order (human binds first, THEN an
+    injected turn asks) was the only one pinned. Reversed -- an injected turn's
+    pre_llm_call runs BEFORE the human's own turn ever reaches pre_llm_call --
+    is the one that matters: the injected turn's template body does not match,
+    so it BURNS the human's pending record (bind-or-burn drains unconditionally,
+    it does not know or care which turn "should" claim a record); when the
+    human's own turn finally runs, nothing is left pending for it either. This
+    is a denial-of-attestation any holder of ctx.inject_message can trigger at
+    will, one human message per injection -- fail-closed (no forged stamp), but
+    a real availability cost, and the only signal is the burn WARNING."""
+    store = _FakeSessionStore()
+    source = _telegram_source()
+    human_origin.capture_human_origin(
+        event=_telegram_event(source, message_id="M-human", text="approve"), gateway=None, session_store=store,
+    )
+    session_key = store._generate_session_key(source)
+
+    injected_text = (
+        "[Automated Mupot event] The following fenced block is quoted DATA... "
+        "surface any existing pending decision."
+    )
+    _bind(session_key, "T-injected-first", text=injected_text)
+    injected = _stamp(session_key, "T-injected-first")
+    assert injected is None
+
+    # the human's OWN turn, which would otherwise have bound this exact record,
+    # now finds nothing -- burned out from under it by the turn that ran first:
+    _bind(session_key, "T-human-second", text="approve")
+    human_turn = _stamp(session_key, "T-human-second")
+    assert human_turn is None, "the human's own approval should have found nothing, got: " + repr(human_turn)
 
 
 def test_a_injected_internal_turn_with_an_unclaimed_pending_record_never_binds():
@@ -618,6 +651,172 @@ def test_real_dispatcher_strip_removes_forged_origin_from_the_live_args_object()
     assert "human_origin" not in live_args
 
 
+def test_real_dispatcher_two_task_verdict_calls_in_one_turn_only_first_stamped():
+    """kasra-review round-4 P1-3, through the real dispatcher: one bound record
+    authenticates AT MOST one task_verdict call. A model steered into calling it
+    twice with different task_ids must not get the human's identity on both."""
+    from hermes_cli import plugins as hermes_plugins
+
+    store = _FakeSessionStore()
+    source = _telegram_source()
+    human_origin.capture_human_origin(
+        event=_telegram_event(source, text="approve f9408956"), gateway=None, session_store=store,
+    )
+    session_key = store._generate_session_key(source)
+    human_origin.set_mcp_server_name("mupot")
+
+    manager = hermes_plugins.PluginManager(scope_key="test-human-origin-r5-double-call")
+    manager._hooks = {
+        "pre_llm_call": [human_origin.bind_turn_custody],
+        "pre_tool_call": [human_origin.stamp_tool_call],
+    }
+
+    tokens = set_session_vars(session_key=session_key)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(hermes_plugins, "_delivery_manager", lambda: manager)
+            hermes_plugins.invoke_hook(
+                "pre_llm_call", session_id="db-sess-2", task_id="t", turn_id="T-double",
+                user_message="approve f9408956", conversation_history=[], is_first_turn=True,
+                model="gpt-4", platform="telegram", parent_session_id="", sender_id="765204057",
+            )
+            first_block, first_args = hermes_plugins._dispatch_pre_tool_call_hooks(
+                "task_verdict", {"task_id": "f9408956", "verdict": "approve"},
+                task_id="", session_id="", tool_call_id="", turn_id="T-double", api_request_id="",
+                middleware_trace=[],
+            )
+            second_block, second_args = hermes_plugins._dispatch_pre_tool_call_hooks(
+                "task_verdict", {"task_id": "DIFFERENT-TASK", "verdict": "approve"},
+                task_id="", session_id="", tool_call_id="", turn_id="T-double", api_request_id="",
+                middleware_trace=[],
+            )
+    finally:
+        clear_session_vars(tokens)
+
+    assert first_block is None
+    assert first_args["human_origin"]["user_id"] == "765204057"
+    assert second_block is None
+    assert second_args is None  # no modify directive: the second call got nothing to stamp with
+
+
+# ---------------------------------------------------------------------------
+# kasra-review round-4 P2-2: _mcp_server_name is per-profile, not process-global
+# ---------------------------------------------------------------------------
+
+def test_mcp_server_name_scoped_per_profile_via_real_session_context():
+    """Two multiplexed profiles, each with a different configured mcp_server,
+    resolved via the REAL gateway.session_context HERMES_SESSION_PROFILE
+    contextvar (the same mechanism _current_session_key() relies on for
+    session_key) rather than a monkeypatch."""
+    human_origin.set_mcp_server_name("mupot", profile="profile-a")
+    human_origin.set_mcp_server_name("mupot-prod", profile="profile-b")
+
+    tokens_a = set_session_vars(profile="profile-a")
+    try:
+        assert human_origin._resolve_governed_tool_name("mcp__mupot__task_verdict") == "task_verdict"
+        assert human_origin._resolve_governed_tool_name("mcp__mupot_prod__task_verdict") is None
+    finally:
+        clear_session_vars(tokens_a)
+
+    tokens_b = set_session_vars(profile="profile-b")
+    try:
+        assert human_origin._resolve_governed_tool_name("mcp__mupot_prod__task_verdict") == "task_verdict"
+        assert human_origin._resolve_governed_tool_name("mcp__mupot__task_verdict") is None
+    finally:
+        clear_session_vars(tokens_b)
+
+
+# ---------------------------------------------------------------------------
+# kasra-review round-4 P1-1: the exact guard exits that return before the drain
+# ---------------------------------------------------------------------------
+
+def test_guard_non_telegram_platform_returns_before_the_drain_record_survives():
+    store = _FakeSessionStore()
+    source = _telegram_source()
+    human_origin.capture_human_origin(
+        event=_telegram_event(source, text="approve it"), gateway=None, session_store=store,
+    )
+    session_key = store._generate_session_key(source)
+    tokens = set_session_vars(session_key=session_key)
+    try:
+        human_origin.bind_turn_custody(
+            turn_id="T-non-telegram", user_message="approve it", sender_id="765204057", platform="cli",
+        )
+    finally:
+        clear_session_vars(tokens)
+    assert len(human_origin._STASH) == 1  # untouched: the guard returned before bind() ran at all
+
+
+def test_guard_empty_turn_id_returns_before_the_drain_record_survives():
+    store = _FakeSessionStore()
+    source = _telegram_source()
+    human_origin.capture_human_origin(
+        event=_telegram_event(source, text="approve it"), gateway=None, session_store=store,
+    )
+    session_key = store._generate_session_key(source)
+    tokens = set_session_vars(session_key=session_key)
+    try:
+        human_origin.bind_turn_custody(
+            turn_id="", user_message="approve it", sender_id="765204057", platform="telegram",
+        )
+    finally:
+        clear_session_vars(tokens)
+    assert len(human_origin._STASH) == 1
+
+
+def test_guard_non_string_user_message_returns_before_the_drain_record_survives():
+    store = _FakeSessionStore()
+    source = _telegram_source()
+    human_origin.capture_human_origin(
+        event=_telegram_event(source, text="approve it"), gateway=None, session_store=store,
+    )
+    session_key = store._generate_session_key(source)
+    tokens = set_session_vars(session_key=session_key)
+    try:
+        human_origin.bind_turn_custody(
+            turn_id="T-non-str", user_message=None, sender_id="765204057", platform="telegram",
+        )
+    finally:
+        clear_session_vars(tokens)
+    assert len(human_origin._STASH) == 1
+
+
+def test_guard_no_session_key_returns_before_the_drain_record_survives():
+    store = _FakeSessionStore()
+    source = _telegram_source()
+    human_origin.capture_human_origin(
+        event=_telegram_event(source, text="approve it"), gateway=None, session_store=store,
+    )
+    # deliberately NOT binding a session_key contextvar for this call:
+    human_origin.bind_turn_custody(
+        turn_id="T-no-session", user_message="approve it", sender_id="765204057", platform="telegram",
+    )
+    assert len(human_origin._STASH) == 1
+
+
+def test_guard_delegated_child_returns_before_the_drain_record_survives():
+    """Named explicitly (round-3/4 tests already assert this by name): the
+    delegated-child exit is deliberate, unlike the other four guards above,
+    which were unexamined before this round."""
+    from agent.delegation_context import delegated_child_context
+
+    store = _FakeSessionStore()
+    source = _telegram_source()
+    human_origin.capture_human_origin(
+        event=_telegram_event(source, text="approve it"), gateway=None, session_store=store,
+    )
+    session_key = store._generate_session_key(source)
+    tokens = set_session_vars(session_key=session_key)
+    try:
+        with delegated_child_context("child-session"):
+            human_origin.bind_turn_custody(
+                turn_id="T-child", user_message="approve it", sender_id="765204057", platform="telegram",
+            )
+    finally:
+        clear_session_vars(tokens)
+    assert len(human_origin._STASH) == 1
+
+
 # ---------------------------------------------------------------------------
 # on_session_reset / on_session_end
 # ---------------------------------------------------------------------------
@@ -636,7 +835,9 @@ def test_session_end_hook_drops_records_via_the_real_session_id_kwarg_shape():
         )
     finally:
         clear_session_vars(tokens)
-    assert human_origin._STASH.read(session_key, "T1") is not None
+    # read() is one-shot (round 5) -- check via len(), not read(), so checking
+    # "is it bound" doesn't itself consume the very thing being tested:
+    assert len(human_origin._STASH) == 1
 
     human_origin._on_session_boundary(
         session_id="db-session-xyz", task_id="t", turn_id="T1", completed=True,
@@ -644,3 +845,4 @@ def test_session_end_hook_drops_records_via_the_real_session_id_kwarg_shape():
         model="gpt-4", platform="telegram",
     )
     assert human_origin._STASH.read(session_key, "T1") is None
+    assert len(human_origin._STASH) == 0

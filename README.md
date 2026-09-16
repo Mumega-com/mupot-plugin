@@ -162,56 +162,73 @@ the whole gateway process restarts, with nothing in this plugin able to detect o
 (there is no hook back into that rebuild path). `register_telegram_control` logs a WARNING
 naming this limitation whenever `telegram_control_enabled: true` is configured.
 
-## Human-origin attestation for `task_verdict` / `needs_you_list`
+## Human-origin attestation for `task_verdict`
 
 The primary decision channel for an owned member is not a deterministic command at all: they
 talk to their own agent in plain natural language, and the **harness** — never the LLM —
-stamps the triggering message's origin onto the agent's `task_verdict`/`needs_you_list` calls.
-Mupot resolves that `human_origin` object to the member and runs the call under the human's
-own identity instead of the agent seat; without it (a CLI turn, a cron turn, a subagent turn,
-or a turn on a platform this plugin doesn't yet support), the call runs under the agent seat
-exactly as before this feature existed.
+stamps the triggering message's origin onto the agent's `task_verdict` calls. Mupot resolves
+that `human_origin` object to the member and runs the call under the human's own identity
+instead of the agent seat; without it (a CLI turn, a cron turn, a subagent turn, or a turn on a
+platform this plugin doesn't yet support), the call runs under the agent seat exactly as
+before this feature existed. `task_verdict` is the only tool this ever stamps: mupot's server
+side resolves `human_origin` per-tool, wired individually, not via shared middleware applied
+across every tool — there is currently no other tool it is safe to stamp.
 
-This is implemented as two Hermes lifecycle hooks in `mupot_gateway/human_origin.py`,
-registered FIRST (before the platform adapter or any tool) from `mupot_gateway/adapter.py`'s
-`register()`, only when `native_gateway_enabled: true`. Registration fails **closed**: a
-Hermes runtime whose `PluginContext` cannot `register_hook` (or whose hook registration
-itself raises) gets no native-gateway registration at all — there is no other choke point in
-this plugin able to keep a model-supplied `human_origin` from reaching mupot verbatim on
-`task_verdict`/`needs_you_list`.
+This is implemented as four Hermes lifecycle hooks plus two session-boundary hooks in
+`mupot_gateway/human_origin.py`, registered FIRST (before the platform adapter or any tool)
+from `mupot_gateway/adapter.py`'s `register()`, only when `native_gateway_enabled: true`.
+Registration fails **closed**: a Hermes runtime whose `PluginContext` cannot `register_hook`
+(or whose hook registration itself raises) gets no native-gateway registration at all — there
+is no other choke point in this plugin able to keep a model-supplied `human_origin` from
+reaching mupot verbatim.
 
 - `pre_gateway_dispatch` fires once per inbound message, straight off the platform adapter,
   before Hermes's own sender-authorization check runs. It is therefore this module's own
   trust fence, not a convenience filter: a message is captured only when it is a private,
   non-forwarded, self chat (`chat_type == "dm"` and `user_id == chat_id` — Telegram's own DM
   invariant, mirroring `telegram_control.py`'s own private/unforwarded gate). A captured
-  record — including a SHA-256 of the message's own text — is *pending* for up to 10 minutes,
-  not yet bound to any turn.
-- `pre_llm_call` fires once per turn, before the tool loop, and is the positive per-turn
-  custody token: it binds a pending capture to the CURRENT `turn_id` iff the turn's own
-  fully-prepared inbound text hashes to exactly the captured message's text AND the turn's
-  sender matches. An internal/plugin-injected turn's text is the injected notification prompt,
-  never the human's own message, so it can never bind; a cron turn and a delegated subagent
-  (checked directly against Hermes's delegated-child-context marker) can't either. Two earlier
-  designs (a session-keyed slot, then a per-session queue) were both still "whichever turn asks
-  first on this session wins" — this one requires the asking turn to *prove* it is processing
-  the exact message the record came from.
+  record — including a SHA-256 of the message's own text — is *pending*, not yet bound to any
+  turn, for up to 2 minutes: a backstop for a session that never reaches `pre_llm_call` at all,
+  not the mechanism that bounds a live record's lifetime (that's the next hook).
+- `pre_llm_call` fires once per turn, before the tool loop. On EVERY call it drains **every**
+  pending record for that turn's session: the first one whose sender and exact SHA-256 text
+  hash match this turn's own is bound to the current `turn_id`; every other one — mismatched or
+  a later duplicate-content match — is burned right there (dropped, never re-queued) and logged
+  at WARNING with its message id and a reason. A turn that binds nothing still burns whatever
+  was pending: **a pending record cannot outlive the very next `pre_llm_call` on its session**,
+  matched or not. Earlier designs (a session-keyed slot, a per-session queue, then a
+  content-matched bind that re-queued failures) all left a window where a record that failed to
+  bind stayed spendable by whatever turn asked next — this closes that window at its root rather
+  than narrowing it again. An internal/plugin-injected turn's text is the injected notification
+  prompt, never the human's own message, so it can never bind; a delegated subagent is refused
+  outright (checked directly against Hermes's delegated-child-context marker).
 - `pre_tool_call` fires once per tool dispatch and only ever *reads* what `pre_llm_call` already
-  bound to that exact turn — it never claims anything itself. It matches
-  `task_verdict`/`needs_you_list` both by bare name and by the exact
-  `mcp__<configured mupot server>__<tool>` wire name a live gateway with mupot registered as an
-  MCP server actually emits (sanitized the same way Hermes sanitizes a configured server name
-  with punctuation in it). A model-supplied `human_origin` is always treated as a forgery
-  attempt (logged at WARNING) and stripped for ANY tool whose name looks like a governed one —
-  regardless of server-name match, so a misconfigured/unresolved server name can only ever cause
-  a missed stamp, never a passthrough — and only replaced with the bound origin on an exact
-  match with a turn that actually bound one.
+  bound to that exact turn — it never claims or burns anything itself. A model-supplied
+  `human_origin` is stripped on **every** tool that looks like it belongs to mupot at all (any
+  `mcp__<configured mupot server>__*` wire name once the server name is resolved — sanitized
+  the same way Hermes sanitizes one with punctuation in it — plus a small named fallback for a
+  handful of other decision-adjacent mupot tools while the server name is still unresolved), and
+  only ever *replaced* with the bound origin for the one-tool stamp allowlist on an exact wire
+  match with a turn that actually bound something.
 - `on_session_reset`/`on_session_end` drop any pending or bound record for a session the moment
-  Hermes itself ends it, rather than relying solely on the 10-minute window.
+  Hermes itself ends it, rather than relying solely on the TTL backstop.
 
 Only Telegram is supported today. Every other platform is a recorded, not silent, gap: the
 first inbound message on an unsupported platform logs one INFO line naming it, and every
-`task_verdict`/`needs_you_list` call from that turn simply runs under the agent seat.
+`task_verdict` call from that turn simply runs under the agent seat.
+
+**Documented residual.** This remains a content-and-sender equality proof over a short window,
+not a cryptographic custody token: an injected/internal turn on the human's own session runs
+under the human's own sender id and platform (Hermes resolves both from the turn's session
+source, which for an injected turn is a copy of the human's own stored origin), so the only
+remaining barrier is that no in-plugin injector today emits a bare, attacker-chosen string
+equal to the human's own text — every injector prepends a fixed, non-removable template. A
+future injector or third-party `pre_gateway_dispatch` plugin able to emit an unwrapped string
+would need to present it as the very next `pre_llm_call` on that session, before the human's
+own turn (if any) burns the record first. A failed bind is silent to the human by design (fail
+closed on the attestation, fail open on the feature): the tool call still runs, under the agent
+seat, and the operator-visible signal is the server's own response on the verdict, not a crash
+or an incorrect stamp.
 
 ### Testing with Hermes
 

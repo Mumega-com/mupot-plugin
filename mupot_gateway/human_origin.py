@@ -2,65 +2,72 @@
 
 The human talks to their own agent in natural language over a platform (Telegram
 today); the HARNESS -- never the LLM -- must be the thing that stamps the inbound
-message's origin onto the agent's ``task_verdict``/``needs_you_list`` calls. Mupot
-resolves that origin to the member and lets the call ride under the human's own
-identity instead of the agent seat; without it, the call runs under the agent seat.
+message's origin onto the agent's ``task_verdict`` calls. Mupot resolves that
+origin to the member and lets the call ride under the human's own identity
+instead of the agent seat; without it, the call runs under the agent seat.
 
-This is round 3. Rounds 1 and 2 each narrowed the claim surface (a bare-name-only
-match, then a session-keyed single slot, then a per-session FIFO) and each round's
-gate found that the narrower surface was STILL first-claimant-wins: whichever turn
-next asked on a given session key could spend a credit no one had verified it was
-entitled to. Round 3 replaces claiming with a POSITIVE per-turn custody token and
-deletes the FIFO/first-claim path entirely -- one mechanism, not a fourth one beside
-it:
+This is round 4. Round 3 replaced session-keyed claiming with a content+sender
+equality bind at ``pre_llm_call`` -- correct predicate, wrong LIFETIME: a pending
+capture whose binding turn failed to match (a reply-quote, an ``@``-reference, a
+media caption) was silently re-queued and stayed spendable, by anyone who could
+later present the same ``(session_key, user_id, sha256(text))``, for the entire
+TTL. Since the "text" in question is the human's own approval word ("approve",
+"yes", "ok") that is a real, if narrow, bearer-credential window -- not a custody
+token. Round 4's rule, and the only thing that changed: **a pending record lives
+until the NEXT ``pre_llm_call`` on its session, full stop.** It either binds to
+that turn or it is burned right there, logged, never re-queued.
 
-1. ``pre_gateway_dispatch`` (:func:`capture_human_origin`) -- unchanged in spirit
-   from round 2: fires once per inbound ``MessageEvent``, BEFORE Hermes's own
-   ``_is_user_authorized_for_source`` (``gateway/run_inbound.py``: hook at line
-   ~180, auth at ~185), so this module is its own trust fence (private,
-   non-forwarded, self chat -- ``chat_type == "dm"`` and ``user_id == chat_id``,
-   mirroring ``telegram_control.py``'s gate, shared forwarding check in
-   ``telegram_fence.py``). NEW: the captured record now also carries a SHA-256 of
-   the message's own text (``event.text``), and its TTL is 10 minutes, not 30 --
-   a short freshness window, not the binding itself.
+1. ``pre_gateway_dispatch`` (:func:`capture_human_origin`) -- unchanged trust
+   fence (private, non-forwarded, self chat; shared forwarding check in
+   ``telegram_fence.py``). The captured record carries a SHA-256 of the
+   message's own text. TTL is now 2 minutes, not 10 -- explicitly a BACKSTOP
+   for a session that never reaches ``pre_llm_call`` at all, not the mechanism
+   that bounds a live credit's lifetime (that's rule 2 below).
 
-2. ``pre_llm_call`` (:func:`bind_turn_custody`) is NEW -- the positive custody
-   token. It fires once per turn, BEFORE the tool loop, with (among others)
-   ``platform``, ``sender_id``, and ``user_message`` -- Hermes's fully-PREPARED
-   inbound text for this turn (``agent/turn_context.py``'s
-   ``_collect_pre_llm_call_context``, called with ``original_user_message``, which
-   for a plain-text private Telegram DM with no media/reply/@-reference is
-   BYTE-IDENTICAL to the raw ``MessageEvent.text`` -- see
-   ``gateway/run_inbound.py``'s ``_prepare_inbound_message_text`` /
-   ``_prefix_inbound_sender_context``: the sender-name prefix and reply/document
-   notes only ever apply to a SHARED multi-user session or a media/reply message,
-   never a bare-text DM, which is all this module's capture-time fence admits in
-   the first place). A pending capture is bound to ``turn_id`` iff
-   ``platform == "telegram"``, the turn's ``sender_id`` equals the record's
-   ``user_id``, and ``sha256(user_message)`` equals the record's stored hash --
-   i.e. THIS turn is provably the one processing THAT exact human message, not
-   merely a turn that happens to share its session. An internal/plugin-injected
-   turn's ``user_message`` is the injected prompt text, never the human's own
-   message, so it can never match; a cron turn carries no matching sender/text
-   either. A delegated subagent is refused outright via
-   ``agent.delegation_context.is_delegated_child_context()`` first, belt-and-braces
-   on top of the content mismatch it would fail on anyway.
+2. ``pre_llm_call`` (:func:`bind_turn_custody`) fires once per turn, before the
+   tool loop. On every call it POPS **every** pending record for the turn's
+   session (not just scans them) -- the FIRST one whose ``sender_id``/text hash
+   match this turn's own ``platform``/``sender_id``/``sha256(user_message)`` is
+   bound to ``turn_id``; every other one is BURNED (dropped, never re-queued)
+   and logged at WARNING with its ``message_id`` and a reason
+   (``sender_mismatch``, ``text_mismatch``, or ``superseded`` for a later
+   duplicate-content match). A turn that binds nothing still burns whatever was
+   pending -- the record does not survive past the turn that was supposed to
+   claim it, matched or not. A delegated subagent is refused outright via
+   ``agent.delegation_context.is_delegated_child_context()`` before any of this,
+   belt-and-braces on top of the content mismatch it would fail on anyway.
 
-3. ``pre_tool_call`` (:func:`stamp_tool_call`) no longer claims anything. It only
-   READS whatever :func:`bind_turn_custody` already bound to THIS turn's
-   ``turn_id`` -- no FIFO, no "first to ask wins". A model-supplied
-   ``human_origin`` is ALWAYS stripped for any tool whose bare/suffix name looks
-   like ``task_verdict``/``needs_you_list`` (regardless of which MCP server it
-   claims to be, fail-closed even when the configured server name doesn't match --
-   see :func:`_looks_like_governed_suffix`), and only replaced with the bound
-   origin on an EXACT wire-name match for the configured mupot server.
+3. ``pre_tool_call`` (:func:`stamp_tool_call`) only ever READS whatever
+   :func:`bind_turn_custody` already bound to THIS turn's ``turn_id`` -- no
+   claiming, no FIFO. A model-supplied ``human_origin`` is stripped on **every**
+   tool that looks like it belongs to mupot at all (any ``mcp__<configured mupot
+   server>__*`` wire name, plus a small named fallback while the server name is
+   still unresolved) -- not just the one tool this module stamps. It is only
+   ever REPLACED with a bound origin for the exact, narrow stamp allowlist
+   (:data:`HUMAN_ORIGIN_TOOL_NAMES` = ``{"task_verdict"}`` only -- mupot's
+   server side (#1425) resolves ``human_origin`` per-tool, wired individually
+   into ``toolTaskVerdict``, not via shared middleware across every tool; there
+   is currently no other tool it is safe to stamp).
 
 4. ``on_session_reset``/``on_session_end`` drop any pending/bound records for a
-   session the moment Hermes itself considers it over, instead of relying solely
-   on the 10-minute TTL.
+   session the moment Hermes itself considers it over, instead of relying
+   solely on the TTL backstop.
 
 Only Telegram is supported for now; every other platform is a recorded, not
 silent, gap (one-time INFO log per platform name).
+
+Documented residual (not fixed, by design -- see the PR thread): this remains a
+content-and-sender EQUALITY PROOF over a short window, not a cryptographic
+custody token. An injected/internal turn on the human's own session runs under
+the human's own ``sender_id`` and ``platform`` (Hermes resolves both from the
+turn's ``SessionSource``, which for an injected turn is a copy of the human's own
+stored origin) -- the only remaining barrier is that no in-plugin injector today
+emits a bare, attacker-chosen string equal to the human's own text (every
+injector prepends a fixed, non-removable template). A future injector or
+third-party ``pre_gateway_dispatch`` plugin that can emit an unwrapped string
+would need to guess/replay the human's own recent words, and round 4's
+bind-or-burn rule means it must do so as the very next ``pre_llm_call`` on that
+session, before the human's own turn (if any) burns it first.
 """
 
 from __future__ import annotations
@@ -78,21 +85,41 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_PLATFORMS = frozenset({"telegram"})
 
-# The plugin's own mupot tools that accept an optional ``human_origin`` object.
-# Reached as bare mupot MCP tools (mupot_operator.py's build_operator_handlers has
-# no generic passthrough -- every handler hand-picks its own payload fields; none
-# forward human_origin), so pre_tool_call -- a GLOBAL Hermes lifecycle hook firing
-# for every tool dispatch, not only this plugin's own registered tools -- is the
-# only choke point that can see and stamp them.
-HUMAN_ORIGIN_TOOL_NAMES = frozenset({"task_verdict", "needs_you_list"})
+# The ONLY tool this module ever STAMPS with a bound origin. Narrow and exact:
+# mupot's server side (#1425) resolves human_origin per-tool, wired individually
+# into toolTaskVerdict -- NOT shared middleware applied uniformly across every
+# tool -- and today task_verdict is the only tool it resolves it on.
+# needs_you_list was in this set through round 3; dropped in round 4
+# (kasra-review round-3 P1-3): the #1425 server tree does not accept
+# human_origin on it, so stamping it there would be inert at best. Reached as a
+# bare mupot MCP tool (mupot_operator.py's build_operator_handlers has no
+# generic passthrough -- every handler hand-picks its own payload fields; none
+# forward human_origin), so pre_tool_call -- a GLOBAL Hermes lifecycle hook
+# firing for every tool dispatch, not only this plugin's own registered tools
+# -- is the only choke point that can see and stamp it.
+HUMAN_ORIGIN_TOOL_NAMES = frozenset({"task_verdict"})
+
+# Decision-adjacent mupot tools identified from the live kayhermes MCP schema
+# cache (kasra-review round-3 P1-3) that must have a model-supplied
+# human_origin STRIPPED even though this module never stamps them -- a model
+# forging the field on any of these is exactly as much a forgery attempt as on
+# task_verdict itself. Used only as a fallback while the configured server name
+# is unresolved (see _looks_like_mupot_tool); once resolved, the broader "any
+# tool under this configured mupot server" check below supersedes it for every
+# tool that server exposes, not just these named ones.
+_KNOWN_MUPOT_DECISION_TOOL_NAMES = frozenset({
+    "task_verdict", "task_verdict_reverse", "needs_you_list",
+    "approve_gate_edge", "advance_node", "objective_accept", "routine_run_answer",
+})
 
 # The mupot MCP server name this Hermes profile configures. UNSET (None) until
 # mupot_gateway/adapter.py's adapter_factory calls set_mcp_server_name() with the
 # SAME value MupotAdapter itself resolves (extra.get("mcp_server") or "mupot") --
 # kasra-review round-2 P1-2: resolving lazily (rather than defaulting to "mupot"
 # up front) means a governed call that somehow arrives before the platform adapter
-# connects can only ever be STRIPPED (via _looks_like_governed_suffix, independent
-# of server name), never wrongly STAMPED under a guessed name.
+# connects can only ever be STRIPPED (via _looks_like_mupot_tool, independent
+# of server name for the named fallback list), never wrongly STAMPED under a
+# guessed name.
 DEFAULT_MCP_SERVER_NAME = "mupot"
 _mcp_server_name: Optional[str] = None
 
@@ -120,19 +147,20 @@ def _hash_text(text: str) -> str:
 
 # Bounded: a gateway running for weeks cannot grow these without limit.
 #  - per-session pending queue: guards a burst of rapid messages before any turn
-#    binds one (most never will -- most human turns are chatter with no governed
-#    call at all, which is exactly what round 2's FIFO got wrong).
+#    binds/burns them.
 #  - total pending count across every session.
 #  - total bound-record count across every (session_key, turn_id) pair.
-# TTL is a 10-minute freshness window (kasra-review + Athena, round 3): short
-# enough that a captured-but-never-bound record (ordinary chatter) cannot become a
-# stale credit some later, unrelated turn spends, and short enough to match the
-# kind of window mupot's own server-side freshness check is expected to enforce --
-# but it is a BACKSTOP, not the defense: the defense is the content+sender bind.
+# TTL is now ONLY a backstop for a session that never reaches pre_llm_call at all
+# (round 4, kasra-review round-3 P0-1/Athena round-3): the mechanism that bounds
+# a live credit's lifetime in the NORMAL case is bind_turn_custody's bind-or-burn
+# rule (a pending record cannot survive past the very next pre_llm_call on its
+# session, whether or not that turn actually binds it) -- not the clock. 2
+# minutes is generous for the ordinary capture-then-turn-starts latency while
+# being far too short to matter as an independent attack window on its own.
 _MAX_PENDING_PER_SESSION = 8
 _MAX_PENDING_TOTAL = 512
 _MAX_BOUND = 512
-_CAPTURE_TTL_SECONDS = 600.0
+_CAPTURE_TTL_SECONDS = 120.0
 
 _WARNED_UNSUPPORTED_PLATFORMS: set[str] = set()
 
@@ -161,16 +189,23 @@ class _OriginStash:
     """Turn-bound human-origin stash: PENDING captures, BOUND (custody-verified) records.
 
     ``capture()`` appends an unclaimed, unbound record to the calling session's FIFO
-    (multiple pending captures can coexist -- most never get bound at all, since
-    most human turns are chatter with no governed call).
+    (multiple pending captures can coexist within one turn's worth of latency --
+    round 4's bind-or-burn rule means none of them can ever outlive the NEXT
+    ``pre_llm_call`` on that session).
 
-    ``bind(session_key, turn_id, sender_id, text_sha256)`` is the ONLY write path
-    from a turn's own custody proof: it scans the session's pending records
-    oldest-first for the FIRST one whose ``user_id``/``text_sha256`` match exactly,
-    removes it from the pending queue, and binds it to ``(session_key, turn_id)``.
-    Two captures with identical text (e.g. the human sends "approve X" twice) bind
-    to two DIFFERENT turns' custody tokens in FIFO order -- one credit per message,
-    never two turns sharing one.
+    ``bind(session_key, turn_id, sender_id, text_sha256, burn_callback)`` is the
+    ONLY write path, and it is called EXACTLY ONCE per turn (from
+    ``bind_turn_custody``). It unconditionally POPS every pending record for
+    ``session_key`` -- not a scan, a drain. The FIRST one whose ``user_id``/
+    ``text_sha256`` match this turn's own is bound to ``(session_key, turn_id)``;
+    every other one is BURNED: dropped, never re-queued, and reported via
+    ``burn_callback(record, reason)`` with ``reason`` one of ``"sender_mismatch"``,
+    ``"text_mismatch"``, or ``"superseded"`` (a later record that ALSO matches,
+    once the first match has already been bound -- round 3's identical-text id
+    drift is closed by this as a side effect: only the oldest matching record is
+    ever bound, and every other one, matching or not, is gone). A turn that binds
+    NOTHING still burns whatever was pending: a captured-but-unbound record does
+    not survive past the turn that was supposed to claim it.
 
     ``read(session_key, turn_id)`` is the ONLY read path (``pre_tool_call``): it
     returns whatever is bound to that exact turn, or ``None`` -- never touches the
@@ -216,33 +251,48 @@ class _OriginStash:
             if not oldest_dq:
                 self._pending.pop(oldest_session, None)
 
-    def bind(self, session_key: str, turn_id: str, *, sender_id: str, text_sha256: str) -> bool:
+    def bind(
+        self, session_key: str, turn_id: str, *, sender_id: str, text_sha256: str,
+        burn_callback: Optional[Any] = None,
+    ) -> bool:
+        """Drain every pending record for *session_key* unconditionally. The first
+        one matching (*sender_id*, *text_sha256*) is bound to *turn_id*; every
+        other one -- expired, mismatched, or a later duplicate match -- is burned
+        and reported to ``burn_callback(record, reason)`` if given. Nothing
+        pending is ever re-queued, whether or not this call ends up binding
+        anything."""
         if not session_key or not turn_id:
             return False
         key = (session_key, turn_id)
         if key in self._bound:
             return True  # idempotent: pre_llm_call firing twice for one turn is a no-op
-        dq = self._pending.get(session_key)
+        dq = self._pending.pop(session_key, None)
+        if dq:
+            self._pending_count -= len(dq)
         if not dq:
             return False
         found: Optional[tuple[float, dict[str, Any]]] = None
-        kept: "deque[tuple[float, dict[str, Any]]]" = deque()
-        kept_count = 0
         while dq:
             stamped_at, record = dq.popleft()
-            self._pending_count -= 1
             if self._expired(stamped_at):
-                continue  # drop silently: the TTL backstop, applied on every bind attempt too
-            if found is None and record.get("user_id") == sender_id and record.get("text_sha256") == text_sha256:
+                if burn_callback is not None:
+                    burn_callback(record, "expired")
+                continue
+            if (
+                found is None
+                and record.get("user_id") == sender_id
+                and record.get("text_sha256") == text_sha256
+            ):
                 found = (stamped_at, record)
-                continue  # consumed: the OLDEST match only, never re-queued
-            kept.append((stamped_at, record))
-            kept_count += 1
-        if kept:
-            self._pending[session_key] = kept
-            self._pending_count += kept_count
-        else:
-            self._pending.pop(session_key, None)
+                continue  # bound below -- not a burn
+            if record.get("user_id") != sender_id:
+                reason = "sender_mismatch"
+            elif record.get("text_sha256") != text_sha256:
+                reason = "text_mismatch"
+            else:
+                reason = "superseded"  # matched, but an earlier record already won this bind
+            if burn_callback is not None:
+                burn_callback(record, reason)
         if found is None:
             return False
         self._bound[key] = found
@@ -300,26 +350,33 @@ def set_mcp_server_name(name: Optional[str]) -> None:
     _mcp_server_name = _sanitize_mcp_name_component(name)
 
 
-def _looks_like_governed_suffix(tool_name: Any) -> Optional[str]:
-    """Broad, server-name-independent check used ONLY to decide whether a
-    model-supplied ``human_origin`` must be stripped (fail closed) -- never to
-    decide whether to stamp. Matches the bare name, or ANY ``mcp__<anything>__``
-    prefix ending in the bare name, regardless of the configured mupot server.
-    kasra-review round-2 P1-1: without this, a misconfigured/unresolved server
-    name made ``_resolve_governed_tool_name`` return ``None`` and
-    ``stamp_tool_call`` returned before ever reaching the strip -- a forged
-    ``human_origin`` passed through untouched. This check can never be fooled the
-    same way because it does not compare a server name at all.
+def _looks_like_mupot_tool(tool_name: Any) -> bool:
+    """Broad check used ONLY to decide whether a model-supplied ``human_origin``
+    must be stripped (fail closed) -- never to decide whether to stamp. Round 4
+    (kasra-review round-3 P1-3): widened from "looks like task_verdict on any
+    server" to "belongs to the configured mupot server AT ALL" -- the live
+    kayhermes schema cache exposes several other decision-adjacent tools
+    (``task_verdict_reverse``, ``approve_gate_edge``, ``advance_node``,
+    ``objective_accept``, ``routine_run_answer``) that a model could just as
+    easily try to forge ``human_origin`` on, none of which the old bare-suffix
+    check ever looked at. True for: any of :data:`_KNOWN_MUPOT_DECISION_TOOL_NAMES`
+    by bare name; ANY ``mcp__<configured mupot server>__*`` wire name once the
+    server is resolved (every tool that server exposes, not just named ones);
+    or, while unresolved, an ``mcp__<anything>__`` prefix ending in one of the
+    named decision tools (the same server-name-independent fallback round 3 had,
+    now covering more names).
     """
     if not isinstance(tool_name, str):
-        return None
-    if tool_name in HUMAN_ORIGIN_TOOL_NAMES:
-        return tool_name
+        return False
+    if tool_name in _KNOWN_MUPOT_DECISION_TOOL_NAMES:
+        return True
+    if _mcp_server_name and tool_name.startswith(f"mcp__{_mcp_server_name}__"):
+        return True
     if tool_name.startswith("mcp__"):
-        for name in HUMAN_ORIGIN_TOOL_NAMES:
+        for name in _KNOWN_MUPOT_DECISION_TOOL_NAMES:
             if tool_name.endswith(f"__{name}"):
-                return name
-    return None
+                return True
+    return False
 
 
 def _resolve_governed_tool_name(tool_name: Any) -> Optional[str]:
@@ -507,12 +564,27 @@ def _in_delegated_child_context() -> bool:
         return False
 
 
+def _log_burn(record: Mapping[str, Any], reason: str) -> None:
+    """A pending capture that did not survive to be bound to a turn (kasra-review
+    round-3 P1-2: this used to be silent -- the only signal a reply-quoted
+    approval or a text-mismatch ever produced). Logged at WARNING, never at
+    DEBUG: an operator investigating "my approval didn't count as mine" needs
+    this to be findable."""
+    try:
+        logger.warning(
+            "mupot plugin: burning unconsumed human-origin capture message_id=%s reason=%s",
+            record.get("message_id"), reason,
+        )
+    except Exception:
+        pass
+
+
 def bind_turn_custody(
     *, session_id: str = "", task_id: str = "", turn_id: str = "", user_message: Any = None,
     conversation_history: Any = None, is_first_turn: Any = None, model: str = "",
     platform: str = "", parent_session_id: str = "", sender_id: str = "", **_kwargs: Any,
 ) -> None:
-    """``pre_llm_call`` hook -- the positive per-turn custody token.
+    """``pre_llm_call`` hook -- bind-or-burn (round 4).
 
     Binds a pending capture to THIS ``turn_id`` iff the turn's own fully-prepared
     inbound message (``user_message``) hashes to exactly the text a pending record
@@ -522,9 +594,18 @@ def bind_turn_custody(
     cron/routine turn has no matching Telegram sender/text either; a delegated
     subagent is refused outright.
 
+    Whether or not this call binds anything, EVERY other pending record for this
+    session is burned right here (kasra-review round-3 P0-1: a record that fails
+    to bind must never be re-queued to sit spendable by whatever turn asks next --
+    a reply-quoted "approve", whose prepared text never matches the bare captured
+    text, must not leave "approve" pending for up to the full TTL). Every burn is
+    logged at WARNING with the burned record's ``message_id`` and a reason.
+
     Never raises: a bind failure just means nothing is stamped for this turn --
-    fail open on the FEATURE (the turn proceeds normally), fail closed on the
-    ATTESTATION (no human_origin is ever fabricated).
+    fail open on the FEATURE (the turn proceeds normally, under the agent seat),
+    fail closed on the ATTESTATION (no human_origin is ever fabricated, and the
+    human sees no stamp -- visible downstream as the server's own
+    ``applied:false`` on the verdict, not a crash or a silent wrong answer).
     """
     try:
         if platform != "telegram" or not turn_id:
@@ -541,6 +622,7 @@ def bind_turn_custody(
         _STASH.bind(
             session_key, turn_id,
             sender_id=str(sender_id or ""), text_sha256=_hash_text(user_message),
+            burn_callback=_log_burn,
         )
     except Exception:
         logger.warning("mupot plugin: human-origin turn-binding failed", exc_info=True)
@@ -553,19 +635,20 @@ def stamp_tool_call(
     """``pre_tool_call`` hook. Reads only; never claims, never falls back to "the
     oldest pending record" -- that FIFO-claim mechanism is gone (round 3).
 
-    A model-supplied ``human_origin`` is ALWAYS stripped for any tool whose
-    bare/suffix name looks like ``task_verdict``/``needs_you_list``
-    (:func:`_looks_like_governed_suffix`, independent of server-name match --
-    fail closed even when :func:`set_mcp_server_name` hasn't run yet or the
-    configured name doesn't match); it is only REPLACED with a bound origin when
-    the tool name is an EXACT match for the configured mupot server
+    A model-supplied ``human_origin`` is ALWAYS stripped on EVERY tool that looks
+    like it belongs to mupot at all (:func:`_looks_like_mupot_tool`, widened in
+    round 4 to cover every tool under the configured mupot server, not just the
+    one this module stamps -- independent of server-name match, fail closed even
+    when :func:`set_mcp_server_name` hasn't run yet or the configured name
+    doesn't match); it is only REPLACED with a bound origin when the tool name is
+    an EXACT match for the narrow stamp allowlist on the configured mupot server
     (:func:`_resolve_governed_tool_name`) AND :func:`bind_turn_custody` already
     bound a record to THIS turn_id. Never raises.
     """
     try:
         if not isinstance(args, dict):
             return None
-        if _looks_like_governed_suffix(tool_name) is None:
+        if not _looks_like_mupot_tool(tool_name):
             return None
         model_supplied = "human_origin" in args
         origin: Optional[dict[str, Any]] = None

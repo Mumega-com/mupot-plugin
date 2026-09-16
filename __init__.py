@@ -24,6 +24,11 @@ from .schemas import (
     MUPOT_STATUS_SCHEMA,
 )
 from .telegram_control import TelegramControlSettings, register_telegram_control
+from .telegram_inline_approval import (
+    TelegramInlineApprovalSettings,
+    maybe_build_needs_keyboard,
+    register_telegram_inline_approval,
+)
 from .profile_scope import ProfileSecretOwner, require_supported_profile_runtime
 from .tools import mupot_brain_enable, mupot_provision, mupot_status
 
@@ -369,15 +374,29 @@ def register(ctx: Any) -> None:
             raise ValueError("restart the gateway before switching an active legacy inbox stream to native receive")
         operator_settings = OperatorSettings.from_mapping(operator_value)
         telegram_control_settings = TelegramControlSettings.from_mapping(operator_value)
+        inline_approval_settings = TelegramInlineApprovalSettings.from_mapping(operator_value)
         secret_owner = ProfileSecretOwner.from_context(ctx)
         with secret_owner.activate():
             client = MupotOperatorClient(
                 operator_settings,
                 secret_reader=secret_owner.read_secret,
             )
+            needs_keyboard_factory = None
+            if inline_approval_settings.enabled:
+                async def needs_keyboard_factory(update: Any) -> Any:
+                    return await maybe_build_needs_keyboard(
+                        client, secret_owner=secret_owner, update=update
+                    )
             register_telegram_control(
                 ctx,
                 telegram_control_settings,
+                secret_owner=secret_owner,
+                needs_keyboard_factory=needs_keyboard_factory,
+            )
+            register_telegram_inline_approval(
+                ctx,
+                inline_approval_settings,
+                client=client,
                 secret_owner=secret_owner,
             )
             if native_gateway:

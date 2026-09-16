@@ -35,6 +35,17 @@ OPERATOR_ACTIONS = frozenset(
     }
 )
 
+# telegram_inline_approval.py's callback handler and its /needs keyboard
+# helper call these two directly through MupotOperatorClient.call() -- never
+# through a registered LLM tool (register_operator_tools below does not map
+# either of them to a tool name; see tests/test_operator.py's
+# test_registered_surface_contains_no_admin_or_external_action_tools, which
+# asserts no registered tool name contains "verdict"). Kept in their own
+# frozenset, not merged into OPERATOR_ACTIONS, so the two callers of a raw
+# task_verdict/needs_you_list capability stay easy to find independently of
+# the routine agent-operator surface.
+VERDICT_ACTIONS = frozenset({"task_verdict", "needs_you_list"})
+
 MANAGER_LIFECYCLE_ACTIONS = frozenset(
     {
         "agent_manager_status",
@@ -264,7 +275,11 @@ class MupotOperatorClient:
         self._transport = transport
 
     def call(self, action: str, args: Mapping[str, Any]) -> JsonObject:
-        if action not in OPERATOR_ACTIONS and action not in MANAGER_ACTIONS:
+        if (
+            action not in OPERATOR_ACTIONS
+            and action not in MANAGER_ACTIONS
+            and action not in VERDICT_ACTIONS
+        ):
             return {"ok": False, "error": "action_not_allowed", "action": action}
         if action in MANAGER_ACTIONS and not self.settings.agent_manager_enabled:
             return {"ok": False, "error": "action_not_allowed", "action": action}

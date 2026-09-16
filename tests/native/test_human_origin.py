@@ -1,10 +1,9 @@
 """Human-origin capture/bind/stamp against REAL Hermes primitives: real
 MessageEvent/SessionSource/Platform dataclasses, the real
 SessionRecoveryMixin._generate_session_key, the real session_context contextvar
-bridge, the real hermes_cli.plugins pre_tool_call dispatcher, the real
-tools.mcp_tool_schema sanitizer + mcp_prefixed_tool_name, the real
-agent.delegation_context marker a delegated subagent runs under, this plugin's own
-notifications.select_target, and -- new in round 4 -- the REAL
+bridge, the real hermes_cli.plugins pre_tool_call/post_tool_call dispatchers, the
+real agent.delegation_context marker a delegated subagent runs under, this
+plugin's own notifications.select_target, and -- new in round 4 -- the REAL
 gateway.run_inbound.GatewayInboundMixin._prepare_inbound_message_text pipeline for
 the equality claim, per kasra-review round-3 P1-1: capture and bind must never hash
 the SAME hand-typed literal.
@@ -17,6 +16,15 @@ next, for the whole TTL -- a content-addressed bearer credential whose secret is
 the human's own approval word. Round 4's rule: a pending record lives until the
 NEXT pre_llm_call on its session, and is consumed there whether or not it binds
 (bind-or-burn).
+
+Round 6 rewrite: kasra-review's round-5 P1-1 found round 5's stamp_tool_call()
+consumed the bound record at pre_tool_call -- BEFORE Hermes's own block gate,
+guardrails, or an approval flow can still kill the call -- so a same-turn retry
+after a block was left unattested. Round 6 splits consumption into
+peek_and_reserve() (pre_tool_call) and resolve() (post_tool_call, via the new
+finalize_tool_call hook, wired through the REAL hermes_cli.plugins.invoke_hook
+dispatcher below): a reservation is only permanently spent once Hermes reports the
+call genuinely dispatched (status != "blocked").
 """
 from __future__ import annotations
 
@@ -132,12 +140,34 @@ def _bind(session_key, turn_id, *, text, sender_id="765204057", platform="telegr
         clear_session_vars(tokens)
 
 
-def _stamp(session_key, turn_id, tool_name="task_verdict", args=None):
+def _stamp(session_key, turn_id, tool_name="task_verdict", args=None, tool_call_id="C1"):
+    """pre_tool_call, round 6 calling convention: every real dispatch carries a
+    tool_call_id, and stamp_tool_call() now requires one to ever reserve a
+    bound record."""
     tokens = set_session_vars(session_key=session_key)
     try:
-        return human_origin.stamp_tool_call(tool_name=tool_name, args=args or {}, turn_id=turn_id)
+        return human_origin.stamp_tool_call(
+            tool_name=tool_name, args=args or {}, turn_id=turn_id, tool_call_id=tool_call_id,
+        )
     finally:
         clear_session_vars(tokens)
+
+
+def _finalize(session_key, turn_id, tool_name="task_verdict", tool_call_id="C1", status="ok"):
+    """post_tool_call, round 6's other half."""
+    tokens = set_session_vars(session_key=session_key)
+    try:
+        return human_origin.finalize_tool_call(
+            tool_name=tool_name, turn_id=turn_id, tool_call_id=tool_call_id, status=status,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+
+def _peek(session_key, turn_id, tool_call_id="test-peek"):
+    """Test-only existence check -- peek_and_reserve() never REMOVES a record
+    (only resolve() does)."""
+    return human_origin._STASH.peek_and_reserve(session_key, turn_id, tool_call_id)
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +183,7 @@ def test_session_key_used_by_capture_matches_the_real_generate_session_key_metho
     event = _telegram_event(source)
     human_origin.capture_human_origin(event=event, gateway=None, session_store=store)
     _bind(expected_key, "T1", text="approve it")
-    assert human_origin._STASH.read(expected_key, "T1") is not None
+    assert _peek(expected_key, "T1") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +233,7 @@ async def test_reply_quoted_approve_then_plain_approve_via_the_real_pipeline():
     assert "Task f9408956 is waiting on you." in reply_prepared
 
     _bind(session_key, "T-reply-turn", text=reply_prepared)
-    assert human_origin._STASH.read(session_key, "T-reply-turn") is None  # burned, not bound
+    assert _peek(session_key, "T-reply-turn") is None  # burned, not bound
     assert len(human_origin._STASH) == 0
 
     plain_event = _telegram_event(source, message_id="M200", text="approve")
@@ -235,7 +265,7 @@ def test_a_failed_bind_burns_the_orphan_so_a_later_turn_finds_nothing(caplog):
 
     with caplog.at_level(logging.WARNING):
         _bind(session_key, "T-mismatched-turn", text="something totally different")
-    assert human_origin._STASH.read(session_key, "T-mismatched-turn") is None
+    assert _peek(session_key, "T-mismatched-turn") is None
     assert len(human_origin._STASH) == 0
     assert any("M-orphan-risk" in r.message and "text_mismatch" in r.message for r in caplog.records)
 
@@ -257,7 +287,7 @@ def test_injected_turn_with_text_approve_after_the_humans_own_turn_finds_nothing
     assert human_turn is not None
 
     _bind(session_key, "T-injected", text="approve")
-    injected = _stamp(session_key, "T-injected")
+    injected = _stamp(session_key, "T-injected", tool_call_id="C-injected")
     assert injected is None
 
 
@@ -290,7 +320,7 @@ def test_injected_turn_BEFORE_the_humans_own_turn_burns_it_no_stamp_on_either():
     # the human's OWN turn, which would otherwise have bound this exact record,
     # now finds nothing -- burned out from under it by the turn that ran first:
     _bind(session_key, "T-human-second", text="approve")
-    human_turn = _stamp(session_key, "T-human-second")
+    human_turn = _stamp(session_key, "T-human-second", tool_call_id="C-human-second")
     assert human_turn is None, "the human's own approval should have found nothing, got: " + repr(human_turn)
 
 
@@ -360,7 +390,7 @@ def test_same_text_twice_binds_oldest_only_second_is_superseded_not_left_pending
     assert any("M2" in r.message and "superseded" in r.message for r in caplog.records)
 
     _bind(session_key, "T2", text="approve X")
-    assert _stamp(session_key, "T2") is None
+    assert _stamp(session_key, "T2", tool_call_id="C2") is None
 
 
 def test_sender_id_mismatch_never_binds_and_is_burned(caplog):
@@ -404,6 +434,7 @@ def test_delegated_child_refusal_does_not_burn_leaves_it_for_the_parent():
                 )
                 return human_origin.stamp_tool_call(
                     tool_name="task_verdict", args={"task_id": "t-child"}, turn_id="T-child-fresh-turn",
+                    tool_call_id="C-child",
                 )
 
         with ThreadPoolExecutor(max_workers=1) as ex:
@@ -430,7 +461,7 @@ def test_a_bound_record_is_never_read_by_a_different_turn_id_same_session():
     assert stamped_a is not None
     assert stamped_a["args"]["human_origin"]["message_id"] == "M-A"
 
-    stamped_b = _stamp(session_key, "T-B")
+    stamped_b = _stamp(session_key, "T-B", tool_call_id="C-B")
     assert stamped_b is None, "a different turn read a record it never bound: " + repr(stamped_b)
 
 
@@ -534,7 +565,7 @@ def test_needs_you_list_wire_name_is_no_longer_in_the_stamp_allowlist():
     assert human_origin._resolve_governed_tool_name(wire) is None
     # but it must still be stripped:
     args = {"human_origin": {"user_id": "forged"}}
-    directive = human_origin.stamp_tool_call(tool_name=wire, args=args, turn_id="T1")
+    directive = human_origin.stamp_tool_call(tool_name=wire, args=args, turn_id="T1", tool_call_id="C1")
     assert directive is None
     assert "human_origin" not in args
 
@@ -543,7 +574,7 @@ def test_task_verdict_reverse_wire_name_is_stripped_never_stamped():
     wire = mcp_prefixed_tool_name("mupot", "task_verdict_reverse")
     human_origin.set_mcp_server_name("mupot")
     args = {"human_origin": {"user_id": "forged"}}
-    directive = human_origin.stamp_tool_call(tool_name=wire, args=args, turn_id="T1")
+    directive = human_origin.stamp_tool_call(tool_name=wire, args=args, turn_id="T1", tool_call_id="C1")
     assert directive is None
     assert "human_origin" not in args
 
@@ -561,7 +592,7 @@ def test_forged_origin_still_stripped_for_a_mismatched_real_wire_name(caplog):
     wire = mcp_prefixed_tool_name("mupot", "task_verdict")
     args = {"human_origin": {"user_id": "forged"}}
     with caplog.at_level(logging.WARNING):
-        directive = human_origin.stamp_tool_call(tool_name=wire, args=args, turn_id="T1")
+        directive = human_origin.stamp_tool_call(tool_name=wire, args=args, turn_id="T1", tool_call_id="C1")
     assert directive is None
     assert "human_origin" not in args
 
@@ -570,7 +601,7 @@ def test_any_mupot_tool_is_stripped_once_server_resolved_real_wire_name():
     human_origin.set_mcp_server_name("mupot")
     wire = mcp_prefixed_tool_name("mupot", "flight_dispatch")
     args = {"human_origin": {"user_id": "forged"}}
-    directive = human_origin.stamp_tool_call(tool_name=wire, args=args, turn_id="T1")
+    directive = human_origin.stamp_tool_call(tool_name=wire, args=args, turn_id="T1", tool_call_id="C1")
     assert directive is None
     assert "human_origin" not in args
 
@@ -586,6 +617,24 @@ def test_end_to_end_bind_and_stamp_via_the_real_wire_name():
     out = _stamp(session_key, "T-real-1", tool_name=wire, args={"task_id": "f9408956", "verdict": "approve"})
     assert out is not None
     assert out["args"]["human_origin"]["user_id"] == "765204057"
+
+
+# ---------------------------------------------------------------------------
+# human_origin.text field (round 6 item 2)
+# ---------------------------------------------------------------------------
+
+def test_stamped_human_origin_carries_the_real_prepared_text_field():
+    store = _FakeSessionStore()
+    source = _telegram_source()
+    human_origin.capture_human_origin(
+        event=_telegram_event(source, message_id="M-text", text="approve f9408956"),
+        gateway=None, session_store=store,
+    )
+    session_key = store._generate_session_key(source)
+    _bind(session_key, "T1", text="approve f9408956")
+    out = _stamp(session_key, "T1", args={"task_id": "f9408956"})
+    assert out["args"]["human_origin"]["text"] == "approve f9408956"
+    assert "text_sha256" not in out["args"]["human_origin"]
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +669,7 @@ def test_real_pre_llm_call_then_pre_tool_call_dispatch_stamps_correctly():
             )
             block_msg, modified_args = hermes_plugins._dispatch_pre_tool_call_hooks(
                 "task_verdict", {"task_id": "f9408956", "verdict": "approve"},
-                task_id="", session_id="", tool_call_id="", turn_id="T-e2e", api_request_id="",
+                task_id="", session_id="", tool_call_id="TC-1", turn_id="T-e2e", api_request_id="",
                 middleware_trace=[],
             )
     finally:
@@ -642,7 +691,7 @@ def test_real_dispatcher_strip_removes_forged_origin_from_the_live_args_object()
         mp.setattr(hermes_plugins, "_delivery_manager", lambda: manager)
         block_msg, modified_args = hermes_plugins._dispatch_pre_tool_call_hooks(
             "task_verdict", live_args,
-            task_id="", session_id="", tool_call_id="", turn_id="T-strip", api_request_id="",
+            task_id="", session_id="", tool_call_id="TC-strip", turn_id="T-strip", api_request_id="",
             middleware_trace=[],
         )
 
@@ -651,10 +700,11 @@ def test_real_dispatcher_strip_removes_forged_origin_from_the_live_args_object()
     assert "human_origin" not in live_args
 
 
-def test_real_dispatcher_two_task_verdict_calls_in_one_turn_only_first_stamped():
+def test_real_dispatcher_two_task_verdict_calls_in_one_turn_with_no_resolve_between_only_first_stamped():
     """kasra-review round-4 P1-3, through the real dispatcher: one bound record
-    authenticates AT MOST one task_verdict call. A model steered into calling it
-    twice with different task_ids must not get the human's identity on both."""
+    authenticates AT MOST one task_verdict call in flight. A model steered into
+    calling it twice with DIFFERENT tool_call_ids, with no post_tool_call
+    resolution between them, must not get the human's identity on both."""
     from hermes_cli import plugins as hermes_plugins
 
     store = _FakeSessionStore()
@@ -682,12 +732,12 @@ def test_real_dispatcher_two_task_verdict_calls_in_one_turn_only_first_stamped()
             )
             first_block, first_args = hermes_plugins._dispatch_pre_tool_call_hooks(
                 "task_verdict", {"task_id": "f9408956", "verdict": "approve"},
-                task_id="", session_id="", tool_call_id="", turn_id="T-double", api_request_id="",
+                task_id="", session_id="", tool_call_id="TC-1", turn_id="T-double", api_request_id="",
                 middleware_trace=[],
             )
             second_block, second_args = hermes_plugins._dispatch_pre_tool_call_hooks(
                 "task_verdict", {"task_id": "DIFFERENT-TASK", "verdict": "approve"},
-                task_id="", session_id="", tool_call_id="", turn_id="T-double", api_request_id="",
+                task_id="", session_id="", tool_call_id="TC-2", turn_id="T-double", api_request_id="",
                 middleware_trace=[],
             )
     finally:
@@ -696,7 +746,189 @@ def test_real_dispatcher_two_task_verdict_calls_in_one_turn_only_first_stamped()
     assert first_block is None
     assert first_args["human_origin"]["user_id"] == "765204057"
     assert second_block is None
-    assert second_args is None  # no modify directive: the second call got nothing to stamp with
+    assert second_args is None  # no modify directive: TC-2 could not also reserve it
+
+
+# ---------------------------------------------------------------------------
+# Round 6 item 1 (kasra-review round-5 P1-1): reserve at pre_tool_call, resolve
+# at post_tool_call -- driven through the REAL hermes_cli.plugins.invoke_hook
+# dispatcher for BOTH hooks, exactly as Hermes itself fires them.
+# ---------------------------------------------------------------------------
+
+def test_real_dispatcher_blocked_call_releases_reservation_for_same_turn_retry():
+    """The exact P1-1 scenario end-to-end through the real dispatcher: Hermes's
+    own block gate (a guardrail, a denied human-approval escalation, a thread
+    whitelist -- anything) kills the FIRST call after stamp_tool_call already
+    stamped it but before it ever reached mupot. The real post_tool_call
+    dispatch, given status="blocked", must release the reservation so the
+    model's retry (a NEW tool_call_id, same turn) is stamped too."""
+    from hermes_cli import plugins as hermes_plugins
+
+    store = _FakeSessionStore()
+    source = _telegram_source()
+    human_origin.capture_human_origin(
+        event=_telegram_event(source, text="approve f9408956"), gateway=None, session_store=store,
+    )
+    session_key = store._generate_session_key(source)
+    human_origin.set_mcp_server_name("mupot")
+
+    manager = hermes_plugins.PluginManager(scope_key="test-human-origin-r6-blocked-retry")
+    manager._hooks = {
+        "pre_llm_call": [human_origin.bind_turn_custody],
+        "pre_tool_call": [human_origin.stamp_tool_call],
+        "post_tool_call": [human_origin.finalize_tool_call],
+    }
+
+    tokens = set_session_vars(session_key=session_key)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(hermes_plugins, "_delivery_manager", lambda: manager)
+            hermes_plugins.invoke_hook(
+                "pre_llm_call", session_id="db-sess-3", task_id="t", turn_id="T-blocked",
+                user_message="approve f9408956", conversation_history=[], is_first_turn=True,
+                model="gpt-4", platform="telegram", parent_session_id="", sender_id="765204057",
+            )
+            first_block, first_args = hermes_plugins._dispatch_pre_tool_call_hooks(
+                "task_verdict", {"task_id": "f9408956", "verdict": "approve"},
+                task_id="", session_id="", tool_call_id="TC-1", turn_id="T-blocked", api_request_id="",
+                middleware_trace=[],
+            )
+            assert first_block is None
+            assert first_args["human_origin"]["user_id"] == "765204057"
+
+            # Hermes's own gate kills the call AFTER the stamp -- the real
+            # post_tool_call dispatch, exactly as tool_executor.py fires it for
+            # a vetoed call:
+            hermes_plugins.invoke_hook(
+                "post_tool_call", tool_name="task_verdict",
+                args={"task_id": "f9408956", "verdict": "approve", "human_origin": first_args["human_origin"]},
+                result=None, task_id="", session_id="", tool_call_id="TC-1", turn_id="T-blocked",
+                api_request_id="", duration_ms=0, status="blocked", error_type=None, error_message=None,
+                middleware_trace=[],
+            )
+
+            # the retry -- a NEW tool_call_id, same turn -- is stamped again:
+            retry_block, retry_args = hermes_plugins._dispatch_pre_tool_call_hooks(
+                "task_verdict", {"task_id": "f9408956", "verdict": "approve"},
+                task_id="", session_id="", tool_call_id="TC-2", turn_id="T-blocked", api_request_id="",
+                middleware_trace=[],
+            )
+    finally:
+        clear_session_vars(tokens)
+
+    assert retry_block is None
+    assert retry_args is not None
+    assert retry_args["human_origin"]["user_id"] == "765204057"
+
+
+def test_real_dispatcher_completed_dispatch_spends_it_second_call_stripped():
+    """The other half, also through the real dispatcher: once post_tool_call
+    reports a genuine dispatch outcome (status="ok"), the record is gone for
+    good -- a second task_verdict call in the same turn gets nothing."""
+    from hermes_cli import plugins as hermes_plugins
+
+    store = _FakeSessionStore()
+    source = _telegram_source()
+    human_origin.capture_human_origin(
+        event=_telegram_event(source, text="approve f9408956"), gateway=None, session_store=store,
+    )
+    session_key = store._generate_session_key(source)
+    human_origin.set_mcp_server_name("mupot")
+
+    manager = hermes_plugins.PluginManager(scope_key="test-human-origin-r6-completed-then-second")
+    manager._hooks = {
+        "pre_llm_call": [human_origin.bind_turn_custody],
+        "pre_tool_call": [human_origin.stamp_tool_call],
+        "post_tool_call": [human_origin.finalize_tool_call],
+    }
+
+    tokens = set_session_vars(session_key=session_key)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(hermes_plugins, "_delivery_manager", lambda: manager)
+            hermes_plugins.invoke_hook(
+                "pre_llm_call", session_id="db-sess-4", task_id="t", turn_id="T-completed",
+                user_message="approve f9408956", conversation_history=[], is_first_turn=True,
+                model="gpt-4", platform="telegram", parent_session_id="", sender_id="765204057",
+            )
+            first_block, first_args = hermes_plugins._dispatch_pre_tool_call_hooks(
+                "task_verdict", {"task_id": "f9408956", "verdict": "approve"},
+                task_id="", session_id="", tool_call_id="TC-1", turn_id="T-completed", api_request_id="",
+                middleware_trace=[],
+            )
+            assert first_args["human_origin"]["user_id"] == "765204057"
+
+            # the call genuinely dispatched and mupot returned success:
+            hermes_plugins.invoke_hook(
+                "post_tool_call", tool_name="task_verdict",
+                args={"task_id": "f9408956", "verdict": "approve", "human_origin": first_args["human_origin"]},
+                result={"ok": True}, task_id="", session_id="", tool_call_id="TC-1", turn_id="T-completed",
+                api_request_id="", duration_ms=42, status="ok", error_type=None, error_message=None,
+                middleware_trace=[],
+            )
+
+            second_block, second_args = hermes_plugins._dispatch_pre_tool_call_hooks(
+                "task_verdict", {"task_id": "ANOTHER-TASK", "verdict": "approve"},
+                task_id="", session_id="", tool_call_id="TC-2", turn_id="T-completed", api_request_id="",
+                middleware_trace=[],
+            )
+    finally:
+        clear_session_vars(tokens)
+
+    assert second_block is None
+    assert second_args is None
+    assert len(human_origin._STASH) == 0
+
+
+def test_finalize_tool_call_status_error_also_spends_via_real_dispatcher():
+    """status="error" (mupot's own tool raised) is just as much a genuine
+    dispatch as "ok" -- only "blocked" releases."""
+    from hermes_cli import plugins as hermes_plugins
+
+    store = _FakeSessionStore()
+    source = _telegram_source()
+    human_origin.capture_human_origin(
+        event=_telegram_event(source, text="approve f9408956"), gateway=None, session_store=store,
+    )
+    session_key = store._generate_session_key(source)
+    human_origin.set_mcp_server_name("mupot")
+
+    manager = hermes_plugins.PluginManager(scope_key="test-human-origin-r6-tool-error")
+    manager._hooks = {
+        "pre_llm_call": [human_origin.bind_turn_custody],
+        "pre_tool_call": [human_origin.stamp_tool_call],
+        "post_tool_call": [human_origin.finalize_tool_call],
+    }
+
+    tokens = set_session_vars(session_key=session_key)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(hermes_plugins, "_delivery_manager", lambda: manager)
+            hermes_plugins.invoke_hook(
+                "pre_llm_call", session_id="db-sess-5", task_id="t", turn_id="T-error",
+                user_message="approve f9408956", conversation_history=[], is_first_turn=True,
+                model="gpt-4", platform="telegram", parent_session_id="", sender_id="765204057",
+            )
+            hermes_plugins._dispatch_pre_tool_call_hooks(
+                "task_verdict", {"task_id": "f9408956", "verdict": "approve"},
+                task_id="", session_id="", tool_call_id="TC-1", turn_id="T-error", api_request_id="",
+                middleware_trace=[],
+            )
+            hermes_plugins.invoke_hook(
+                "post_tool_call", tool_name="task_verdict", args={"task_id": "f9408956"},
+                result=None, task_id="", session_id="", tool_call_id="TC-1", turn_id="T-error",
+                api_request_id="", duration_ms=5, status="error", error_type="ToolError",
+                error_message="mupot raised", middleware_trace=[],
+            )
+            second_block, second_args = hermes_plugins._dispatch_pre_tool_call_hooks(
+                "task_verdict", {"task_id": "ANOTHER-TASK"},
+                task_id="", session_id="", tool_call_id="TC-2", turn_id="T-error", api_request_id="",
+                middleware_trace=[],
+            )
+    finally:
+        clear_session_vars(tokens)
+
+    assert second_args is None
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +956,27 @@ def test_mcp_server_name_scoped_per_profile_via_real_session_context():
         assert human_origin._resolve_governed_tool_name("mcp__mupot__task_verdict") is None
     finally:
         clear_session_vars(tokens_b)
+
+
+def test_current_profile_key_reads_the_real_session_profile_contextvar_directly():
+    """kasra-review round-5 P3-3: the plain-suite test covering per-profile
+    scoping monkeypatches _current_profile_key() itself, so it cannot detect a
+    regression where _current_profile_key() stops reading the real
+    HERMES_SESSION_PROFILE contextvar at all. This test calls
+    _current_profile_key() directly against a REAL contextvar binding, with no
+    monkeypatch anywhere in the chain -- deleting the read inside
+    _current_profile_key() makes THIS test go red, not just silent."""
+    tokens = set_session_vars(profile="profile-x")
+    try:
+        assert human_origin._current_profile_key() == "profile-x"
+    finally:
+        clear_session_vars(tokens)
+
+    tokens2 = set_session_vars(profile="profile-y")
+    try:
+        assert human_origin._current_profile_key() == "profile-y"
+    finally:
+        clear_session_vars(tokens2)
 
 
 # ---------------------------------------------------------------------------
@@ -835,14 +1088,15 @@ def test_session_end_hook_drops_records_via_the_real_session_id_kwarg_shape():
         )
     finally:
         clear_session_vars(tokens)
-    # read() is one-shot (round 5) -- check via len(), not read(), so checking
-    # "is it bound" doesn't itself consume the very thing being tested:
-    assert len(human_origin._STASH) == 1
+    # peek_and_reserve() never consumes (round 6), so checking "is it bound"
+    # before the boundary call cannot itself invalidate the very thing being
+    # tested -- unlike round 5's one-shot read():
+    assert _peek(session_key, "T1") is not None
 
     human_origin._on_session_boundary(
         session_id="db-session-xyz", task_id="t", turn_id="T1", completed=True,
         failed=False, interrupted=False, turn_exit_reason="text_response(stop)",
         model="gpt-4", platform="telegram",
     )
-    assert human_origin._STASH.read(session_key, "T1") is None
+    assert _peek(session_key, "T1") is None
     assert len(human_origin._STASH) == 0

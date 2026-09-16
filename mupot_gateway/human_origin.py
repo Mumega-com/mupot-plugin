@@ -100,6 +100,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import threading
 import time
 from collections import OrderedDict, deque
 from typing import Any, Dict, Mapping, Optional
@@ -236,6 +237,14 @@ _MAX_PENDING_TOTAL = 512
 _MAX_BOUND = 512
 _CAPTURE_TTL_SECONDS = 120.0
 
+# The stamped human_origin.text field (round 6): mupot's server side requires
+# the task id to appear in the human's own words, binding the stamp to the
+# INTENT the human expressed, not just his identity. Capped independently of
+# what gets hashed for the bind-time equality check (the FULL text is always
+# hashed) -- this bound only limits how much of a long message rides along in
+# the stamped payload.
+_MAX_STAMPED_TEXT_CHARS = 2048
+
 _WARNED_UNSUPPORTED_PLATFORMS: set[str] = set()
 
 # session_id -> session_key, populated opportunistically the first time
@@ -289,15 +298,27 @@ class _OriginStash:
     the OLDER of the two message ids: content-correct, id-drifted. Named P2
     residual, unchanged severity from round 3.
 
-    ``read(session_key, turn_id)`` is the ONLY read path (``pre_tool_call``) and
-    is ONE-SHOT (round 5, kasra-review round-4 P1-3): it CONSUMES the bound
-    record on the first call, returning ``None`` to every later call for the
-    same turn. Without this, one bound record stamped EVERY ``task_verdict`` call
-    in the turn -- so a model steered into calling it twice with two different
-    ``task_id``s got the human's identity on both, and mupot's own replay guard
-    (keyed on the message, not the task) would apply whichever call reached it
-    first, not necessarily the one the human actually named. One human message
-    now authenticates AT MOST one ``task_verdict`` call.
+    ``peek_and_reserve(session_key, turn_id, tool_call_id)`` / ``resolve(...)``
+    (round 6, kasra-review round-5 P1-1) replace what round 5 called ``read()``.
+    Round 5's one-shot ``read()`` consumed the record at ``pre_tool_call`` --
+    before Hermes's own block gate, guardrails, or approval flow can still kill
+    the call (``hermes_cli/plugins.py``'s ``modify`` directive is resolved
+    BEFORE the block/approve gate, by design, so every hook -- including a
+    thread whitelist, another plugin, a human-approval denial -- runs against
+    args this module had already stamped and popped). A vetoed or failed
+    ``task_verdict`` therefore spent the human's ONE credit on a call that never
+    reached mupot at all, leaving a same-turn retry unattested. Round 6 splits
+    consumption into two steps: ``peek_and_reserve`` (called from
+    ``pre_tool_call``) hands out the bound record and marks it RESERVED by
+    *tool_call_id* -- available for stamping, but not to any OTHER concurrent
+    call -- without removing it; ``resolve`` (called from ``post_tool_call``,
+    once Hermes knows whether the call actually dispatched) either releases the
+    reservation back to available (``spent=False``, e.g. ``status == "blocked"``
+    -- the retry in the SAME turn can then reserve and stamp it) or permanently
+    removes it (``spent=True``, a genuine dispatch outcome -- success or tool
+    error, mupot has now seen the field or would have). One human message still
+    authenticates AT MOST one ``task_verdict`` call THAT ACTUALLY DISPATCHES;
+    a call that never reaches mupot no longer burns the credit.
     """
 
     def __init__(
@@ -313,7 +334,11 @@ class _OriginStash:
         self._ttl_seconds = ttl_seconds
         self._pending: "OrderedDict[str, deque[tuple[float, dict[str, Any]]]]" = OrderedDict()
         self._pending_count = 0
-        self._bound: "OrderedDict[tuple[str, str], tuple[float, dict[str, Any]]]" = OrderedDict()
+        # value = (stamped_at, record, reserved_by) -- reserved_by is the
+        # tool_call_id currently holding this record for stamping, or None
+        # when it is available to be reserved by the next pre_tool_call.
+        self._bound: "OrderedDict[tuple[str, str], tuple[float, dict[str, Any], Optional[str]]]" = OrderedDict()
+        self._lock = threading.Lock()
 
     def _expired(self, stamped_at: float) -> bool:
         return (time.monotonic() - stamped_at) > self._ttl_seconds
@@ -389,27 +414,65 @@ class _OriginStash:
                 burn_callback(record, reason)
         if found is None:
             return False
-        self._bound[key] = found
-        self._bound.move_to_end(key)
-        while len(self._bound) > self._max_bound:
-            self._bound.popitem(last=False)
+        stamped_at, record = found
+        with self._lock:
+            self._bound[key] = (stamped_at, record, None)  # unreserved: available to stamp
+            self._bound.move_to_end(key)
+            while len(self._bound) > self._max_bound:
+                evicted_key, (_, evicted_record, _) = self._bound.popitem(last=False)
+                if burn_callback is not None:
+                    burn_callback(evicted_record, "bound_overflow")
         return True
 
-    def read(self, session_key: str, turn_id: str) -> Optional[dict[str, Any]]:
-        """One-shot: pops the bound record on the FIRST call for this turn (round
-        5, kasra-review round-4 P1-3). A second ``task_verdict`` call in the same
-        turn -- whether the model made it deliberately or was steered into it --
-        finds nothing, exactly like a turn nothing was ever bound to."""
-        if not session_key or not turn_id:
+    def peek_and_reserve(
+        self, session_key: str, turn_id: str, tool_call_id: str,
+    ) -> Optional[dict[str, Any]]:
+        """``pre_tool_call``: return the bound record and mark it reserved by
+        *tool_call_id* iff it is bound, unexpired, and either unreserved or
+        already reserved by this SAME ``tool_call_id`` (idempotent re-entry --
+        a hook re-dispatch or a retry with the identical id). Reserved by a
+        DIFFERENT ``tool_call_id`` (a concurrent call) returns ``None`` --
+        never hands the same credential to two calls at once. Does NOT
+        consume: the record is only ever removed by :meth:`resolve`."""
+        if not session_key or not turn_id or not tool_call_id:
             return None
         key = (session_key, turn_id)
-        entry = self._bound.pop(key, None)
-        if entry is None:
-            return None
-        stamped_at, record = entry
-        if self._expired(stamped_at):
-            return None
-        return dict(record)
+        with self._lock:
+            entry = self._bound.get(key)
+            if entry is None:
+                return None
+            stamped_at, record, reserved_by = entry
+            if self._expired(stamped_at):
+                del self._bound[key]
+                return None
+            if reserved_by is not None and reserved_by != tool_call_id:
+                return None
+            self._bound[key] = (stamped_at, record, tool_call_id)
+            return dict(record)
+
+    def resolve(self, session_key: str, turn_id: str, tool_call_id: str, *, spent: bool) -> None:
+        """``post_tool_call``: resolve the reservation *tool_call_id* holds.
+        ``spent=True`` (the call genuinely dispatched -- success or tool error)
+        permanently removes the record. ``spent=False`` (the call was blocked
+        before it ever reached mupot) releases the reservation so the NEXT
+        pre_tool_call for this turn -- typically the model's own retry -- can
+        reserve and stamp it again. A mismatched or already-gone reservation is
+        a no-op: this is a resolution of a SPECIFIC reservation, not a blind
+        drop."""
+        if not session_key or not turn_id or not tool_call_id:
+            return
+        key = (session_key, turn_id)
+        with self._lock:
+            entry = self._bound.get(key)
+            if entry is None:
+                return
+            stamped_at, record, reserved_by = entry
+            if reserved_by != tool_call_id:
+                return
+            if spent or self._expired(stamped_at):
+                del self._bound[key]
+            else:
+                self._bound[key] = (stamped_at, record, None)
 
     def drop_session(self, session_key: str) -> None:
         if not session_key:
@@ -612,6 +675,7 @@ def capture_human_origin(
         # "triggering message (pin/reply/react)" reference, not this message's own id.
         message_id = getattr(event, "message_id", None)
         text = getattr(event, "text", None)
+        text_str = text if isinstance(text, str) else ""
         record = {
             "platform": platform,
             "user_id": str(user_id) if user_id is not None else None,
@@ -621,9 +685,16 @@ def capture_human_origin(
             "chat_type": chat_type_value(source),
             "thread_id": str(thread_id) if thread_id is not None else None,
             "forwarded": False,  # _passes_trust_fence already refused any forwarded message
+            # The human's own message text, truncated -- mupot's server side (round 4)
+            # requires the task id to appear in it, binding the stamp to the intent the
+            # human actually expressed, not just his identity. Truncated independently
+            # of what gets HASHED (below): the full, untruncated text is always what
+            # bind_turn_custody compares against, so truncation here can never turn a
+            # real match into a false one.
+            "text": text_str[:_MAX_STAMPED_TEXT_CHARS],
             # Internal-only correlation key for bind(); stripped before ever being
             # returned as a stamped human_origin (see stamp_tool_call).
-            "text_sha256": _hash_text(text if isinstance(text, str) else ""),
+            "text_sha256": _hash_text(text_str),
         }
         _STASH.capture(session_key, record, evict_callback=_log_burn)
     except Exception:
@@ -739,10 +810,13 @@ def bind_turn_custody(
 
 
 def stamp_tool_call(
-    *, tool_name: str = "", args: Any = None, turn_id: str = "", **_kwargs: Any
+    *, tool_name: str = "", args: Any = None, turn_id: str = "", tool_call_id: str = "",
+    **_kwargs: Any,
 ) -> Optional[dict[str, Any]]:
-    """``pre_tool_call`` hook. Reads only; never claims, never falls back to "the
-    oldest pending record" -- that FIFO-claim mechanism is gone (round 3).
+    """``pre_tool_call`` hook. RESERVES, never fully consumes -- that is
+    :func:`finalize_tool_call`'s job at ``post_tool_call`` (round 6, kasra-review
+    round-5 P1-1). Never claims from pending, never falls back to "the oldest
+    pending record" -- that FIFO-claim mechanism is gone (round 3).
 
     A model-supplied ``human_origin`` is ALWAYS stripped on EVERY tool that looks
     like it belongs to mupot at all (:func:`_looks_like_mupot_tool`, widened in
@@ -752,7 +826,9 @@ def stamp_tool_call(
     doesn't match); it is only REPLACED with a bound origin when the tool name is
     an EXACT match for the narrow stamp allowlist on the configured mupot server
     (:func:`_resolve_governed_tool_name`) AND :func:`bind_turn_custody` already
-    bound a record to THIS turn_id. Never raises.
+    bound a record to THIS turn_id that is either unreserved or already reserved
+    by THIS ``tool_call_id`` (:meth:`_OriginStash.peek_and_reserve`). Never
+    raises.
     """
     try:
         if not isinstance(args, dict):
@@ -761,10 +837,10 @@ def stamp_tool_call(
             return None
         model_supplied = "human_origin" in args
         origin: Optional[dict[str, Any]] = None
-        if _resolve_governed_tool_name(tool_name) is not None and turn_id:
+        if _resolve_governed_tool_name(tool_name) is not None and turn_id and tool_call_id:
             session_key = _current_session_key()
             if session_key:
-                bound = _STASH.read(session_key, turn_id)
+                bound = _STASH.peek_and_reserve(session_key, turn_id, tool_call_id)
                 if bound is not None:
                     origin = {k: v for k, v in bound.items() if k != "text_sha256"}
         if model_supplied:
@@ -784,6 +860,31 @@ def stamp_tool_call(
         return None
 
 
+def finalize_tool_call(
+    *, tool_name: str = "", turn_id: str = "", tool_call_id: str = "",
+    status: Optional[str] = None, **_kwargs: Any,
+) -> None:
+    """``post_tool_call`` hook -- the other half of round 6's fix. Resolves
+    whatever reservation *tool_call_id* holds: ``status == "blocked"`` (Hermes's
+    own block gate, a guardrail, a denied/erroring human-approval escalation --
+    anything that stopped the call before it ever reached mupot) RELEASES the
+    reservation so a same-turn retry can stamp it again; any other status ("ok",
+    "error", "cancelled", ...) is a genuine dispatch attempt and PERMANENTLY
+    consumes it. A non-governed tool, or a turn/call that never reserved
+    anything, is a no-op. Never raises.
+    """
+    try:
+        if _resolve_governed_tool_name(tool_name) is None or not turn_id or not tool_call_id:
+            return None
+        session_key = _current_session_key()
+        if not session_key:
+            return None
+        _STASH.resolve(session_key, turn_id, tool_call_id, spent=(status != "blocked"))
+    except Exception:
+        logger.warning("mupot plugin: human-origin reservation resolution failed", exc_info=True)
+    return None
+
+
 def _on_session_boundary(*, session_id: str = "", **_kwargs: Any) -> None:
     """``on_session_reset``/``on_session_end`` hook: drop any pending/bound
     records for the session Hermes itself just ended, instead of relying solely on
@@ -799,7 +900,7 @@ def _on_session_boundary(*, session_id: str = "", **_kwargs: Any) -> None:
 
 
 def register(ctx: Any) -> None:
-    """Wire all four hooks. Called from the native gateway's own ``register()``
+    """Wire all six hooks. Called from the native gateway's own ``register()``
     (``mupot_gateway/adapter.py``), FIRST, before anything else is registered.
     A Hermes runtime that cannot ``register_hook`` (or whose hook registration
     itself fails) gets NO native-gateway registration at all -- refusing loudly
@@ -821,6 +922,7 @@ def register(ctx: Any) -> None:
         register_hook("pre_gateway_dispatch", capture_human_origin)
         register_hook("pre_llm_call", bind_turn_custody)
         register_hook("pre_tool_call", stamp_tool_call)
+        register_hook("post_tool_call", finalize_tool_call)
         register_hook("on_session_reset", _on_session_boundary)
         register_hook("on_session_end", _on_session_boundary)
     except Exception:

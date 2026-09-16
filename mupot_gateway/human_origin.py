@@ -2,63 +2,72 @@
 
 The human talks to their own agent in natural language over a platform (Telegram
 today); the HARNESS -- never the LLM -- must be the thing that stamps the inbound
-message's origin (platform, user id, chat id, message id, timestamp) onto the
-agent's ``task_verdict``/``needs_you_list`` calls. Mupot resolves that origin to the
-member and lets the call ride under the human's own identity instead of the agent
-seat; without it, the call runs under the agent seat as today.
+message's origin onto the agent's ``task_verdict``/``needs_you_list`` calls. Mupot
+resolves that origin to the member and lets the call ride under the human's own
+identity instead of the agent seat; without it, the call runs under the agent seat.
 
-Two Hermes lifecycle hooks do the whole job, and BOTH classes an adversarial gate
-found (kasra-review + Athena, 2026-09-16, PR#13) are addressed at the class level,
-not per repro:
+This is round 3. Rounds 1 and 2 each narrowed the claim surface (a bare-name-only
+match, then a session-keyed single slot, then a per-session FIFO) and each round's
+gate found that the narrower surface was STILL first-claimant-wins: whichever turn
+next asked on a given session key could spend a credit no one had verified it was
+entitled to. Round 3 replaces claiming with a POSITIVE per-turn custody token and
+deletes the FIFO/first-claim path entirely -- one mechanism, not a fourth one beside
+it:
 
-* ``pre_gateway_dispatch`` (:func:`capture_human_origin`) fires once per inbound
-  ``MessageEvent``, straight off the platform adapter, BEFORE Hermes's own
-  ``_is_user_authorized_for_source`` runs (``gateway/run_inbound.py``: the hook at
-  line ~180, auth at ~185) -- so this module is its OWN trust fence, not a
-  convenience filter: a message is captured only when it is a private,
-  non-forwarded, self chat (``chat_type == "dm"`` and ``user_id == chat_id``,
-  Telegram's own DM invariant), mirroring ``telegram_control.py``'s
-  ``_sanitized_envelope`` gate exactly (shared forwarding-marker check lives in
-  ``telegram_fence.py`` so the two never drift). A captured record is PENDING,
-  not yet bound to any turn.
-* ``pre_tool_call`` (:func:`stamp_tool_call`) fires once per tool dispatch, for
-  ``task_verdict``/``needs_you_list`` only -- matched by bare name OR by the exact
-  ``mcp__<mupot-server>__<tool>`` wire name Hermes's MCP tool registration emits
-  (``tools/mcp_tool_schema.py``'s ``mcp_prefixed_tool_name``; a live gateway NEVER
-  emits the bare name once mupot is configured as an MCP server, so bare-only
-  matching is a silent, unfired hook -- kasra-review P0-1). The FIRST such call
-  from a NEWLY-arrived turn CLAIMS the oldest pending capture for its session,
-  binding it to that turn's ``turn_id`` (received directly in ``pre_tool_call``'s
-  own kwargs); every LATER call sharing that exact ``turn_id`` keeps reading the
-  same claimed origin, but no OTHER turn -- an internal/plugin-injected turn on
-  the same session key (``gateway/run_inbound.py``'s
-  ``_dispatch_plugin_message_injection``, and this plugin's own
-  ``notifications.py`` activation path), a cron turn, or a delegated subagent
-  (``tools/delegate_tool_child_run.py``, which additionally always runs inside
-  ``agent.delegation_context.is_delegated_child_context()`` -- checked directly,
-  belt-and-suspenders on top of the turn_id mismatch) -- can ever claim or read
-  it (kasra-review P0-2, the subagent sub-case, and Athena's positive-custody-
-  token framing). A model-supplied ``human_origin`` is always overwritten (or
-  stripped, when nothing is claimable) and logged as a forgery attempt.
+1. ``pre_gateway_dispatch`` (:func:`capture_human_origin`) -- unchanged in spirit
+   from round 2: fires once per inbound ``MessageEvent``, BEFORE Hermes's own
+   ``_is_user_authorized_for_source`` (``gateway/run_inbound.py``: hook at line
+   ~180, auth at ~185), so this module is its own trust fence (private,
+   non-forwarded, self chat -- ``chat_type == "dm"`` and ``user_id == chat_id``,
+   mirroring ``telegram_control.py``'s gate, shared forwarding check in
+   ``telegram_fence.py``). NEW: the captured record now also carries a SHA-256 of
+   the message's own text (``event.text``), and its TTL is 10 minutes, not 30 --
+   a short freshness window, not the binding itself.
 
-Only Telegram is supported for now. Every other platform is recorded (a one-time
-log per platform name) as unsupported: ``task_verdict``/``needs_you_list`` calls
-from those turns simply never carry a claimed origin and fall back to running
-under the agent seat, exactly like a CLI turn, a cron turn, or a subagent turn.
+2. ``pre_llm_call`` (:func:`bind_turn_custody`) is NEW -- the positive custody
+   token. It fires once per turn, BEFORE the tool loop, with (among others)
+   ``platform``, ``sender_id``, and ``user_message`` -- Hermes's fully-PREPARED
+   inbound text for this turn (``agent/turn_context.py``'s
+   ``_collect_pre_llm_call_context``, called with ``original_user_message``, which
+   for a plain-text private Telegram DM with no media/reply/@-reference is
+   BYTE-IDENTICAL to the raw ``MessageEvent.text`` -- see
+   ``gateway/run_inbound.py``'s ``_prepare_inbound_message_text`` /
+   ``_prefix_inbound_sender_context``: the sender-name prefix and reply/document
+   notes only ever apply to a SHARED multi-user session or a media/reply message,
+   never a bare-text DM, which is all this module's capture-time fence admits in
+   the first place). A pending capture is bound to ``turn_id`` iff
+   ``platform == "telegram"``, the turn's ``sender_id`` equals the record's
+   ``user_id``, and ``sha256(user_message)`` equals the record's stored hash --
+   i.e. THIS turn is provably the one processing THAT exact human message, not
+   merely a turn that happens to share its session. An internal/plugin-injected
+   turn's ``user_message`` is the injected prompt text, never the human's own
+   message, so it can never match; a cron turn carries no matching sender/text
+   either. A delegated subagent is refused outright via
+   ``agent.delegation_context.is_delegated_child_context()`` first, belt-and-braces
+   on top of the content mismatch it would fail on anyway.
 
-Registration (:func:`register`) fails CLOSED: a Hermes runtime whose
-``PluginContext`` cannot ``register_hook`` (or whose hook registration itself
-raises) gets NO native-gateway registration at all, not a silent, unenforced
-attestation surface -- there is no other choke point in this plugin able to see
-``task_verdict``/``needs_you_list`` args before they leave the process (see
-``mupot_operator.py``'s ``build_operator_handlers``: no handler there forwards a
-raw, model-supplied ``human_origin`` at all; those two tools are reached as bare
-mupot MCP tools, never through this plugin's own action allowlist).
+3. ``pre_tool_call`` (:func:`stamp_tool_call`) no longer claims anything. It only
+   READS whatever :func:`bind_turn_custody` already bound to THIS turn's
+   ``turn_id`` -- no FIFO, no "first to ask wins". A model-supplied
+   ``human_origin`` is ALWAYS stripped for any tool whose bare/suffix name looks
+   like ``task_verdict``/``needs_you_list`` (regardless of which MCP server it
+   claims to be, fail-closed even when the configured server name doesn't match --
+   see :func:`_looks_like_governed_suffix`), and only replaced with the bound
+   origin on an EXACT wire-name match for the configured mupot server.
+
+4. ``on_session_reset``/``on_session_end`` drop any pending/bound records for a
+   session the moment Hermes itself considers it over, instead of relying solely
+   on the 10-minute TTL.
+
+Only Telegram is supported for now; every other platform is a recorded, not
+silent, gap (one-time INFO log per platform name).
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 import time
 from collections import OrderedDict, deque
 from typing import Any, Mapping, Optional
@@ -67,87 +76,130 @@ from ..telegram_fence import is_forwarded_telegram_message
 
 logger = logging.getLogger(__name__)
 
-# Platforms the harness can currently attest a human origin for. Every other
-# platform is a documented gap, not a silent one (see _warn_unsupported_platform).
 SUPPORTED_PLATFORMS = frozenset({"telegram"})
 
 # The plugin's own mupot tools that accept an optional ``human_origin`` object.
-# Reached as bare mupot MCP tools (not wrapped by mupot_operator.py's action
-# allowlist -- every handler in build_operator_handlers hand-picks its own
-# payload fields; none forward human_origin), so pre_tool_call -- a GLOBAL
-# Hermes lifecycle hook firing for every tool dispatch, not only this plugin's
-# own registered tools -- is the only choke point that can see and stamp them.
+# Reached as bare mupot MCP tools (mupot_operator.py's build_operator_handlers has
+# no generic passthrough -- every handler hand-picks its own payload fields; none
+# forward human_origin), so pre_tool_call -- a GLOBAL Hermes lifecycle hook firing
+# for every tool dispatch, not only this plugin's own registered tools -- is the
+# only choke point that can see and stamp them.
 HUMAN_ORIGIN_TOOL_NAMES = frozenset({"task_verdict", "needs_you_list"})
 
-# The mupot MCP server name this Hermes profile configures (mcp_servers.<name>).
-# Hermes registers every MCP tool as mcp__<server>__<tool> (tools/mcp_tool_schema.py's
-# mcp_prefixed_tool_name) -- the REGISTRY name, not an alias; a live kayhermes gateway
-# emits mcp__mupot__task_verdict, never the bare name. mupot_gateway/adapter.py's
-# adapter_factory calls set_mcp_server_name() with the SAME value MupotAdapter itself
-# resolves (extra.get("mcp_server") or "mupot"), so this only ever matches the
-# configured mupot server's own tools -- never a same-named tool on a different MCP
-# server, which is exactly why this is a name comparison and not a bare-suffix scan.
+# The mupot MCP server name this Hermes profile configures. UNSET (None) until
+# mupot_gateway/adapter.py's adapter_factory calls set_mcp_server_name() with the
+# SAME value MupotAdapter itself resolves (extra.get("mcp_server") or "mupot") --
+# kasra-review round-2 P1-2: resolving lazily (rather than defaulting to "mupot"
+# up front) means a governed call that somehow arrives before the platform adapter
+# connects can only ever be STRIPPED (via _looks_like_governed_suffix, independent
+# of server name), never wrongly STAMPED under a guessed name.
 DEFAULT_MCP_SERVER_NAME = "mupot"
-_mcp_server_name = DEFAULT_MCP_SERVER_NAME
+_mcp_server_name: Optional[str] = None
 
-# Bounded so a gateway that runs for weeks cannot grow this stash without limit.
-# Two independent bounds:
-#  - per-session pending queue (guards a burst of rapid messages before any turn
-#    claims one -- see docstring's turn-binding note; FIFO, oldest claimed first);
-#  - total claimed-record count across every (session_key, turn_id) pair.
-# TTL is a BACKSTOP only (kasra-review's own framing): the primary defense is the
-# turn_id binding, not the clock -- a stale, unclaimed pending capture or an
-# abandoned claim eventually falls out on its own even if nothing ever reads it.
+# kasra-review round-2 P1-1: Hermes SANITIZES the server component of the wire name
+# (tools/mcp_tool_schema.py's sanitize_mcp_name_component, re.sub(r"[^A-Za-z0-9_]",
+# "_", ...)) -- imported lazily so a configured name like "mupot-prod" is compared
+# through the IDENTICAL transform Hermes itself applies, not a hand-rolled guess.
+# The regex fallback (used only when tools.mcp_tool_schema isn't importable, i.e.
+# the plain non-native test suite) is copied verbatim from that function so the two
+# can never silently drift on the character class.
+_SANITIZE_FALLBACK_RE = re.compile(r"[^A-Za-z0-9_]")
+
+
+def _sanitize_mcp_name_component(value: str) -> str:
+    try:
+        from tools.mcp_tool_schema import sanitize_mcp_name_component
+        return sanitize_mcp_name_component(value)
+    except Exception:
+        return _SANITIZE_FALLBACK_RE.sub("_", str(value or ""))
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+# Bounded: a gateway running for weeks cannot grow these without limit.
+#  - per-session pending queue: guards a burst of rapid messages before any turn
+#    binds one (most never will -- most human turns are chatter with no governed
+#    call at all, which is exactly what round 2's FIFO got wrong).
+#  - total pending count across every session.
+#  - total bound-record count across every (session_key, turn_id) pair.
+# TTL is a 10-minute freshness window (kasra-review + Athena, round 3): short
+# enough that a captured-but-never-bound record (ordinary chatter) cannot become a
+# stale credit some later, unrelated turn spends, and short enough to match the
+# kind of window mupot's own server-side freshness check is expected to enforce --
+# but it is a BACKSTOP, not the defense: the defense is the content+sender bind.
 _MAX_PENDING_PER_SESSION = 8
 _MAX_PENDING_TOTAL = 512
-_MAX_CLAIMS = 512
-_STASH_TTL_SECONDS = 1800.0
+_MAX_BOUND = 512
+_CAPTURE_TTL_SECONDS = 600.0
 
 _WARNED_UNSUPPORTED_PLATFORMS: set[str] = set()
 
+# session_id -> session_key, populated opportunistically the first time
+# bind_turn_custody sees a session_id for a session_key (pre_llm_call is the only
+# hook this module registers that receives BOTH). on_session_reset/on_session_end
+# only ever receive session_id, never session_key, so this is what lets those two
+# hooks find the right stash entries to drop. A session that captured a record but
+# never ran any turn at all is not in this map -- the 10-minute TTL alone bounds
+# that (extremely unlikely: capturing IS part of processing an inbound message,
+# which necessarily starts a turn).
+_MAX_SESSION_ID_MAP = 512
+_SESSION_ID_TO_KEY: "OrderedDict[str, str]" = OrderedDict()
+
+
+def _remember_session_id(session_id: str, session_key: str) -> None:
+    if not session_id or not session_key:
+        return
+    _SESSION_ID_TO_KEY[session_id] = session_key
+    _SESSION_ID_TO_KEY.move_to_end(session_id)
+    while len(_SESSION_ID_TO_KEY) > _MAX_SESSION_ID_MAP:
+        _SESSION_ID_TO_KEY.popitem(last=False)
+
 
 class _OriginStash:
-    """Turn-bound human-origin stash.
+    """Turn-bound human-origin stash: PENDING captures, BOUND (custody-verified) records.
 
-    ``capture()`` appends an UNCLAIMED record to the calling session's FIFO
-    (one inbound human DM message = one record; multiple rapid messages queue,
-    oldest first -- so a same-user double-message never misattributes the
-    SECOND message's id to the FIRST message's turn, kasra-review's P0-3b).
+    ``capture()`` appends an unclaimed, unbound record to the calling session's FIFO
+    (multiple pending captures can coexist -- most never get bound at all, since
+    most human turns are chatter with no governed call).
 
-    ``claim(session_key, turn_id)`` is the ONLY read path. The first call for a
-    given ``(session_key, turn_id)`` pops the oldest unclaimed record for that
-    session and binds it to ``turn_id`` for the rest of that turn's lifetime;
-    every subsequent call with the SAME ``turn_id`` returns the same bound
-    record (so a turn that calls task_verdict more than once still gets
-    stamped every time); a DIFFERENT ``turn_id`` on the same session -- an
-    internal/injected turn, a cron turn, a delegated subagent -- sees only
-    whatever is LEFT in the pending queue (nothing, once the legitimate turn
-    has claimed its own), never a record another turn already claimed.
+    ``bind(session_key, turn_id, sender_id, text_sha256)`` is the ONLY write path
+    from a turn's own custody proof: it scans the session's pending records
+    oldest-first for the FIRST one whose ``user_id``/``text_sha256`` match exactly,
+    removes it from the pending queue, and binds it to ``(session_key, turn_id)``.
+    Two captures with identical text (e.g. the human sends "approve X" twice) bind
+    to two DIFFERENT turns' custody tokens in FIFO order -- one credit per message,
+    never two turns sharing one.
+
+    ``read(session_key, turn_id)`` is the ONLY read path (``pre_tool_call``): it
+    returns whatever is bound to that exact turn, or ``None`` -- never touches the
+    pending queue, never falls back to "whatever is left".
     """
 
     def __init__(
         self,
         max_pending_per_session: int = _MAX_PENDING_PER_SESSION,
         max_pending_total: int = _MAX_PENDING_TOTAL,
-        max_claims: int = _MAX_CLAIMS,
-        ttl_seconds: float = _STASH_TTL_SECONDS,
+        max_bound: int = _MAX_BOUND,
+        ttl_seconds: float = _CAPTURE_TTL_SECONDS,
     ) -> None:
         self._max_pending_per_session = max_pending_per_session
         self._max_pending_total = max_pending_total
-        self._max_claims = max_claims
+        self._max_bound = max_bound
         self._ttl_seconds = ttl_seconds
         self._pending: "OrderedDict[str, deque[tuple[float, dict[str, Any]]]]" = OrderedDict()
         self._pending_count = 0
-        self._claims: "OrderedDict[tuple[str, str], tuple[float, dict[str, Any]]]" = OrderedDict()
+        self._bound: "OrderedDict[tuple[str, str], tuple[float, dict[str, Any]]]" = OrderedDict()
 
     def _expired(self, stamped_at: float) -> bool:
         return (time.monotonic() - stamped_at) > self._ttl_seconds
 
-    def capture(self, session_key: str, origin: Mapping[str, Any]) -> None:
+    def capture(self, session_key: str, record: Mapping[str, Any]) -> None:
         if not session_key:
             return
         dq = self._pending.setdefault(session_key, deque())
-        dq.append((time.monotonic(), dict(origin)))
+        dq.append((time.monotonic(), dict(record)))
         self._pending_count += 1
         while len(dq) > self._max_pending_per_session:
             dq.popleft()
@@ -164,40 +216,71 @@ class _OriginStash:
             if not oldest_dq:
                 self._pending.pop(oldest_session, None)
 
-    def claim(self, session_key: str, turn_id: str) -> Optional[dict[str, Any]]:
+    def bind(self, session_key: str, turn_id: str, *, sender_id: str, text_sha256: str) -> bool:
+        if not session_key or not turn_id:
+            return False
+        key = (session_key, turn_id)
+        if key in self._bound:
+            return True  # idempotent: pre_llm_call firing twice for one turn is a no-op
+        dq = self._pending.get(session_key)
+        if not dq:
+            return False
+        found: Optional[tuple[float, dict[str, Any]]] = None
+        kept: "deque[tuple[float, dict[str, Any]]]" = deque()
+        kept_count = 0
+        while dq:
+            stamped_at, record = dq.popleft()
+            self._pending_count -= 1
+            if self._expired(stamped_at):
+                continue  # drop silently: the TTL backstop, applied on every bind attempt too
+            if found is None and record.get("user_id") == sender_id and record.get("text_sha256") == text_sha256:
+                found = (stamped_at, record)
+                continue  # consumed: the OLDEST match only, never re-queued
+            kept.append((stamped_at, record))
+            kept_count += 1
+        if kept:
+            self._pending[session_key] = kept
+            self._pending_count += kept_count
+        else:
+            self._pending.pop(session_key, None)
+        if found is None:
+            return False
+        self._bound[key] = found
+        self._bound.move_to_end(key)
+        while len(self._bound) > self._max_bound:
+            self._bound.popitem(last=False)
+        return True
+
+    def read(self, session_key: str, turn_id: str) -> Optional[dict[str, Any]]:
         if not session_key or not turn_id:
             return None
         key = (session_key, turn_id)
-        existing = self._claims.get(key)
-        if existing is not None:
-            stamped_at, origin = existing
-            if self._expired(stamped_at):
-                del self._claims[key]
-            else:
-                self._claims.move_to_end(key)
-                return dict(origin)
-        dq = self._pending.get(session_key)
-        while dq:
-            stamped_at, origin = dq.popleft()
-            self._pending_count -= 1
-            if not dq:
-                self._pending.pop(session_key, None)
-            if self._expired(stamped_at):
-                continue
-            self._claims[key] = (stamped_at, dict(origin))
-            self._claims.move_to_end(key)
-            while len(self._claims) > self._max_claims:
-                self._claims.popitem(last=False)
-            return dict(origin)
-        return None
+        entry = self._bound.get(key)
+        if entry is None:
+            return None
+        stamped_at, record = entry
+        if self._expired(stamped_at):
+            del self._bound[key]
+            return None
+        self._bound.move_to_end(key)
+        return dict(record)
+
+    def drop_session(self, session_key: str) -> None:
+        if not session_key:
+            return
+        dq = self._pending.pop(session_key, None)
+        if dq:
+            self._pending_count -= len(dq)
+        for key in [k for k in self._bound if k[0] == session_key]:
+            del self._bound[key]
 
     def __len__(self) -> int:
-        return self._pending_count + len(self._claims)
+        return self._pending_count + len(self._bound)
 
     def clear(self) -> None:
         self._pending.clear()
         self._pending_count = 0
-        self._claims.clear()
+        self._bound.clear()
 
 
 # Process-global: one gateway process serves every concurrent session, exactly
@@ -207,27 +290,51 @@ _STASH = _OriginStash()
 
 def set_mcp_server_name(name: Optional[str]) -> None:
     """Called from mupot_gateway/adapter.py's adapter_factory with the SAME value
-    MupotAdapter itself resolves (extra.get("mcp_server") or "mupot"), so tool-name
-    matching below always tracks whatever this Hermes profile actually configured,
-    never a hardcoded guess independent of the live adapter."""
+    MupotAdapter itself resolves. A falsy *name* explicitly UNSETS resolution
+    (prefix matching refused entirely until set again) rather than falling back to
+    a guessed default -- see the module-level ``_mcp_server_name`` docstring note."""
     global _mcp_server_name
-    _mcp_server_name = name or DEFAULT_MCP_SERVER_NAME
+    if not name:
+        _mcp_server_name = None
+        return
+    _mcp_server_name = _sanitize_mcp_name_component(name)
 
 
-def _resolve_governed_tool_name(tool_name: Any) -> Optional[str]:
-    """Return the canonical bare name ("task_verdict"/"needs_you_list") when
-    *tool_name* is exactly that bare name OR exactly
-    ``mcp__<configured mupot server>__<bare name>`` (the wire name a live gateway
-    with mupot registered as an MCP server actually emits); else ``None``.
-
-    Exact match only: no case-folding, no trimming, no alternate separators. A
-    model, or a malicious same-named tool on a DIFFERENT MCP server, presenting
-    a look-alike name must never be treated as governed.
+def _looks_like_governed_suffix(tool_name: Any) -> Optional[str]:
+    """Broad, server-name-independent check used ONLY to decide whether a
+    model-supplied ``human_origin`` must be stripped (fail closed) -- never to
+    decide whether to stamp. Matches the bare name, or ANY ``mcp__<anything>__``
+    prefix ending in the bare name, regardless of the configured mupot server.
+    kasra-review round-2 P1-1: without this, a misconfigured/unresolved server
+    name made ``_resolve_governed_tool_name`` return ``None`` and
+    ``stamp_tool_call`` returned before ever reaching the strip -- a forged
+    ``human_origin`` passed through untouched. This check can never be fooled the
+    same way because it does not compare a server name at all.
     """
     if not isinstance(tool_name, str):
         return None
     if tool_name in HUMAN_ORIGIN_TOOL_NAMES:
         return tool_name
+    if tool_name.startswith("mcp__"):
+        for name in HUMAN_ORIGIN_TOOL_NAMES:
+            if tool_name.endswith(f"__{name}"):
+                return name
+    return None
+
+
+def _resolve_governed_tool_name(tool_name: Any) -> Optional[str]:
+    """Return the canonical bare name when *tool_name* is exactly the bare name OR
+    exactly ``mcp__<configured mupot server>__<bare name>`` (the wire name a live
+    gateway with mupot registered as an MCP server actually emits, sanitized the
+    same way Hermes sanitizes it); else ``None``. Exact match only, and refuses
+    ALL prefix matching until :func:`set_mcp_server_name` has been called with a
+    real value (kasra-review round-2 P1-2)."""
+    if not isinstance(tool_name, str):
+        return None
+    if tool_name in HUMAN_ORIGIN_TOOL_NAMES:
+        return tool_name
+    if not _mcp_server_name:
+        return None
     prefix = f"mcp__{_mcp_server_name}__"
     if tool_name.startswith(prefix):
         suffix = tool_name[len(prefix):]
@@ -256,6 +363,11 @@ def _isoformat(value: Any) -> Optional[str]:
     return str(value)
 
 
+def chat_type_value(source: Any) -> Optional[str]:
+    value = getattr(source, "chat_type", None)
+    return value if isinstance(value, str) else (str(value) if value is not None else None)
+
+
 def _warn_unsupported_platform_once(platform: str) -> None:
     if platform in _WARNED_UNSUPPORTED_PLATFORMS:
         return
@@ -268,29 +380,18 @@ def _warn_unsupported_platform_once(platform: str) -> None:
 
 
 def _passes_trust_fence(event: Any, source: Any) -> bool:
-    """The SAME private/self-chat/unforwarded invariant telegram_control.py's
-    ``_sanitized_envelope`` enforces (lines ~140-156 there), expressed against
-    Hermes's own normalized ``SessionSource`` fields instead of the raw PTB
-    ``Update`` (a different shape at this layer -- ``pre_gateway_dispatch``
-    never sees the raw ``Update``, only ``MessageEvent``/``SessionSource``; the
-    one piece that IS the same raw shape, the forwarding-marker check, is
-    literally shared via ``telegram_fence.is_forwarded_telegram_message``).
-
-    This gate runs BEFORE Hermes's own ``_is_user_authorized_for_source``
-    (``pre_gateway_dispatch`` fires at ``gateway/run_inbound.py`` line ~180,
-    auth at ~185) -- so it is this module's OWN authorization check, not a
-    redundant belt-and-suspenders on top of Hermes's: an unauthorized or
-    unknown sender, or a second participant in a group/thread that shares a
-    session key with someone else (Hermes's own
-    ``thread_sessions_per_user=False`` default drops the participant from the
-    key for ANY threaded group message -- ``gateway/session.py``'s
-    ``build_session_key``), must never be able to write a stash record at all.
-
-    Telegram's own DM invariant is ``chat_id == user_id`` for a private
-    one-on-one chat with the bot; requiring BOTH ``chat_type == "dm"`` and that
-    equality closes the group/thread session-key-collision class outright, at
-    the source, independent of the turn-binding claim() logic in
-    :class:`_OriginStash`.
+    """The same private/self-chat/unforwarded invariant telegram_control.py's
+    ``_sanitized_envelope`` enforces, expressed against Hermes's own normalized
+    ``SessionSource`` fields. Runs BEFORE Hermes's own
+    ``_is_user_authorized_for_source`` (``gateway/run_inbound.py`` line ~180 vs
+    ~185) -- an unauthorized or unknown sender must never be able to write a
+    record at all. Telegram's own DM invariant is ``chat_id == user_id``; a
+    Telegram callback-query/inline-query source carries the RAW ``"private"``
+    literal rather than Hermes's normalized ``"dm"`` (the main inbound
+    ``build_event`` path normalizes ``private`` -> ``dm``; callback/inline paths
+    build their own ad hoc source dicts and do not) -- this fence's literal
+    ``"dm"`` comparison therefore also fails closed on those paths today (a real,
+    documented coverage gap for inline-button approvals, not a security hole).
     """
     chat_type = getattr(source, "chat_type", None)
     if chat_type != "dm":
@@ -326,11 +427,11 @@ def capture_human_origin(
     *, event: Any, gateway: Any = None, session_store: Any = None, **_kwargs: Any
 ) -> None:
     """``pre_gateway_dispatch`` hook. Pure observer: always returns ``None`` (never
-    skips or rewrites the inbound event) and never raises -- a capture failure must
-    never be able to drop or corrupt the human's message. Produces at most one
-    PENDING (unclaimed) stash record per genuinely private, unforwarded, self-chat
-    Telegram message; :func:`stamp_tool_call` is the only place that record is ever
-    bound to a turn.
+    skips or rewrites the inbound event) and never raises. Produces at most one
+    PENDING (unbound) stash record per genuinely private, unforwarded, self-chat
+    Telegram message; :func:`bind_turn_custody` is the only place that record is
+    ever bound to a turn, and :func:`stamp_tool_call` the only place a bound record
+    is ever read.
     """
     try:
         source = getattr(event, "source", None)
@@ -352,27 +453,24 @@ def capture_human_origin(
         # event.message_id, NOT source.message_id: SessionSource.message_id is the
         # "triggering message (pin/reply/react)" reference, not this message's own id.
         message_id = getattr(event, "message_id", None)
-        origin = {
+        text = getattr(event, "text", None)
+        record = {
             "platform": platform,
             "user_id": str(user_id) if user_id is not None else None,
             "chat_id": str(chat_id) if chat_id is not None else None,
             "message_id": str(message_id) if message_id is not None else None,
             "timestamp": _isoformat(getattr(event, "timestamp", None)),
-            # Recorded (not just enforced) so mupot can independently re-check the
-            # same invariant this fence already applied at capture time.
             "chat_type": chat_type_value(source),
             "thread_id": str(thread_id) if thread_id is not None else None,
             "forwarded": False,  # _passes_trust_fence already refused any forwarded message
+            # Internal-only correlation key for bind(); stripped before ever being
+            # returned as a stamped human_origin (see stamp_tool_call).
+            "text_sha256": _hash_text(text if isinstance(text, str) else ""),
         }
-        _STASH.capture(session_key, origin)
+        _STASH.capture(session_key, record)
     except Exception:
         logger.warning("mupot plugin: human-origin capture failed", exc_info=True)
     return None
-
-
-def chat_type_value(source: Any) -> Optional[str]:
-    value = getattr(source, "chat_type", None)
-    return value if isinstance(value, str) else (str(value) if value is not None else None)
 
 
 def _current_session_key() -> Optional[str]:
@@ -388,18 +486,16 @@ def _current_session_key() -> Optional[str]:
 
 
 def _in_delegated_child_context() -> bool:
-    """True while this tool call is executing inside a delegated subagent
-    (``tools/delegate_tool_child_run.py``'s ``_run_with_thread_capture``, which
-    wraps the ENTIRE child conversation -- every tool call it makes -- in
-    ``agent.delegation_context.delegated_child_context()``). Checked directly so
-    a delegated child can never claim (or read) a human-origin record even in the
-    narrow race where it happens to present a turn_id before the parent turn's
-    own task_verdict/needs_you_list call does. Fails closed: an ImportError (the
-    plain, non-native test suite; a very old Hermes) is treated as "cannot prove
-    this is NOT a delegated child" the same way :func:`_passes_trust_fence`
-    treats a missing raw_message -- but only for THIS narrow signal, so it never
-    masks the primary turn_id-binding defense when the module is simply
-    unavailable.
+    """True while this turn/tool call is executing inside a delegated subagent
+    (both ``tools/delegate_tool.py`` and ``tools/delegate_tool_child_run.py``
+    spawn points wrap the ENTIRE child conversation -- every ``pre_llm_call`` and
+    every tool call it makes -- in ``agent.delegation_context.delegated_child_context()``).
+    Checked directly in :func:`bind_turn_custody` so a delegated child can never
+    bind a human-origin record even in the narrow race where it would otherwise
+    present matching content before the parent turn does. Fails closed to "not a
+    child" on ImportError (the plain, non-native test suite) the same way
+    :func:`_passes_trust_fence` treats a missing raw_message -- content+sender
+    matching is still the primary defense either way.
     """
     try:
         from agent.delegation_context import is_delegated_child_context
@@ -411,49 +507,80 @@ def _in_delegated_child_context() -> bool:
         return False
 
 
+def bind_turn_custody(
+    *, session_id: str = "", task_id: str = "", turn_id: str = "", user_message: Any = None,
+    conversation_history: Any = None, is_first_turn: Any = None, model: str = "",
+    platform: str = "", parent_session_id: str = "", sender_id: str = "", **_kwargs: Any,
+) -> None:
+    """``pre_llm_call`` hook -- the positive per-turn custody token.
+
+    Binds a pending capture to THIS ``turn_id`` iff the turn's own fully-prepared
+    inbound message (``user_message``) hashes to exactly the text a pending record
+    was captured from, AND the turn's ``sender_id`` matches that record's
+    ``user_id``. An internal/plugin-injected turn's ``user_message`` is the
+    injected prompt text, never the human's own message, so it can never match; a
+    cron/routine turn has no matching Telegram sender/text either; a delegated
+    subagent is refused outright.
+
+    Never raises: a bind failure just means nothing is stamped for this turn --
+    fail open on the FEATURE (the turn proceeds normally), fail closed on the
+    ATTESTATION (no human_origin is ever fabricated).
+    """
+    try:
+        if platform != "telegram" or not turn_id:
+            return None
+        if _in_delegated_child_context():
+            return None
+        if not isinstance(user_message, str):
+            return None
+        session_key = _current_session_key()
+        if not session_key:
+            return None
+        if session_id:
+            _remember_session_id(str(session_id), session_key)
+        _STASH.bind(
+            session_key, turn_id,
+            sender_id=str(sender_id or ""), text_sha256=_hash_text(user_message),
+        )
+    except Exception:
+        logger.warning("mupot plugin: human-origin turn-binding failed", exc_info=True)
+    return None
+
+
 def stamp_tool_call(
     *, tool_name: str = "", args: Any = None, turn_id: str = "", **_kwargs: Any
 ) -> Optional[dict[str, Any]]:
-    """``pre_tool_call`` hook.
+    """``pre_tool_call`` hook. Reads only; never claims, never falls back to "the
+    oldest pending record" -- that FIFO-claim mechanism is gone (round 3).
 
-    A model-supplied ``human_origin`` is ALWAYS treated as a forgery attempt: this
-    field is harness-stamped only, so any value already present in ``args`` is
-    logged at WARNING regardless of whether it happens to match the real origin.
-
-    Returns a ``{"action": "modify", "args": {"human_origin": ...}}`` directive
-    only when THIS EXACT turn (``turn_id``, received directly in ``pre_tool_call``'s
-    own kwargs -- never the tool call's own ``session_id`` kwarg, which is
-    ``agent.session_id``, a DB row id that can rotate on compression and is shared
-    across a session's turns rather than unique per turn) successfully claims a
-    pending origin for its session (see :class:`_OriginStash`). No ``turn_id``, no
-    session_key, a delegated-subagent context, or nothing left in the pending
-    queue for this session all resolve to "nothing to stamp" identically.
-
-    When nothing is claimable, the ``modify`` contract cannot express "delete this
-    key" (it only shallow-merges keys onto the original args), so a forged value is
-    instead removed by mutating *args* in place -- the exact same dict object
-    ``model_tools.py``'s ``_pre_dispatch_guards`` and ``agent/tool_executor.py``'s
-    ``_pre_tool_block`` both fall back to using when no hook returns a ``modify``
-    directive, so the removal is visible either way. Never raises: a hook failure
-    must fail open (tool proceeds unstamped) rather than block a real human
-    decision.
+    A model-supplied ``human_origin`` is ALWAYS stripped for any tool whose
+    bare/suffix name looks like ``task_verdict``/``needs_you_list``
+    (:func:`_looks_like_governed_suffix`, independent of server-name match --
+    fail closed even when :func:`set_mcp_server_name` hasn't run yet or the
+    configured name doesn't match); it is only REPLACED with a bound origin when
+    the tool name is an EXACT match for the configured mupot server
+    (:func:`_resolve_governed_tool_name`) AND :func:`bind_turn_custody` already
+    bound a record to THIS turn_id. Never raises.
     """
     try:
-        governed = _resolve_governed_tool_name(tool_name)
-        if governed is None or not isinstance(args, dict):
+        if not isinstance(args, dict):
+            return None
+        if _looks_like_governed_suffix(tool_name) is None:
             return None
         model_supplied = "human_origin" in args
         origin: Optional[dict[str, Any]] = None
-        if turn_id and not _in_delegated_child_context():
+        if _resolve_governed_tool_name(tool_name) is not None and turn_id:
             session_key = _current_session_key()
             if session_key:
-                origin = _STASH.claim(session_key, turn_id)
+                bound = _STASH.read(session_key, turn_id)
+                if bound is not None:
+                    origin = {k: v for k, v in bound.items() if k != "text_sha256"}
         if model_supplied:
             logger.warning(
                 "mupot plugin: model supplied human_origin directly for tool '%s' -- "
                 "this field is harness-stamped only; treating as a forgery attempt and %s",
                 tool_name,
-                "overwriting it with the claimed origin" if origin is not None else "stripping it",
+                "overwriting it with the bound origin" if origin is not None else "stripping it",
             )
         if origin is not None:
             return {"action": "modify", "args": {"human_origin": origin}}
@@ -465,19 +592,26 @@ def stamp_tool_call(
         return None
 
 
+def _on_session_boundary(*, session_id: str = "", **_kwargs: Any) -> None:
+    """``on_session_reset``/``on_session_end`` hook: drop any pending/bound
+    records for the session Hermes itself just ended, instead of relying solely on
+    the TTL. Both hooks give only ``session_id`` (never ``session_key``), so this
+    consults the map :func:`bind_turn_custody` opportunistically populates."""
+    try:
+        session_key = _SESSION_ID_TO_KEY.pop(str(session_id), None) if session_id else None
+        if session_key:
+            _STASH.drop_session(session_key)
+    except Exception:
+        logger.debug("mupot plugin: on_session_boundary cleanup failed", exc_info=True)
+    return None
+
+
 def register(ctx: Any) -> None:
-    """Wire both hooks. Called from the native gateway's own ``register()``
-    (``mupot_gateway/adapter.py``), FIRST, before anything else is registered --
-    these hooks are meaningless without a live platform adapter feeding
-    ``pre_gateway_dispatch`` real ``MessageEvent``s, but more importantly: this is
-    the ONLY choke point this plugin has for keeping a model-supplied
-    ``human_origin`` from reaching mupot verbatim on ``task_verdict``/
-    ``needs_you_list``. A Hermes runtime that cannot ``register_hook`` (or whose
-    hook registration itself fails) gets NO native-gateway registration at all --
-    refusing loudly beats leaving an unenforced identity-attestation surface
-    running silently (kasra-review P1-1: the previous ``getattr(ctx,
-    "register_tool", None)``-style optional-degrade pattern protects a
-    convenience tool; it is not a precedent for an identity attestation).
+    """Wire all four hooks. Called from the native gateway's own ``register()``
+    (``mupot_gateway/adapter.py``), FIRST, before anything else is registered.
+    A Hermes runtime that cannot ``register_hook`` (or whose hook registration
+    itself fails) gets NO native-gateway registration at all -- refusing loudly
+    beats leaving an unenforced identity-attestation surface running silently.
     """
     register_hook = getattr(ctx, "register_hook", None)
     if not callable(register_hook):
@@ -493,7 +627,10 @@ def register(ctx: Any) -> None:
         )
     try:
         register_hook("pre_gateway_dispatch", capture_human_origin)
+        register_hook("pre_llm_call", bind_turn_custody)
         register_hook("pre_tool_call", stamp_tool_call)
+        register_hook("on_session_reset", _on_session_boundary)
+        register_hook("on_session_end", _on_session_boundary)
     except Exception:
         logger.error("mupot plugin: human-origin hook registration failed", exc_info=True)
         raise

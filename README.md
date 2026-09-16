@@ -185,17 +185,29 @@ this plugin able to keep a model-supplied `human_origin` from reaching mupot ver
   trust fence, not a convenience filter: a message is captured only when it is a private,
   non-forwarded, self chat (`chat_type == "dm"` and `user_id == chat_id` — Telegram's own DM
   invariant, mirroring `telegram_control.py`'s own private/unforwarded gate). A captured
-  record is *pending*, not yet bound to any turn.
-- `pre_tool_call` fires once per tool dispatch. It matches `task_verdict`/`needs_you_list`
-  both by bare name and by the exact `mcp__<configured mupot server>__<tool>` wire name a live
-  gateway with mupot registered as an MCP server actually emits (never the bare name, once
-  mupot is an MCP server). The *first* such call from a turn claims the oldest pending capture
-  for its session and binds it to that turn's own `turn_id`; only that same turn can read it
-  again. A different turn on the same session — a plugin-injected/notification turn, a cron
-  turn, or a delegated subagent (checked directly against Hermes's own delegated-child-context
-  marker, on top of the turn_id mismatch) — gets nothing, even though it shares the session.
-  A model-supplied `human_origin` is always treated as a forgery attempt (logged at WARNING)
-  and either overwritten with the claimed origin or, when nothing is claimable, stripped.
+  record — including a SHA-256 of the message's own text — is *pending* for up to 10 minutes,
+  not yet bound to any turn.
+- `pre_llm_call` fires once per turn, before the tool loop, and is the positive per-turn
+  custody token: it binds a pending capture to the CURRENT `turn_id` iff the turn's own
+  fully-prepared inbound text hashes to exactly the captured message's text AND the turn's
+  sender matches. An internal/plugin-injected turn's text is the injected notification prompt,
+  never the human's own message, so it can never bind; a cron turn and a delegated subagent
+  (checked directly against Hermes's delegated-child-context marker) can't either. Two earlier
+  designs (a session-keyed slot, then a per-session queue) were both still "whichever turn asks
+  first on this session wins" — this one requires the asking turn to *prove* it is processing
+  the exact message the record came from.
+- `pre_tool_call` fires once per tool dispatch and only ever *reads* what `pre_llm_call` already
+  bound to that exact turn — it never claims anything itself. It matches
+  `task_verdict`/`needs_you_list` both by bare name and by the exact
+  `mcp__<configured mupot server>__<tool>` wire name a live gateway with mupot registered as an
+  MCP server actually emits (sanitized the same way Hermes sanitizes a configured server name
+  with punctuation in it). A model-supplied `human_origin` is always treated as a forgery
+  attempt (logged at WARNING) and stripped for ANY tool whose name looks like a governed one —
+  regardless of server-name match, so a misconfigured/unresolved server name can only ever cause
+  a missed stamp, never a passthrough — and only replaced with the bound origin on an exact
+  match with a turn that actually bound one.
+- `on_session_reset`/`on_session_end` drop any pending or bound record for a session the moment
+  Hermes itself ends it, rather than relying solely on the 10-minute window.
 
 Only Telegram is supported today. Every other platform is a recorded, not silent, gap: the
 first inbound message on an unsupported platform logs one INFO line naming it, and every

@@ -149,6 +149,173 @@ for setup, verification, retry, revocation, and rollback steps. A live pilot rem
 on independent review, exact deployment proof, migration readback, and protected webhook
 configuration.
 
+**This deterministic command relay is a fallback, not the primary path.** It exists for
+participants who are not bound to an owned Hermes agent seat. For an owned member, plain
+natural language through their own agent is the primary, always-live decision channel — see
+"Human-origin attestation" below. The relay also has a known gap: Hermes's own Telegram
+polling-connection rebuild (a transient reconnect after a network hiccup) re-registers only
+Hermes's core message/command handlers, never a plugin's own `CommandHandler`s
+(`plugins/platforms/telegram/adapter.py`'s `_register_handlers`, called from
+`_initialize_app_with_retries` on every rebuilt polling `Application`) — so after such a
+rebuild, `/start` `/needs` `/answer` `/approve` `/reject` can silently stop responding until
+the whole gateway process restarts, with nothing in this plugin able to detect or repair it
+(there is no hook back into that rebuild path). `register_telegram_control` logs a WARNING
+naming this limitation whenever `telegram_control_enabled: true` is configured.
+
+## Human-origin attestation for `task_verdict`
+
+The primary decision channel for an owned member is not a deterministic command at all: they
+talk to their own agent in plain natural language, and the **harness** — never the LLM —
+stamps the triggering message's origin onto the agent's `task_verdict` calls. Mupot resolves
+that `human_origin` object to the member and runs the call under the human's own identity
+instead of the agent seat; without it (a CLI turn, a cron turn, a subagent turn, or a turn on a
+platform this plugin doesn't yet support), the call runs under the agent seat exactly as
+before this feature existed. `task_verdict` is the only tool this ever stamps: mupot's server
+side resolves `human_origin` per-tool, wired individually, not via shared middleware applied
+across every tool — there is currently no other tool it is safe to stamp.
+
+This is implemented as four decision-path Hermes lifecycle hooks (`pre_gateway_dispatch`,
+`pre_llm_call`, `pre_tool_call`, `post_tool_call`) plus two session-boundary hooks in
+`mupot_gateway/human_origin.py`, registered FIRST (before the platform adapter or any tool)
+from `mupot_gateway/adapter.py`'s `register()`, only when `native_gateway_enabled: true`.
+Registration fails **closed**: a Hermes runtime whose `PluginContext` cannot `register_hook`
+(or whose hook registration itself raises) gets no native-gateway registration at all — there
+is no other choke point in this plugin able to keep a model-supplied `human_origin` from
+reaching mupot verbatim. Round 7 (kasra-review round-6 item 5) extends the same fail-closed
+posture one step earlier: when the runtime's own `hermes_cli.plugins.VALID_HOOKS` is
+introspectable, `register()` also refuses outright if it is missing `pre_llm_call` or
+`post_tool_call` — an older runtime would otherwise accept `register_hook("post_tool_call",
+...)` as a silent, callable-shaped no-op that is simply never invoked, quietly reverting round
+6's reserve/resolve fix back to round 5's premature-consumption defect with no signal at all.
+(When `VALID_HOOKS` cannot be introspected at all — not a real runtime shape, only this
+module's own test doubles — this extra check is skipped; the `register_hook`-callable check
+above is still the primary gate.)
+
+- `pre_gateway_dispatch` fires once per inbound message, straight off the platform adapter,
+  before Hermes's own sender-authorization check runs. It is therefore this module's own
+  trust fence, not a convenience filter: a message is captured only when it is a private,
+  non-forwarded, self chat (`chat_type == "dm"` and `user_id == chat_id` — Telegram's own DM
+  invariant, mirroring `telegram_control.py`'s own private/unforwarded gate). A captured
+  record — including a SHA-256 of the message's own text — is *pending*, not yet bound to any
+  turn, for up to 2 minutes: a backstop for a session that never reaches `pre_llm_call` at all,
+  not the mechanism that bounds a live record's lifetime (that's the next hook).
+- `pre_llm_call` fires once per turn, before the tool loop. On EVERY call it drains **every**
+  pending record for that turn's session: the first one whose sender and exact SHA-256 text
+  hash match this turn's own is bound to the current `turn_id`; every other one — mismatched or
+  a later duplicate-content match — is burned right there (dropped, never re-queued) and logged
+  at WARNING with its message id and a reason. A turn that binds nothing still burns whatever
+  was pending: **a pending record cannot outlive the next `pre_llm_call` that QUALIFIES for its
+  session** (Telegram platform, a string inbound message, a resolvable session key, not a
+  delegated child — each of those is its own guard that returns *before* the drain). A turn that
+  doesn't qualify neither binds nor burns anything; the 2-minute TTL backstop still caps whatever
+  is left pending in that case. Earlier designs (a session-keyed slot, a per-session queue, then a
+  content-matched bind that re-queued failures) all left a window where a record that failed to
+  bind stayed spendable by whatever turn asked next — this closes that window at its root rather
+  than narrowing it again. An internal/plugin-injected turn is handed the human's own sender id
+  and platform (Hermes resolves both from the turn's session source, a copy of the human's stored
+  origin), so text is the only discriminator: today's in-plugin injectors all prepend a fixed,
+  non-removable preamble, so their prompt never equals the human's own message and they only ever
+  *burn* a pending record, never bind it — but an injector able to emit an unwrapped string equal
+  to the human's own recent words *would* bind it with the human's identity (see "Documented
+  residual" below; this is a property of the fixed preamble, not of the binding logic itself). A
+  delegated subagent is refused outright regardless of its text, checked directly against Hermes's
+  delegated-child-context marker.
+- `pre_tool_call` fires once per tool dispatch and only ever *reserves* what `pre_llm_call`
+  already bound to that exact turn — it never claims or burns anything itself, and it never
+  fully consumes on its own (round 6, kasra-review round-5 P1-1). Earlier (round 5) the read
+  here was one-shot: it consumed the bound record the moment `pre_tool_call` ran, which is
+  *before* Hermes's own block gate, a guardrail, or a denied human-approval escalation can
+  still kill the call (`hermes_cli/plugins.py` resolves a hook's `modify` directive before the
+  block/approve gate runs) — so a vetoed call spent the human's one credit on a dispatch that
+  never reached mupot at all, leaving a same-turn retry unattested. Round 6 splits this in two:
+  `pre_tool_call` marks the bound record *reserved* by that call's `tool_call_id` (available for
+  stamping, but not to any other concurrent call) without removing it, and only `post_tool_call`
+  (below) decides whether the reservation is actually spent. One human message still
+  authenticates AT MOST one `task_verdict` call *that actually dispatches* — a call that never
+  reaches mupot no longer burns the credit. Round 7 (kasra-review round-6 P1): reservation is
+  **not** trusted to `tool_call_id` identity across repeat calls — round 6 briefly treated a
+  repeat call carrying the identical `tool_call_id` as an idempotent retry and handed the same
+  record out again, but `tool_call_id` rides in on the model's own tool-call output; Hermes does
+  not mint or verify it. A model steered to emit two DISTINCT `task_verdict` calls in one turn
+  could simply copy the same id onto both and get the human's identity stamped twice. Now, once a
+  record is reserved by anyone — same id or not — every further reservation attempt for that turn
+  is stripped until `post_tool_call` (below) explicitly releases it. A model-supplied
+  `human_origin` is stripped on **every** tool that looks like it belongs to mupot at all (any
+  `mcp__<configured mupot server>__*` wire name once the server name is resolved — sanitized the
+  same way Hermes sanitizes one with punctuation in it — plus a small named fallback for a
+  handful of other decision-adjacent mupot tools while the server name is still unresolved, and
+  the server name itself is scoped per Hermes profile so two multiplexed profiles with different
+  `mcp_server` values can't clobber each other's resolution), and only ever *replaced* with the
+  bound origin for the one-tool stamp allowlist on an exact wire match with a turn that actually
+  bound something and a call carrying a `tool_call_id`.
+- `post_tool_call` (round 6) fires once per tool dispatch outcome and resolves whatever
+  reservation that call's `tool_call_id` holds: `status == "blocked"` (Hermes's own block gate,
+  a guardrail, or a denied/erroring human-approval escalation — anything that stopped the call
+  before it ever reached mupot) *releases* the reservation, so the model's retry in the same
+  turn — a new `tool_call_id` — can reserve and stamp it again; any other status (`ok`, `error`,
+  `cancelled`, …) is a genuine dispatch attempt and *permanently* consumes it — mupot has seen
+  the field (or would have) either way. A non-governed tool, or a turn/call that never reserved
+  anything, is a no-op. **Known limitation (kasra-review round-6 item 4):** Hermes's own
+  `invoke_hook` skips a callback invocation entirely while a PRIOR invocation of that SAME
+  callback is still running (its own timeout/re-entrancy protection) — a slow `finalize_tool_call`
+  for one `tool_call_id` can therefore cause a concurrent `post_tool_call` for a DIFFERENT
+  `tool_call_id` to never fire at all, leaving that reservation permanently outstanding on its
+  own. This module does not solve that (it cannot, from inside one of the callbacks Hermes might
+  skip) — instead, the NEXT `pre_llm_call` on that session (round 7) scans for any reservation
+  left over from an earlier turn, drops it, and logs it at WARNING with reason
+  `stale_reservation`, exactly like any other burn — so the skipped-callback case leaves an
+  operator-visible signal instead of a silently immortal reservation.
+- `on_session_reset`/`on_session_end` drop any pending or bound record for a session the moment
+  Hermes itself ends it, rather than relying solely on the TTL backstop.
+
+The stamped `human_origin` object also carries a `text` field (round 6, sized in round 7): the
+human's own message, truncated to 4096 characters — Telegram's own maximum message length, so a
+legitimate full-length message is never truncated — independently of what gets hashed for the
+bind-time equality check (the full text is always hashed). Mupot's server side requires the task
+id to appear in it, binding the stamp to the intent the human actually expressed, not just his
+identity.
+
+`_OriginStash`'s internal lock (round 7, kasra-review round-6 P2) is an `RLock`, held for the
+full body of every mutating method — `capture`, `bind`, `peek_and_reserve`, `resolve`,
+`drop_session`, `clear` — not only `peek_and_reserve`/`resolve` as in round 6, so concurrent tool
+dispatch cannot double-spend a reservation AND concurrent captures/binds cannot race the
+underlying pending/bound dicts either.
+
+Only Telegram is supported today. Every other platform is a recorded, not silent, gap: the
+first inbound message on an unsupported platform logs one INFO line naming it, and every
+`task_verdict` call from that turn simply runs under the agent seat.
+
+**Documented residual.** This remains a content-and-sender equality proof over a short window,
+not a cryptographic custody token: an injected/internal turn on the human's own session runs
+under the human's own sender id and platform (Hermes resolves both from the turn's session
+source, which for an injected turn is a copy of the human's own stored origin), so the only
+remaining barrier is that no in-plugin injector today emits a bare, attacker-chosen string
+equal to the human's own text — every injector prepends a fixed, non-removable template. A
+future injector or third-party `pre_gateway_dispatch` plugin able to emit an unwrapped string
+would need to present it as the next qualifying `pre_llm_call` on that session, before the
+human's own turn (if any) burns the record first. Separately: `bind()` always takes the OLDEST
+matching pending record, so two identical human messages inside one window still produce a
+stamp naming the older of the two message ids — content-correct, id-drifted; round 4 only stops
+the newer one from lingering to be (mis)claimed by a later turn (it is burned as `superseded`
+instead), it does not fix which of the two ids gets named.
+
+A failed bind is invisible to the human by design (fail closed on the attestation, fail open on
+the feature): the tool call still runs, under the agent seat, and this plugin never sends a
+`human_origin` field at all. On mupot's server side, an agent-bound call with no supplied origin
+gets back `human_origin: {applied: false, reason: "absent"}` in its response — distinct from
+what a *supplied but unresolvable* origin would produce, but not a signal an operator would read
+as "your approval didn't count as yours" on its own. The only operator-visible signal that
+specifically names what happened is the plugin's own `burning unconsumed human-origin capture`
+WARNING log.
+
+**Also documented (kasra-review round-4 P1-2): the pool drains per SESSION, not per MESSAGE.** On
+Hermes's own live default (`busy_input_mode: interrupt`), two Telegram texts sent inside the
+debounce window are merged into one turn's inbound text before that turn ever reaches
+`pre_llm_call` — but both were already captured as separate records first. The one turn that
+runs presents the concatenated text, which matches neither individual capture, so both are
+burned: fail-closed by design, not a bypass — neither message authenticates a `task_verdict`
+call, and the human's remedy is to resend one message at a time.
+
 ### Testing with Hermes
 
 `./scripts/test.sh` runs the standalone operator/provisioner and legacy stream tests.

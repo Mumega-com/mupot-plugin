@@ -1933,6 +1933,9 @@ def test_gateway_status_tool_reports_stranded_notifications(tmp_path: Path) -> N
         def inject_message(self, *_a, **_kw):
             return True
 
+        def register_hook(self, *_a, **_kw):
+            pass
+
         def register_platform(self, **kwargs):
             self.adapter_factory = kwargs["adapter_factory"]
 
@@ -1979,6 +1982,9 @@ async def test_gateway_status_clears_to_disconnected_after_adapter_disconnect(
     class Ctx:
         def inject_message(self, *_a, **_kw):
             return True
+
+        def register_hook(self, *_a, **_kw):
+            pass
 
         def register_platform(self, **kwargs):
             self.adapter_factory = kwargs["adapter_factory"]
@@ -2033,6 +2039,9 @@ def test_gateway_status_survives_real_hermes_registry_dispatch(tmp_path: Path) -
     class Ctx:
         def inject_message(self, *_a, **_kw):
             return True
+
+        def register_hook(self, *_a, **_kw):
+            pass
 
         def register_platform(self, **kwargs):
             self.adapter_factory = kwargs["adapter_factory"]

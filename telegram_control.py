@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import json
+import logging
 import math
 import re
 from typing import Any, Mapping
@@ -16,15 +17,12 @@ from .profile_scope import (
     read_profile_secret,
     require_supported_profile_runtime,
 )
+from .telegram_fence import is_forwarded_telegram_message
+
+logger = logging.getLogger(__name__)
 
 
 _COMMANDS = ("start", "needs", "answer", "approve", "reject")
-_FORWARDING_MARKERS = (
-    "forward_origin",
-    "forward_from",
-    "forward_from_chat",
-    "forward_date",
-)
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,127}\Z")
 _MAX_REQUEST_BYTES = 32 * 1024
 _MAX_RESPONSE_BYTES = 64 * 1024
@@ -147,9 +145,7 @@ def _sanitized_envelope(update: Any) -> dict[str, Any]:
     if str(user_id) != str(chat_id):
         raise ValueError("telegram project control requires a private user chat")
 
-    if any(
-        getattr(message, marker, None) is not None for marker in _FORWARDING_MARKERS
-    ):
+    if is_forwarded_telegram_message(message):
         raise ValueError("forwarded telegram project control messages are refused")
 
     update_id = getattr(update, "update_id", None)
@@ -235,6 +231,31 @@ def register_telegram_control(
     settings.validate()
     if not settings.enabled:
         return
+
+    # Known limitation (evidence: kayhermes gateway journal 2026-09-15, plugin
+    # PR #11): Hermes's own transient-init reconnect path (plugins/platforms/
+    # telegram/adapter.py's _register_handlers, invoked from
+    # _initialize_app_with_retries on a rebuilt polling Application) re-adds
+    # ONLY Hermes's core handlers, never a plugin's own factory-registered
+    # CommandHandlers -- so after any such rebuild (a network hiccup mid-poll
+    # is enough), /start /needs /answer /approve /reject silently stop
+    # responding until the whole gateway process restarts, with nothing in
+    # this plugin able to detect or repair it (there is no hook back into
+    # that rebuild path). This relay stays available for members who are not
+    # bound to an owned Hermes agent; for an owned member the primary,
+    # always-live path is plain natural language through their own agent --
+    # see mupot_gateway/human_origin.py, whose task_verdict
+    # calls now carry a harness-stamped human_origin instead of needing a
+    # deterministic command at all.
+    logger.warning(
+        "mupot plugin: telegram_control's deterministic /%s commands are enabled as a "
+        "fallback for non-owned members. They do NOT survive Hermes's own Telegram "
+        "polling-connection rebuild (silently stop responding until the gateway process "
+        "restarts) -- see README.md's 'Telegram project control' section. For an owned "
+        "member, plain natural language through their own agent is the primary, always-live "
+        "path.",
+        " /".join(_COMMANDS),
+    )
 
     wired_applications: list[tuple[Any, list[Any]]] = []
 

@@ -244,7 +244,7 @@ def register_telegram_control(
     # that rebuild path). This relay stays available for members who are not
     # bound to an owned Hermes agent; for an owned member the primary,
     # always-live path is plain natural language through their own agent --
-    # see mupot_gateway/human_origin.py, whose task_verdict/needs_you_list
+    # see mupot_gateway/human_origin.py, whose task_verdict
     # calls now carry a harness-stamped human_origin instead of needing a
     # deterministic command at all.
     logger.warning(

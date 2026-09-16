@@ -3291,7 +3291,7 @@ def register(
 ) -> None:
     # FIRST, before anything else: human-origin capture/stamp is this plugin's
     # only choke point for keeping a model-supplied human_origin from reaching
-    # mupot verbatim on task_verdict/needs_you_list. register_human_origin_hooks
+    # mupot verbatim on task_verdict. register_human_origin_hooks
     # raises when it cannot enforce that (see human_origin.register's docstring),
     # and nothing else in the native gateway should register either in that case
     # -- a platform adapter + status tool with an unenforced identity-attestation

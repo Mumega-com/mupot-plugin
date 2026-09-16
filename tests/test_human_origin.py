@@ -320,10 +320,14 @@ def test_chatter_then_approve_stamps_the_approve_messages_id(monkeypatch):
 
 
 def test_same_text_twice_binds_oldest_match_only_second_is_superseded_not_pending(monkeypatch, caplog):
-    """Round-4 closes round-3's Probe D residual (identical-text id drift) as a
-    side effect of bind-or-burn: only the oldest matching record is ever bound;
-    a second, later capture with IDENTICAL text presented to the SAME bind call
-    is burned as "superseded", not left pending for yet another turn."""
+    """Round-4 does NOT close round-3's Probe D residual (identical-text id
+    drift) -- bind() still takes the OLDEST matching record by design, so the
+    stamp still names the older message_id (M1, asserted below). What round 4
+    DOES close is the duplicate's lingering: a second, later capture with
+    IDENTICAL text presented to the SAME bind call is burned as "superseded"
+    right there, instead of staying pending for yet another turn to (mis)claim.
+    Content-correct, id-drifted -- a named P2 residual (Athena round-4 gate
+    correction)."""
     store = _Store("sk-dup")
     human_origin.capture_human_origin(
         event=_event(_source(), message_id="M1", text="approve X"), gateway=None, session_store=store,

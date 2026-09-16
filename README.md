@@ -195,8 +195,11 @@ reaching mupot verbatim.
   hash match this turn's own is bound to the current `turn_id`; every other one — mismatched or
   a later duplicate-content match — is burned right there (dropped, never re-queued) and logged
   at WARNING with its message id and a reason. A turn that binds nothing still burns whatever
-  was pending: **a pending record cannot outlive the very next `pre_llm_call` on its session**,
-  matched or not. Earlier designs (a session-keyed slot, a per-session queue, then a
+  was pending: **a pending record cannot outlive the next `pre_llm_call` that QUALIFIES for its
+  session** (Telegram platform, a string inbound message, a resolvable session key, not a
+  delegated child — each of those is its own guard that returns *before* the drain). A turn that
+  doesn't qualify neither binds nor burns anything; the 2-minute TTL backstop still caps whatever
+  is left pending in that case. Earlier designs (a session-keyed slot, a per-session queue, then a
   content-matched bind that re-queued failures) all left a window where a record that failed to
   bind stayed spendable by whatever turn asked next — this closes that window at its root rather
   than narrowing it again. An internal/plugin-injected turn's text is the injected notification
@@ -224,11 +227,19 @@ source, which for an injected turn is a copy of the human's own stored origin), 
 remaining barrier is that no in-plugin injector today emits a bare, attacker-chosen string
 equal to the human's own text — every injector prepends a fixed, non-removable template. A
 future injector or third-party `pre_gateway_dispatch` plugin able to emit an unwrapped string
-would need to present it as the very next `pre_llm_call` on that session, before the human's
-own turn (if any) burns the record first. A failed bind is silent to the human by design (fail
-closed on the attestation, fail open on the feature): the tool call still runs, under the agent
-seat, and the operator-visible signal is the server's own response on the verdict, not a crash
-or an incorrect stamp.
+would need to present it as the next qualifying `pre_llm_call` on that session, before the
+human's own turn (if any) burns the record first. Separately: `bind()` always takes the OLDEST
+matching pending record, so two identical human messages inside one window still produce a
+stamp naming the older of the two message ids — content-correct, id-drifted; round 4 only stops
+the newer one from lingering to be (mis)claimed by a later turn (it is burned as `superseded`
+instead), it does not fix which of the two ids gets named.
+
+A failed bind is invisible to the human by design (fail closed on the attestation, fail open on
+the feature): the tool call still runs, under the agent seat, and mupot's server never receives
+a `human_origin` field at all — its response is byte-identical to a pre-feature call (`applied:
+false` is a DIFFERENT case: a *supplied but unresolvable* origin, not an absent one). The only
+positive, operator-visible signal that an approval failed to attest is the plugin's own
+`burning unconsumed human-origin capture` WARNING log.
 
 ### Testing with Hermes
 

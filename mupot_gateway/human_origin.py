@@ -14,8 +14,13 @@ later present the same ``(session_key, user_id, sha256(text))``, for the entire
 TTL. Since the "text" in question is the human's own approval word ("approve",
 "yes", "ok") that is a real, if narrow, bearer-credential window -- not a custody
 token. Round 4's rule, and the only thing that changed: **a pending record lives
-until the NEXT ``pre_llm_call`` on its session, full stop.** It either binds to
-that turn or it is burned right there, logged, never re-queued.
+until the next ``pre_llm_call`` that QUALIFIES for this session** (Telegram
+platform, a string ``user_message``, a resolvable session key, not a delegated
+child -- see :func:`bind_turn_custody`'s own guards, each of which returns
+*before* the drain) **-- it either binds to that turn or is burned right there,
+logged, never re-queued.** A turn that does not qualify neither binds nor burns
+anything; whatever is pending for that session is still capped by the 2-minute
+TTL backstop.
 
 1. ``pre_gateway_dispatch`` (:func:`capture_human_origin`) -- unchanged trust
    fence (private, non-forwarded, self chat; shared forwarding check in
@@ -201,11 +206,19 @@ class _OriginStash:
     every other one is BURNED: dropped, never re-queued, and reported via
     ``burn_callback(record, reason)`` with ``reason`` one of ``"sender_mismatch"``,
     ``"text_mismatch"``, or ``"superseded"`` (a later record that ALSO matches,
-    once the first match has already been bound -- round 3's identical-text id
-    drift is closed by this as a side effect: only the oldest matching record is
-    ever bound, and every other one, matching or not, is gone). A turn that binds
-    NOTHING still burns whatever was pending: a captured-but-unbound record does
-    not survive past the turn that was supposed to claim it.
+    once the first match has already been bound). A turn that binds NOTHING still
+    burns whatever was pending: a captured-but-unbound record does not survive
+    past the turn that was supposed to claim it.
+
+    NOTE (Athena round-4 gate): this does NOT close round 3's identical-text id
+    drift -- ``bind()`` still takes the OLDEST matching record by design (the
+    ``found is None`` check below only ever captures the first match in drain
+    order). What round 4 closes is the duplicate's LINGERING: a second capture
+    with identical text no longer stays pending for some later, unrelated turn to
+    (mis)claim -- it is burned as ``"superseded"`` at the very first bind instead.
+    Two identical human messages inside one window still produce a stamp naming
+    the OLDER of the two message ids: content-correct, id-drifted. Named P2
+    residual, unchanged severity from round 3.
 
     ``read(session_key, turn_id)`` is the ONLY read path (``pre_tool_call``): it
     returns whatever is bound to that exact turn, or ``None`` -- never touches the
@@ -431,7 +444,7 @@ def _warn_unsupported_platform_once(platform: str) -> None:
     _WARNED_UNSUPPORTED_PLATFORMS.add(platform)
     logger.info(
         "mupot plugin: human-origin capture is not yet supported for platform %r; "
-        "task_verdict/needs_you_list calls from this platform run under the agent seat",
+        "task_verdict calls from this platform run under the agent seat",
         platform,
     )
 
@@ -603,9 +616,15 @@ def bind_turn_custody(
 
     Never raises: a bind failure just means nothing is stamped for this turn --
     fail open on the FEATURE (the turn proceeds normally, under the agent seat),
-    fail closed on the ATTESTATION (no human_origin is ever fabricated, and the
-    human sees no stamp -- visible downstream as the server's own
-    ``applied:false`` on the verdict, not a crash or a silent wrong answer).
+    fail closed on the ATTESTATION (no human_origin is ever fabricated). This is
+    NOT visible as an ``applied:false`` on the server's response -- when nothing
+    binds, ``human_origin`` is never sent at all, and mupot's server omits the
+    key from its answer entirely (``applied:false`` is what a SUPPLIED but
+    unresolvable origin produces, a different case). The verdict's response is
+    therefore byte-identical to a pre-feature call; the ONLY positive
+    operator-visible signal that an approval failed to attest is the
+    ``burning unconsumed human-origin capture`` WARNING this function logs via
+    :func:`_log_burn`.
     """
     try:
         if platform != "telegram" or not turn_id:
@@ -700,7 +719,7 @@ def register(ctx: Any) -> None:
     if not callable(register_hook):
         logger.error(
             "mupot plugin: ctx has no register_hook -- this Hermes runtime cannot enforce "
-            "human_origin integrity on task_verdict/needs_you_list (a model-supplied value "
+            "human_origin integrity on task_verdict (a model-supplied value "
             "would otherwise reach mupot unchecked). Refusing native-gateway registration "
             "entirely rather than degrade silently."
         )

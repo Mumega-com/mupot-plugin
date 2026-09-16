@@ -304,10 +304,14 @@ def test_chatter_then_approve_stamps_the_approve_turns_own_message():
 
 
 def test_same_text_twice_binds_oldest_only_second_is_superseded_not_left_pending(caplog):
-    """Round-4 closes Athena's round-3 Probe D residual (identical-text id
-    drift) as a side effect of bind-or-burn: the second identical-text capture
-    is burned as "superseded" the moment ANY turn binds, not left pending for a
-    LATER turn to (mis)claim."""
+    """Round-4 does NOT close Athena's round-3 Probe D residual (identical-text
+    id drift) -- bind() still takes the OLDEST matching record by design, so the
+    stamp still names the older message_id (asserted below: == "M1", not "M2").
+    What round 4 DOES close is the duplicate's lingering: the second
+    identical-text capture is burned as "superseded" at the very first bind
+    instead of staying pending for some LATER, unrelated turn to (mis)claim.
+    Content-correct, id-drifted -- a named P2 residual, unchanged severity from
+    round 3 (Athena round-4 gate correction)."""
     store = _FakeSessionStore()
     source = _telegram_source()
     human_origin.capture_human_origin(

@@ -41,8 +41,9 @@ class Chat:
 
 
 class Message:
-    def __init__(self, chat: Chat | None = None) -> None:
+    def __init__(self, chat: Chat | None = None, message_id: str = "999") -> None:
         self.chat = chat if chat is not None else Chat()
+        self.message_id = message_id
         self.edited: list[Any] = []
 
     async def edit_reply_markup(self, reply_markup: Any = None) -> None:
@@ -601,6 +602,77 @@ async def test_handle_callback_non_mapping_transport_result_still_answers(
     receipt = next(iter(data["receipts"].values()))
     assert receipt["applied"] is False
     assert receipt["reason"] == "invalid_response"
+
+
+@pytest.mark.asyncio
+async def test_handle_callback_refuses_when_pressed_from_a_different_message(
+    tmp_path: Any,
+) -> None:
+    """kasra-review round-2 gate, P1-A residual: `build_approval_keyboard` mints
+    against a `VerifiedPresser` but leaves SENDING to its caller -- nothing
+    previously compared the live callback's chat/user/message against the
+    record it claimed. A token minted and bound to message "999" pressed via
+    a callback carrying message "111" must be refused, and the important
+    property is that the call to task_verdict never happens at all -- NOT
+    that `human_origin` merely differs from expectations (that's round 1's
+    M13 trap: a test asserting the echoed value only proves the record was
+    read, not that the mismatch was ever caught)."""
+    token_store = _ApprovalTokenStore()
+    nonces = token_store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
+    token_store.bind_message(nonces.values(), "999")
+    message = Message(Chat(chat_id=123, chat_type="private"), message_id="111")
+    query = CallbackQuery(
+        data=CALLBACK_PREFIX + nonces["approve"], message=message, from_user=User(123)
+    )
+    update = Update(query)
+    client = FakeClient(applied_result(applied=True))
+    store = ApprovalReceiptStore(tmp_path / "receipts.json")
+    await _handle_callback(
+        update, client=client, secret_owner=None, receipt_store=store, token_store=token_store
+    )
+    assert client.calls == []  # task_verdict must never be called
+    assert query.answers[-1][1] is True
+    # The token is spent, not resurrected -- a second press (even a matching
+    # one) is refused as "used", never as a fresh "not_bound"/"unknown".
+    status, _record = token_store.claim(nonces["approve"])
+    assert status == "used"
+
+
+@pytest.mark.asyncio
+async def test_handle_callback_refuses_when_pressed_from_a_different_chat(
+    tmp_path: Any,
+) -> None:
+    """Same property as above, on the chat axis: a keyboard built for
+    presser 123 but delivered by its (hypothetical) caller into chat 456
+    must not submit a verdict when pressed there."""
+    token_store = _ApprovalTokenStore()
+    nonces = token_store.mint_triplet(task_id="task-1", presser=presser(), ttl_seconds=60)
+    token_store.bind_message(nonces.values(), "999")
+    message = Message(Chat(chat_id=456, chat_type="private"), message_id="999")
+    query = CallbackQuery(
+        data=CALLBACK_PREFIX + nonces["reject"], message=message, from_user=User(456)
+    )
+    update = Update(query)
+    client = FakeClient(applied_result(applied=True))
+    store = ApprovalReceiptStore(tmp_path / "receipts.json")
+    await _handle_callback(
+        update, client=client, secret_owner=None, receipt_store=store, token_store=token_store
+    )
+    assert client.calls == []
+    assert query.answers[-1][1] is True
+
+
+def test_mint_triplet_rejects_a_non_verifiedpresser_object() -> None:
+    """Athena round-2 gate: the type hint alone does not stop a duck-typed
+    lookalike whose chat_id/user_id disagree from being passed at runtime."""
+
+    class FakePresser:
+        chat_id = "100"
+        user_id = "200"
+
+    token_store = _ApprovalTokenStore()
+    with pytest.raises(TypeError):
+        token_store.mint_triplet(task_id="task-1", presser=FakePresser(), ttl_seconds=60)
 
 
 # ---------------------------------------------------------------------------

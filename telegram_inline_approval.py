@@ -115,6 +115,11 @@ _MIN_TOKEN_TTL_SECONDS = 1.0
 _MAX_TOKEN_TTL_SECONDS = 600.0
 _NONCE_BYTES = 18  # secrets.token_urlsafe(18) ~ 144 bits of entropy
 _MAX_PENDING_TOKENS = 512
+# Bounds `_ApprovalTokenStore._mint_times` the same way `_MAX_PENDING_TOKENS`
+# bounds `_entries` -- kasra-review round-2 gate, P3-J: a chat that mints
+# exactly once and never again left a permanent one-entry dict record with
+# no sweep, growing with every distinct chat over the process's lifetime.
+_MAX_MINT_RATE_CHATS = 512
 _MAX_RECEIPTS = 500
 
 # Per-chat mint throttle (kasra-review round-1 gate, P2-F): round 1's only
@@ -136,6 +141,7 @@ _REFUSAL_TEXT: Mapping[str, str] = {
     "version_mismatch": "This button is from an older message. Ask for a fresh prompt.",
     "not_bound": "This button is no longer valid.",
     "fence": "This decision can only be made in your own private chat.",
+    "context_mismatch": "This decision is no longer available.",
 }
 
 
@@ -162,7 +168,18 @@ class VerifiedPresser:
     the first. This is round 2's structural fix for kasra-review's P1-A: a
     concrete PoC minted a prompt with ``chat_id=100, user_id=200`` and had it
     attest to member 200 when Telegram user 100 (the real presser) pressed
-    it -- with this type, that call could not have been written.
+    it -- this type makes that specific two-argument construction impossible.
+
+    It does NOT by itself guarantee the button ends up delivered to the chat
+    it names: :func:`build_approval_keyboard` mints against *presser* but
+    leaves sending -- and therefore the actual delivery chat -- to its
+    caller. kasra-review's round-2 gate found exactly that gap live in the
+    shipped API. :func:`_handle_callback`'s post-claim context check (same
+    commit as this note) closes it: a claimed record's ``chat_id``/
+    ``user_id``/``prompt_message_id`` are re-checked against the ACTUAL
+    callback query before any verdict is submitted, so a keyboard delivered
+    anywhere other than where it was minted for is refused, not merely
+    difficult to construct in the first place.
     """
 
     id: str
@@ -365,7 +382,7 @@ class _ApprovalTokenStore:
         self._lock = threading.Lock()
         self._entries: "OrderedDict[str, _PendingApproval]" = OrderedDict()
         self._max_entries = max_entries
-        self._mint_times: dict[str, list[float]] = {}
+        self._mint_times: "OrderedDict[str, list[float]]" = OrderedDict()
 
     def _check_mint_rate_locked(self, chat_key: str, *, task_id: str) -> None:
         now = time.monotonic()
@@ -389,6 +406,9 @@ class _ApprovalTokenStore:
             )
         recent.append(now)
         self._mint_times[chat_key] = recent
+        self._mint_times.move_to_end(chat_key)
+        while len(self._mint_times) > _MAX_MINT_RATE_CHATS:
+            self._mint_times.popitem(last=False)
 
     def mint_triplet(
         self,
@@ -404,7 +424,16 @@ class _ApprovalTokenStore:
         Raises :class:`MintRateLimited` when *presser*'s chat has minted too
         many triplets recently (see ``_MINT_RATE_LIMIT_PER_CHAT``) -- callers
         that want to degrade gracefully instead of erroring must catch it.
+
+        Raises :class:`TypeError` when *presser* is not an actual
+        :class:`VerifiedPresser` instance (Athena's round-2 gate: the type
+        hint alone does not stop a duck-typed lookalike whose ``chat_id``/
+        ``user_id`` properties disagree from being passed at runtime).
         """
+        if not isinstance(presser, VerifiedPresser):
+            raise TypeError(
+                f"presser must be a VerifiedPresser instance, got {type(presser).__name__}"
+            )
         bounded_ttl = max(
             _MIN_TOKEN_TTL_SECONDS, min(_MAX_TOKEN_TTL_SECONDS, float(ttl_seconds))
         )
@@ -811,6 +840,48 @@ async def _handle_callback(
             _REFUSAL_TEXT.get(status, "This decision is no longer available."),
             show_alert=True,
         )
+        return
+
+    # kasra-review round-2 gate, P1-A residual: `claim()` only proves the
+    # NONCE is valid and unused -- it says nothing about whether the chat,
+    # user, and message this actual callback arrived on are the ones the
+    # record was minted and bound for. `build_approval_keyboard` mints
+    # against a `VerifiedPresser` but leaves sending (and so the real
+    # delivery chat) to its caller; a caller that sends the returned
+    # markup somewhere other than `presser`'s own chat would otherwise have
+    # the mismatch silently baked into `human_origin` at submit time. The
+    # fence above only proves THIS callback's own chat/user shape is a
+    # private self-chat -- it never compares against the claimed record.
+    # Re-check every axis the server's replay key and identity resolution
+    # actually rely on before any verdict is submitted; a claimed-but-
+    # mismatched token is spent (never returned to the pool), matching how
+    # every other refusal after `claim()` already behaves.
+    live_message = getattr(query, "message", None)
+    live_chat = getattr(live_message, "chat", None) if live_message is not None else None
+    live_from_user = getattr(query, "from_user", None)
+    live_chat_id = getattr(live_chat, "id", None)
+    live_user_id = getattr(live_from_user, "id", None)
+    live_message_id = getattr(live_message, "message_id", None) if live_message is not None else None
+    if (
+        str(live_chat_id) != record.chat_id
+        or str(live_user_id) != record.user_id
+        or str(live_message_id) != record.prompt_message_id
+    ):
+        logger.warning(
+            "mupot plugin: inline-approval callback refused -- press context does "
+            "not match the record it was minted for nonce=%s task_id=%s "
+            "record_chat=%s live_chat=%s record_user=%s live_user=%s "
+            "record_message=%s live_message=%s",
+            nonce[:8],
+            record.task_id,
+            record.chat_id,
+            live_chat_id,
+            record.user_id,
+            live_user_id,
+            record.prompt_message_id,
+            live_message_id,
+        )
+        await _answer(_REFUSAL_TEXT["context_mismatch"], show_alert=True)
         return
 
     if record.verdict == "details":

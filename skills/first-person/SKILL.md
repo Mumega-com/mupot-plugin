@@ -123,9 +123,10 @@ touches the conversation when that status says intake is actually pending.
 ## Mupot-side contract this build depends on
 
 Athena's round-1 ruling on this reshape (2026-09-21) is binding: this plugin
-codes against the fields below NOW and fails OPEN (falls through untouched)
-everywhere they are absent or malformed. **This PR must not merge before the
-mupot Slice 2 chain PR lands these contracts.**
+codes against the fields below NOW and is fail-safe for the intake (absent or
+unknown status is never consumed; the host handler owns the turn) everywhere
+they are absent or malformed. **This PR must not merge before the mupot
+Slice 2 chain PR lands these contracts.**
 
 - **Status probe response** (new): `{"ok": true, "bound": bool, "member_id":
   str|null, "home_squad_id": str|null, "intake_state": "none"|"pending"|"complete"}`

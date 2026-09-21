@@ -34,10 +34,12 @@ mupot itself. Every private DM re-checks a structured status
 identity surface: ``{bound, member_id, home_squad_id, intake_state}``, where
 ``intake_state`` is ``"none" | "pending" | "complete"`` (server-decided; this
 module never invents newness from its own state). Athena's round-1 ruling on
-this reshape (2026-09-21) is binding: **code against those fields now, and fail
-OPEN (return ``False``, no reply, no ``ApplicationHandlerStop``) whenever they
-are absent or malformed** -- exactly the same fail-open posture as "bound"
-resolving false. This PR must not merge before the mupot-side contract PR lands
+this reshape (2026-09-21) is binding: **code against those fields now, and
+fail-safe for the intake (return ``False``, no reply, no
+``ApplicationHandlerStop`` -- never consume the update; the host handler owns
+the turn) whenever they are absent or malformed** -- exactly the same
+fail-safe posture as "bound" resolving false. This PR must not merge before
+the mupot-side contract PR lands
 that field set (and the ``routine_proposal_submit`` ``project_access`` kind, and
 ``resolve_member_project``) -- see the PR body's mupot-side contract section.
 
@@ -413,15 +415,17 @@ def resolve_member_status(
     trusts for identity and for "is intake actually in progress".
 
     Mupot-side contract this depends on (see PR body -- Athena's round-1 ruling
-    on this reshape, 2026-09-21, is binding: code against this now, fail OPEN
-    while it is absent): the probe response must carry
+    on this reshape, 2026-09-21, is binding: code against this now, fail-safe
+    for the intake while it is absent): the probe response must carry
     ``{"ok": true, "bound": bool, "member_id": str|null, "home_squad_id":
     str|null, "intake_state": "none"|"pending"|"complete"}``. This function
     never parses a human-readable ``reply`` string for any decision (see
     kasra-review's PR#15 finding: comparing rendered prose against local
-    literals fails open). Anything missing, malformed, or simply not shipped
+    literals fails open -- a different, accidental failure mode this module
+    deliberately avoids). Anything missing, malformed, or simply not shipped
     yet resolves to ``intake_state="unknown"`` -- which the caller treats
-    exactly like "not pending": fail OPEN, never consume the update.
+    exactly like "not pending": fail-safe for the intake, never consume the
+    update, the host handler owns the turn.
     """
 
     cache_key = str(user_id)
@@ -927,7 +931,8 @@ async def handle_first_contact(
     sender is ``"pending"`` -- never from local state alone. This is re-checked
     on EVERY message, including mid-intake ones (round-2 P1-3): an unbind, a
     server-side reset, or the contract fields simply not existing yet on a
-    given deployment all fail OPEN here, every time.
+    given deployment all fail-safe for the intake here, every time -- never
+    consumed, the host handler owns the turn.
     """
 
     # Edited messages must never re-enter as the "next answer" -- the PTB
@@ -958,7 +963,8 @@ async def handle_first_contact(
     if not status.is_pending:
         # Unbound, never-started, already-onboarded, or the contract fields
         # aren't live on this deployment yet (intake_state=="unknown") --
-        # every one of these fails OPEN. Drop any stale local record; store
+        # every one of these is fail-safe for the intake: never consumed, the
+        # host handler owns the turn. Drop any stale local record; store
         # nothing.
         if pending is not None:
             runtime.abandon(chat_key)

@@ -263,17 +263,20 @@ def test_fence_accepts_a_genuinely_clean_private_dm() -> None:
 
 
 # ---------------------------------------------------------------------------
-# resolve_member_status -- wire format + fail-open on missing/malformed fields
+# resolve_member_status -- wire format + fail-safe-for-the-intake on
+# missing/malformed fields
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_member_status_fails_open_on_missing_structured_fields(
+def test_resolve_member_status_is_fail_safe_for_the_intake_on_missing_structured_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """kasra-review's PR#15 lesson, reapplied: a response with ok:true but no
     `bound` field at all must resolve unknown, never crash, never default to
-    bound. This IS the fail-open posture Athena's round-1 ruling requires
-    while the mupot-side contract fields don't exist yet."""
+    bound. This IS the fail-safe-for-the-intake posture Athena's round-1
+    ruling requires while the mupot-side contract fields don't exist yet --
+    absent/unknown status never gets consumed, the host handler owns the
+    turn."""
     install_probe(monkeypatch, response=b'{"ok":true,"reply":"Welcome back!"}')
     status = resolve_member_status(valid_settings(), 123, 123)
     assert status == StatusResolution(bound=False, member_id=None, home_squad_id=None, intake_state="unknown")

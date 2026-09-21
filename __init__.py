@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
+from .first_person import FirstPersonSettings, register_first_person
 from .mupot_operator import MupotOperatorClient, OperatorSettings, register_operator_tools
 from .schemas import (
     MUPOT_BRAIN_ENABLE_SCHEMA,
@@ -374,6 +375,7 @@ def register(ctx: Any) -> None:
         operator_settings = OperatorSettings.from_mapping(operator_value)
         telegram_control_settings = TelegramControlSettings.from_mapping(operator_value)
         inline_approval_settings = TelegramInlineApprovalSettings.from_mapping(operator_value)
+        first_person_settings = FirstPersonSettings.from_mapping(operator_value)
         secret_owner = ProfileSecretOwner.from_context(ctx)
         with secret_owner.activate():
             client = MupotOperatorClient(
@@ -388,6 +390,12 @@ def register(ctx: Any) -> None:
             register_telegram_inline_approval(
                 ctx,
                 inline_approval_settings,
+                client=client,
+                secret_owner=secret_owner,
+            )
+            register_first_person(
+                ctx,
+                first_person_settings,
                 client=client,
                 secret_owner=secret_owner,
             )

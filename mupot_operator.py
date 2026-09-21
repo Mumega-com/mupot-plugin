@@ -49,6 +49,25 @@ OPERATOR_ACTIONS = frozenset(
 # tracking follow-up issue for a presser-scoped replacement.)
 VERDICT_ACTIONS = frozenset({"task_verdict"})
 
+# first_person.py's deterministic intake handler calls these directly through
+# MupotOperatorClient.call() -- same "own frozenset, never a registered LLM tool"
+# shape as VERDICT_ACTIONS above, for the same reason: Mubot (the model) must
+# never be ABLE to reach these, not merely instructed not to. register_operator_tools
+# below never maps any of these four to a tool name, so there is no registered
+# surface for a model to call even if it tried. Deliberately excludes
+# project_squad_set / grant_agent_capability / grant_gate_capability / any other
+# manage_access surface -- first_person.py proposes access via
+# routine_proposal_submit, it never grants it (tests/test_operator.py's
+# test_first_person_actions_exclude_manage_access_surfaces pins this).
+FIRST_PERSON_ACTIONS = frozenset(
+    {
+        "create_home_for_member",
+        "squad_remember",
+        "routine_proposal_submit",
+        "project_list",
+    }
+)
+
 MANAGER_LIFECYCLE_ACTIONS = frozenset(
     {
         "agent_manager_status",
@@ -282,6 +301,7 @@ class MupotOperatorClient:
             action not in OPERATOR_ACTIONS
             and action not in MANAGER_ACTIONS
             and action not in VERDICT_ACTIONS
+            and action not in FIRST_PERSON_ACTIONS
         ):
             return {"ok": False, "error": "action_not_allowed", "action": action}
         if action in MANAGER_ACTIONS and not self.settings.agent_manager_enabled:

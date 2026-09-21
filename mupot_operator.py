@@ -74,10 +74,24 @@ VERDICT_ACTIONS = frozenset({"task_verdict"})
 # Calling either of these two names through MupotOperatorClient.call() would
 # just get `action_not_allowed`; keeping dead names in this set would be
 # actively misleading about what this module can reach.
+#
+# Round-3-gate-4 P1-a (2026-09-21, adversarial round 1 on PR#20): "task_create"
+# was ADDED here specifically so the module's _PROPOSAL_STALLED_REPLY claim
+# ("I've flagged it so a human can look") is TRUE -- a prior build sent that
+# exact sentence with no receiver anywhere, which is fabricating a receipt on
+# a human-decision channel. This is still not a grant/manage_access surface
+# (it creates a plain task item in THIS OPERATOR's own squad -- see
+# first_person.py's _stall_reply -- never in the member's home_squad_id,
+# never anything squad_remember/routine_proposal_submit couldn't already
+# tell an operator watching the board); it is the SAME action
+# OPERATOR_ACTIONS already exposes to an LLM-driven agent turn elsewhere in
+# this plugin, scoped here to one fixed, deterministic call shape this
+# module's own code controls end to end, never model-composed.
 FIRST_PERSON_ACTIONS = frozenset(
     {
         "squad_remember",
         "routine_proposal_submit",
+        "task_create",
     }
 )
 

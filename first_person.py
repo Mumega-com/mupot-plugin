@@ -258,11 +258,21 @@ _STATUS_UNKNOWN_SHORT_TTL_SECONDS = 30.0
 # entries are dropped first once over this cap -- same bounded-LRU-by-another-
 # name discipline as _StatusCache/_NotifyOncePerWindow above.
 _JOURNAL_MAX_ENTRIES = 2048
-# read_journal_proposal_id must never read an unbounded amount of a file it
-# does not fully control the size of (e.g. a pre-existing file from before
-# this cap existed, or a hand-edited one) -- caps the read regardless of
-# on-disk size, reading only the tail (the newest entries) when oversized.
-_JOURNAL_READ_CAP_BYTES = 256 * 1024
+# Round-3-gate-4 P3-c: the read cap MUST be derived from the write cap, not
+# picked independently -- a fixed 256KiB read cap alongside a 2048-entry
+# write cap meant a fully-compacted journal (2048 entries * a realistic
+# ~150-200 bytes/line) could already exceed what one read would see, so
+# append_journal's own read-then-recompact-then-write cycle would silently
+# read only the TAIL of the file, treat that partial view as "everything",
+# and rewrite the file WITHOUT the entries that fell outside the read
+# window -- permanently losing already-compacted proposal_ids on the very
+# next write, the opposite of what compaction is for. 512 bytes/entry is a
+# generous per-line estimate (member_id + proposal_id + timestamp + JSON
+# syntax) with headroom well beyond any realistic id length; deriving the
+# read cap from the write cap this way means the two can never silently
+# diverge again, whichever one changes.
+_JOURNAL_MAX_ENTRY_BYTES_ESTIMATE = 512
+_JOURNAL_READ_CAP_BYTES = _JOURNAL_MAX_ENTRIES * _JOURNAL_MAX_ENTRY_BYTES_ESTIMATE
 
 # Proposal-submission retry backoff (round-2 P0-3): a failed submit must not be
 # retried on literally the next keystroke.
@@ -348,15 +358,31 @@ _CREDENTIAL_REPLY = (
 )
 _PROPOSAL_FAILED_REPLY = "I couldn't send your request yet -- I'll try again."
 _PROPOSAL_RETRY_WAIT_REPLY = "Still working on sending your request -- I'll try again shortly."
-# Round-3-gate-3 / Athena's ruling (4): once the retry backoff table itself
-# is exhausted (_PROPOSAL_STALLED_AFTER_ATTEMPTS failed attempts), the member
-# gets THIS distinct, rate-limited reply instead of an unbounded repeat of
-# the two lines above -- honest that something is actually stuck, never a
-# claim of completion, and never sent more than once per
-# _PROPOSAL_STALLED_REPLY_WINDOW_SECONDS.
+# Round-3-gate-3 / Athena's ruling (4), corrected round-3-gate-4 P1-a: once
+# the retry backoff table itself is exhausted
+# (_PROPOSAL_STALLED_AFTER_ATTEMPTS failed attempts), the member gets one of
+# the two lines below instead of an unbounded repeat of the two ABOVE.
+# _PROPOSAL_STALLED_REPLY is sent ONLY the moment a real task_create call
+# (see :func:`_stall_reply`) actually succeeds -- the round-3-gate-3 build
+# sent this exact sentence with no receiver anywhere, which is fabricating a
+# receipt on a human-decision channel. If the flag call itself fails,
+# _PROPOSAL_STALLED_REPLY_FLAG_FAILED is sent instead -- honest that nothing
+# was actually flagged. Round-3-gate-4 P3-a: once stalled, the member NEVER
+# reverts to _PROPOSAL_FAILED_REPLY/_PROPOSAL_RETRY_WAIT_REPLY again on a
+# later check-in within the same stall -- _PROPOSAL_STILL_STALLED_REPLY is
+# used for every subsequent rate-limited (see
+# _PROPOSAL_STALLED_REPLY_WINDOW_SECONDS) check-in instead, so a member is
+# never told "still working on it" as if nothing had been escalated.
 _PROPOSAL_STALLED_REPLY = (
     "This is taking longer than it should -- I've flagged it so a human can "
     "look into your request directly."
+)
+_PROPOSAL_STALLED_REPLY_FLAG_FAILED = (
+    "This is taking longer than it should, and I couldn't reach the team "
+    "automatically -- please check in with them directly."
+)
+_PROPOSAL_STILL_STALLED_REPLY = (
+    "Still waiting on a human to follow up on this -- I'll let you know the moment it moves."
 )
 # Round-3 ruling (6): a mid-intake message that is not a usable answer (empty
 # or whitespace-only after stripping) is nudged with this fixed line rather
@@ -379,6 +405,20 @@ _HOME_NOT_READY_REPLY = "Opening your space — one moment, I'll come back to yo
 # non-escape message resumes at the same still-pending question.
 _ESCAPE_WORDS = frozenset({"stop", "cancel", "later", "no thanks", "not now"})
 _PAUSED_REPLY = "No problem -- message me whenever you're ready to continue."
+
+
+def _is_escape_text(text: Any) -> bool:
+    """Shared escape-word check (round-3-gate-4 P2-b): the proposal-retry-
+    wait phase (index == len(FIRST_PERSON_QUESTIONS)) previously routed
+    straight to :func:`_retry_proposal_if_due` with no escape check at all
+    -- 'stop'/'cancel'/'not now' were only ever honoured mid-question, so
+    an escape word became permanently dead the instant a member finished
+    all 5 questions. Used by :func:`handle_first_contact` before routing to
+    the retry-wait path, and mirrors the check :func:`_handle_answer` makes
+    on the normalized text for an in-progress question."""
+    if not isinstance(text, str):
+        return False
+    return _sanitize_answer(text).strip().lower().lstrip("/") in _ESCAPE_WORDS
 
 
 def _project_not_found_reply(name: str) -> str:
@@ -775,6 +815,7 @@ def resolve_member_status(
     cache: _StatusCache | None = None,
     probe_limiter: "_ProbeLimiter | None" = None,
     sender_limiter: "_SenderProbeLimiter | None" = None,
+    fallback: StatusResolution | None = None,
 ) -> StatusResolution:
     """Resolve the Telegram sender's bound member + intake progress through the
     authenticated ``/im/webhook`` surface -- the ONLY channel this module
@@ -809,7 +850,19 @@ def resolve_member_status(
         # never cached (a rate-limit denial is not information ABOUT the
         # sender, and caching it would recreate exactly the latch this is
         # meant to avoid).
-        return _UNKNOWN_STATUS
+        #
+        # Round-3-gate-4 P0 (:803): the round-3-gate-3 version returned
+        # _UNKNOWN_STATUS unconditionally here -- which handle_first_contact
+        # treats as "hold, do nothing" for a mid-intake member, so two
+        # ordinary answers typed within the limiter's own window (15s) meant
+        # the SECOND one was silently never sanitized, credential-checked,
+        # stored, or replied to, and fell through to the host's own LLM
+        # turn. A denial is not new information; it must never reuse the
+        # sentinel that means "the probe ran and found nothing". Callers
+        # that already know a reasonable "nothing has changed" answer (see
+        # handle_first_contact's `resolve()`, which passes the current
+        # pending record's own last-known state) get THAT back instead.
+        return fallback if fallback is not None else _UNKNOWN_STATUS
 
     require_supported_profile_runtime({})
     body = _status_probe_body(user_id, chat_id)
@@ -924,6 +977,74 @@ def _with_secret_owner(secret_owner: ProfileSecretOwner, fn: Any) -> Any:
 # --------------------------------------------------------------------------
 
 
+def _read_bounded_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Bounded, tolerant JSONL reader shared by the completion journal and
+    the stall-marker file (round-3-gate-4 P1-a/P3-c). Never reads more than
+    ``_JOURNAL_READ_CAP_BYTES`` regardless of on-disk file size, and only
+    ever the TAIL of an oversized file; tolerant of a partially-written
+    last line (an fsync'd append can still be torn by a concurrent crash on
+    some filesystems) -- one bad line is skipped, not fatal to the read."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    try:
+        with open(path, "rb") as handle:
+            truncated_head = size > _JOURNAL_READ_CAP_BYTES
+            if truncated_head:
+                handle.seek(size - _JOURNAL_READ_CAP_BYTES)
+            raw = handle.read(_JOURNAL_READ_CAP_BYTES + 1)
+    except OSError:
+        return []
+    text = raw.decode("utf-8", errors="ignore")
+    lines = text.splitlines()
+    if truncated_head and lines:
+        # The first line read after an interior seek is very likely a
+        # partial line -- drop it rather than risk parsing a truncated
+        # JSON object as a real (and possibly wrong) record.
+        lines = lines[1:]
+    parsed: list[dict[str, Any]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            parsed.append(entry)
+    return parsed
+
+
+def _write_bounded_jsonl(path: Path, entries: dict[str, dict[str, Any]], *, sort_key: str) -> None:
+    """Compact-on-write atomic JSONL writer shared by the completion
+    journal and the stall-marker file -- caps at ``_JOURNAL_MAX_ENTRIES``
+    distinct ``member_id`` keys, oldest (by ``sort_key``) evicted first.
+    Written atomically (temp file + fsync + rename), same shape as the main
+    store's own ``save``."""
+    if len(entries) > _JOURNAL_MAX_ENTRIES:
+        oldest_first = sorted(entries.values(), key=lambda entry: entry.get(sort_key, 0.0))
+        for stale in oldest_first[: len(entries) - _JOURNAL_MAX_ENTRIES]:
+            entries.pop(stale["member_id"], None)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for entry in entries.values():
+                handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True))
+                handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 class FirstPersonStateStore:
     """Durable, atomically-written completion marker.
 
@@ -945,6 +1066,11 @@ class FirstPersonStateStore:
         # Appending one line never touches, reads, or risks anyone else's
         # data -- see FirstPersonRuntime.finish/held_proposal_id.
         self.journal_path = self.path.with_name(self.path.name + ".journal")
+        # Round-3-gate-4 P1-a: durable breadcrumb that a proposal has
+        # stalled long enough to need human follow-up -- part of what makes
+        # _PROPOSAL_STALLED_REPLY's "I've flagged it" claim true (see
+        # first_person._stall_reply). Same file, bounded-compaction shape.
+        self.stall_path = self.path.with_name(self.path.name + ".stalled")
 
     def load_checked(self) -> tuple[dict[str, Any], bool]:
         try:
@@ -978,49 +1104,11 @@ class FirstPersonStateStore:
                 pass
 
     def _read_journal_entries(self) -> dict[str, dict[str, Any]]:
-        """Tolerant of a partially-written last line (an fsync'd append can
-        still be torn by a concurrent crash on some filesystems) -- one bad
-        line is skipped, not fatal to the whole read.
-
-        Round-3-gate-3 P3 (:860): bounded read -- never reads more than
-        ``_JOURNAL_READ_CAP_BYTES`` regardless of on-disk file size, and only
-        ever the TAIL of an oversized file (the newest entries are what a
-        compact-on-write journal needs; a file larger than the cap is itself
-        evidence something wrote to it outside this class's own bound, so
-        this reads defensively rather than trusting the on-disk size).
-        Returns at most one entry per ``member_id`` -- the LAST one seen
-        scanning forward, matching the previous append-only "most recent
-        wins" semantics.
-        """
-        try:
-            size = self.journal_path.stat().st_size
-        except OSError:
-            return {}
-        try:
-            with open(self.journal_path, "rb") as handle:
-                truncated_head = size > _JOURNAL_READ_CAP_BYTES
-                if truncated_head:
-                    handle.seek(size - _JOURNAL_READ_CAP_BYTES)
-                raw = handle.read(_JOURNAL_READ_CAP_BYTES + 1)
-        except OSError:
-            return {}
-        text = raw.decode("utf-8", errors="ignore")
-        lines = text.splitlines()
-        if truncated_head and lines:
-            # The first line read after an interior seek is very likely a
-            # partial line -- drop it rather than risk parsing a truncated
-            # JSON object as a real (and possibly wrong) record.
-            lines = lines[1:]
+        """Bounded read (see :func:`_read_bounded_jsonl`), keeping at most
+        one entry per ``member_id`` -- the LAST one seen scanning forward,
+        matching the previous append-only "most recent wins" semantics."""
         entries: dict[str, dict[str, Any]] = {}
-        for line in lines:
-            if not line.strip():
-                continue
-            try:
-                entry = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(entry, dict):
-                continue
+        for entry in _read_bounded_jsonl(self.journal_path):
             member_id = entry.get("member_id")
             proposal_id = entry.get("proposal_id")
             if not isinstance(member_id, str) or not member_id.strip():
@@ -1042,11 +1130,7 @@ class FirstPersonStateStore:
         existing (bounded) entries, keeps at most one per member_id, adds/
         replaces this member's own entry, and if that leaves more than
         ``_JOURNAL_MAX_ENTRIES`` distinct members, drops the OLDEST (by
-        ``completed_at``) first -- same bounded-cache discipline as
-        ``_StatusCache``/``_NotifyOncePerWindow``. Written back atomically
-        (temp file + fsync + rename), same shape as the main store's own
-        ``save``.
-        """
+        ``completed_at``) first (see :func:`_write_bounded_jsonl`)."""
         try:
             entries = self._read_journal_entries()
             entries[member_id] = {
@@ -1054,28 +1138,7 @@ class FirstPersonStateStore:
                 "proposal_id": proposal_id,
                 "completed_at": completed_at,
             }
-            if len(entries) > _JOURNAL_MAX_ENTRIES:
-                oldest_first = sorted(entries.values(), key=lambda entry: entry.get("completed_at", 0.0))
-                for stale in oldest_first[: len(entries) - _JOURNAL_MAX_ENTRIES]:
-                    entries.pop(stale["member_id"], None)
-
-            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            temporary = self.journal_path.with_suffix(self.journal_path.suffix + ".tmp")
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    for entry in entries.values():
-                        handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True))
-                        handle.write("\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, self.journal_path)
-                os.chmod(self.journal_path, 0o600)
-            finally:
-                try:
-                    temporary.unlink()
-                except FileNotFoundError:
-                    pass
+            _write_bounded_jsonl(self.journal_path, entries, sort_key="completed_at")
         except OSError:
             pass
 
@@ -1086,6 +1149,34 @@ class FirstPersonStateStore:
             return None
         candidate = entry.get("proposal_id")
         return candidate.strip() if isinstance(candidate, str) and candidate.strip() else None
+
+    def record_stall(self, member_id: str, retry_count: int, stalled_at: float) -> None:
+        """Round-3-gate-4 P1-a: durable, compacted-on-write breadcrumb that
+        a proposal has stalled long enough to need human follow-up. This is
+        NOT the primary flag mechanism (see :func:`_stall_reply`'s
+        ``task_create`` call) -- it is the audit trail that survives even
+        if the task_create call itself fails, and the thing that makes
+        ``_PROPOSAL_STALLED_REPLY_FLAG_FAILED``'s honesty possible (an
+        operator can still find every stall here). Never raises."""
+        try:
+            entries: dict[str, dict[str, Any]] = {}
+            for entry in _read_bounded_jsonl(self.stall_path):
+                candidate_id = entry.get("member_id")
+                if isinstance(candidate_id, str) and candidate_id.strip():
+                    entries[candidate_id] = entry
+            entries[member_id] = {"member_id": member_id, "retry_count": retry_count, "stalled_at": stalled_at}
+            _write_bounded_jsonl(self.stall_path, entries, sort_key="stalled_at")
+        except OSError:
+            pass
+
+    def stall_entries(self) -> dict[str, dict[str, Any]]:
+        """Read-only view of the durable stall breadcrumbs, for tests/audit."""
+        entries: dict[str, dict[str, Any]] = {}
+        for entry in _read_bounded_jsonl(self.stall_path):
+            member_id = entry.get("member_id")
+            if isinstance(member_id, str) and member_id.strip():
+                entries[member_id] = entry
+        return entries
 
 
 def default_state_path() -> Path:
@@ -1155,6 +1246,42 @@ class FirstPersonRuntime:
         self.store = FirstPersonStateStore(state_path)
         self._clock = clock
         self._wall_clock = wall_clock
+        # Round-3-gate-4 P1-b: a single non-pending (`'none'`/`'complete'`)
+        # reading is never enough to durably prune a member's in-progress
+        # record -- see note_non_pending/note_pending below.
+        self._terminal_sightings: "OrderedDict[str, float]" = OrderedDict()
+
+    def wall_now(self) -> float:
+        return self._wall_clock()
+
+    def note_non_pending(self, member_id: str) -> bool:
+        """Round-3-gate-4 P1-b: a transient status flap (a completion-
+        detection race, or a server-side bug) reporting 'complete' or
+        'none' for one message and 'pending' again the next must NEVER
+        destroy durable in-progress engrams on that single reading --
+        exactly the round-3-gate-3 P0 trigger (c) landmine, just one level
+        earlier: pruning immediately on the FIRST non-pending reading is
+        itself un-confirmed. Returns True (CONFIRMED) only on the SECOND
+        consecutive non-pending reading for this member since the last
+        pending one; the first reading is recorded and returns False
+        (caller must leave the local AND durable record untouched -- a
+        flap back to 'pending' before confirmation must resume with every
+        engram intact, never re-ask an already-answered question)."""
+        with self._lock:
+            if member_id in self._terminal_sightings:
+                del self._terminal_sightings[member_id]
+                return True
+            self._terminal_sightings[member_id] = self._clock()
+            while len(self._terminal_sightings) > 2048:
+                self._terminal_sightings.popitem(last=False)
+            return False
+
+    def note_pending(self, member_id: str) -> None:
+        """A genuine, member-matched 'pending' reading resets any partial
+        (unconfirmed) non-pending sighting recorded above -- a flap-back
+        is not evidence toward a future confirmation."""
+        with self._lock:
+            self._terminal_sightings.pop(member_id, None)
 
     def is_complete_or_unknown(self, member_id: str) -> bool:
         """Round-2 P1-4 + Athena's round-2 condition (ii): fail CLOSED on an
@@ -1220,7 +1347,7 @@ class FirstPersonRuntime:
         # main store is fixed/replaced.
         return self.store.read_journal_proposal_id(member_id)
 
-    def _load_in_progress_state(self, member_id: str) -> tuple[dict[str, str], str | None]:
+    def _load_in_progress_state(self, member_id: str) -> tuple[dict[str, str], str | None, int]:
         """Durable, best-effort read of everything :meth:`start` needs to
         resume -- the {question_id: engram_id} map AND ``project_id`` --
         round-3-gate-2 P0/Athena's RESUME REBINDS: lets :meth:`start` resume
@@ -1240,19 +1367,30 @@ class FirstPersonRuntime:
         BOTH the answer for a question and (once past it) the project_id
         that answer resolved to, or neither.
 
+        Round-3-gate-4 P3-b: ``proposal_retry_count`` is now part of the
+        same durable record too -- without it, an idle-drop-then-resume (or
+        a process restart) during the retry-wait phase silently reset the
+        backoff counter to 0, letting a member's repeated idle-triggered
+        resumes hammer a known-failing submission far more often than the
+        backoff table intends. ``next_proposal_retry_at`` itself is NOT
+        persisted -- it is a ``time.monotonic()`` value, meaningless across
+        a process restart (a fresh process has its own monotonic epoch);
+        :meth:`start` recomputes a fresh backoff window from the restored
+        ``proposal_retry_count`` instead of trusting a stale timestamp.
+
         Never raises; a corrupted store just degrades this specific
         member's resume to "start over" (the durable proposal-dedupe
         guarantee in held_proposal_id/is_complete_or_unknown is unaffected
         -- this method is purely a UX aid, not a security-relevant gate)."""
         data, valid = self.store.load_checked()
         if not valid:
-            return {}, None
+            return {}, None, 0
         in_progress = data.get("in_progress")
         if not isinstance(in_progress, dict) or member_id not in in_progress:
-            return {}, None
+            return {}, None, 0
         entry = in_progress[member_id]
         if not isinstance(entry, dict):
-            return {}, None
+            return {}, None, 0
         raw_engrams = entry.get("engram_ids")
         engrams = (
             {
@@ -1265,9 +1403,15 @@ class FirstPersonRuntime:
         )
         raw_project_id = entry.get("project_id")
         project_id = raw_project_id.strip() if isinstance(raw_project_id, str) and raw_project_id.strip() else None
-        return engrams, project_id
+        raw_retry_count = entry.get("proposal_retry_count")
+        retry_count = (
+            raw_retry_count if isinstance(raw_retry_count, int) and not isinstance(raw_retry_count, bool) and raw_retry_count >= 0 else 0
+        )
+        return engrams, project_id, retry_count
 
-    def _save_in_progress(self, member_id: str, engrams: dict[str, str], project_id: str | None) -> None:
+    def _save_in_progress(
+        self, member_id: str, engrams: dict[str, str], project_id: str | None, proposal_retry_count: int
+    ) -> None:
         """Sender-scoped, validity-gated (round-3-gate-2 P1 :931 discipline
         applied here too): read, validate, merge ONLY this member's
         in-progress record, write. On an invalid read this is a best-effort
@@ -1279,7 +1423,8 @@ class FirstPersonRuntime:
         Round-3-gate-3 P0: ``project_id`` is now written alongside
         ``engrams`` on every call, not only the engram map -- see
         :meth:`_load_in_progress_state`'s docstring for why a partial write
-        of just one of the two is itself the defect class."""
+        of just one of the two is itself the defect class. Round-3-gate-4
+        P3-b: ``proposal_retry_count`` is written the same way."""
         data, valid = self.store.load_checked()
         if not valid:
             return
@@ -1289,6 +1434,7 @@ class FirstPersonRuntime:
         in_progress[member_id] = {
             "engram_ids": dict(engrams),
             "project_id": project_id,
+            "proposal_retry_count": proposal_retry_count,
             "updated_at": self._wall_clock(),
         }
         data["in_progress"] = in_progress
@@ -1399,9 +1545,23 @@ class FirstPersonRuntime:
         older build, or a torn write). Rather than manufacture "all
         questions answered, no project" -- a state the forward path can
         never produce -- this clamps back to the project question so the
-        very next answer re-resolves it (self-healing; the project engram
-        already on disk is simply overwritten, which is always safe)."""
-        prior_engrams, prior_project_id = self._load_in_progress_state(member_id)
+        very next answer re-resolves it.
+
+        Round-3-gate-4 P2-a (correcting a round-3-gate-3 bug): the clamp
+        must NOT drop the "project" question's own already-recorded
+        engram_id from the resumed ``engrams``. ``squad_remember`` is an
+        INSERT, never an upsert -- the round-3-gate-3 comment claiming the
+        old engram is "simply overwritten" on re-answer was FALSE: nothing
+        anywhere deletes the prior engram, so re-recording on the re-answer
+        would leave a permanent DUPLICATE in squad memory while this
+        record's own view of it (the engram_id kept here) just moves on.
+        The engram_id is kept in ``engrams`` (even though ``index`` itself
+        reverts to point AT the project question, not past it) precisely so
+        :func:`_handle_answer` can detect "this question already has a
+        recorded engram" and reuse it -- re-deriving only ``project_id``
+        from the fresh answer, never calling ``squad_remember`` again for a
+        question already on disk."""
+        prior_engrams, prior_project_id, prior_retry_count = self._load_in_progress_state(member_id)
         index = 0
         for question_id, _ in FIRST_PERSON_QUESTIONS:
             if question_id in prior_engrams:
@@ -1414,12 +1574,32 @@ class FirstPersonRuntime:
             None,
         )
         project_id = prior_project_id
+        engram_prefix_index = index
         if project_question_index is not None and index > project_question_index and project_id is None:
             index = project_question_index
             project_id = None
+            # Keep engrams through the project question INCLUSIVE -- see
+            # the docstring above. Everything strictly after "project" is
+            # still dropped: those questions were only reachable in the
+            # forward path once project_id existed, so an engram recorded
+            # for one of them without a project_id ever having existed
+            # would itself be a shape the forward path cannot produce.
+            engram_prefix_index = project_question_index + 1
 
-        engrams = {question_id: prior_engrams[question_id] for question_id, _ in FIRST_PERSON_QUESTIONS[:index]}
+        engrams = {
+            question_id: prior_engrams[question_id] for question_id, _ in FIRST_PERSON_QUESTIONS[:engram_prefix_index]
+        }
         now = self._clock()
+        # Round-3-gate-4 P3-b: restore proposal_retry_count directly (a
+        # plain counter, safe across a restart) but recompute
+        # next_proposal_retry_at from it via a FRESH backoff window from
+        # `now` -- the durable record deliberately never carries the raw
+        # monotonic timestamp, which would be meaningless once resumed in a
+        # different process (a fresh process has its own monotonic epoch).
+        # Only meaningful once every question is answered; harmless
+        # (unused) otherwise.
+        retry_count = prior_retry_count if index >= len(FIRST_PERSON_QUESTIONS) else 0
+        next_retry_at = now + _next_backoff(retry_count) if retry_count > 0 else 0.0
         intake = Intake(
             member_id=member_id,
             home_squad_id=home_squad_id,
@@ -1428,6 +1608,8 @@ class FirstPersonRuntime:
             engrams=engrams,
             created_at=now,
             last_activity_at=now,
+            proposal_retry_count=retry_count,
+            next_proposal_retry_at=next_retry_at,
         )
         with self._lock:
             self._pending[chat_key] = intake
@@ -1456,7 +1638,7 @@ class FirstPersonRuntime:
                 last_activity_at=self._clock(),
             )
             self._pending[chat_key] = updated
-        self._save_in_progress(updated.member_id, updated.engrams, updated.project_id)
+        self._save_in_progress(updated.member_id, updated.engrams, updated.project_id, updated.proposal_retry_count)
         return updated
 
     def set_project_id(self, chat_key: str, project_id: str) -> Intake | None:
@@ -1476,19 +1658,25 @@ class FirstPersonRuntime:
                 return None
             updated = replace(intake, project_id=project_id)
             self._pending[chat_key] = updated
-        self._save_in_progress(updated.member_id, updated.engrams, updated.project_id)
+        self._save_in_progress(updated.member_id, updated.engrams, updated.project_id, updated.proposal_retry_count)
         return updated
 
     def schedule_proposal_retry(self, chat_key: str, *, next_retry_at: float, retry_count: int) -> Intake | None:
         """Same replace-in-place shape as :meth:`record_answer`, for the
-        proposal-retry backoff pair (round-2 P0-3)."""
+        proposal-retry backoff pair (round-2 P0-3).
+
+        Round-3-gate-4 P3-b: ``proposal_retry_count`` is now ALSO durably
+        persisted (``next_proposal_retry_at`` deliberately is not -- it is
+        a ``time.monotonic()`` value with no meaning across a process
+        restart; see :meth:`start`'s recompute logic)."""
         with self._lock:
             intake = self._pending.get(chat_key)
             if intake is None:
                 return None
             updated = replace(intake, next_proposal_retry_at=next_retry_at, proposal_retry_count=retry_count)
             self._pending[chat_key] = updated
-            return updated
+        self._save_in_progress(updated.member_id, updated.engrams, updated.project_id, updated.proposal_retry_count)
+        return updated
 
     def finish(self, chat_key: str, *, proposal_id: str | None) -> None:
         """Round-3-gate-2 P1 (:931): sender-scoped and validity-gated. On an
@@ -1799,6 +1987,8 @@ async def _handle_answer(
     settings: FirstPersonSettings,
     envelope: Mapping[str, Any],
     secret_owner: ProfileSecretOwner | None = None,
+    clock: Any = time.monotonic,
+    stalled_notifier: "_NotifyOncePerWindow | None" = None,
 ) -> bool:
     """Returns True iff this message was actually consumed by first-person
     (the caller's ``handle_first_contact`` should report ``True``/stop
@@ -1865,6 +2055,29 @@ async def _handle_answer(
             return True  # race: pending vanished (TTL/abandon) mid-resolution
         intake = updated
 
+    existing_engram_id = intake.engrams.get(question_id)
+    if existing_engram_id is not None:
+        # Round-3-gate-4 P2-a: this question ALREADY has a recorded engram
+        # -- reachable only via FirstPersonRuntime.start()'s resume clamp,
+        # which deliberately keeps the "project" question's prior engram_id
+        # even though it reverts `index` to re-ask that question (see its
+        # docstring). squad_remember is an INSERT, never an upsert -- there
+        # is no delete/update path for the OLD engram anywhere in this
+        # module or the mupot side, so calling remember() again here would
+        # leave a permanent duplicate answer in squad memory. Reuse the
+        # existing engram_id and simply advance -- only project_id itself
+        # (above) is re-derived from the fresh answer.
+        updated = runtime.record_answer(chat_key, question_id, existing_engram_id)
+        if updated is None:
+            return True  # race: pending vanished (TTL/abandon) mid-write
+        if updated.index >= len(FIRST_PERSON_QUESTIONS):
+            await _submit_proposal(
+                message, chat_key, updated, client=client, runtime=runtime, clock=clock, stalled_notifier=stalled_notifier
+            )
+            return True
+        await message.reply_text(FIRST_PERSON_QUESTIONS[updated.index][1])
+        return True
+
     def remember() -> dict[str, Any]:
         return client.call(
             "squad_remember",
@@ -1896,26 +2109,98 @@ async def _handle_answer(
         return True
 
     if updated.index >= len(FIRST_PERSON_QUESTIONS):
-        await _submit_proposal(message, chat_key, updated, client=client, runtime=runtime)
+        # Round-3-gate-4 P3-d: this call was missing `stalled_notifier` --
+        # the very FIRST submission attempt (right after the 5th answer)
+        # would always use the un-rate-limited default, meaning the fresh-
+        # completion path and the retry-wait path could each maintain their
+        # own independent "have I notified" state for the SAME member.
+        await _submit_proposal(
+            message, chat_key, updated, client=client, runtime=runtime, clock=clock, stalled_notifier=stalled_notifier
+        )
         return True
     await message.reply_text(FIRST_PERSON_QUESTIONS[updated.index][1])
     return True
 
 
-def _proposal_failure_reply(
-    *, retry_count: int, member_id: str, stalled_notifier: "_NotifyOncePerWindow | None"
+async def _stall_reply(
+    *,
+    retry_count: int,
+    member_id: str,
+    project_id: str | None,
+    client: MupotOperatorClient,
+    runtime: FirstPersonRuntime,
+    stalled_notifier: "_NotifyOncePerWindow | None",
 ) -> str:
-    """Round-3-gate-3 / Athena's ruling (4): the DEFECT is the reply shape
-    when the server keeps rejecting a submission (today, always: the live
-    schema has no project_access kind), not the rejection itself -- an
-    unbounded repeat of the same "I'll try again" line forever reads as a
-    permanent loop. Once the retry backoff table is exhausted, switch to the
-    distinct, honest _PROPOSAL_STALLED_REPLY -- rate-limited on its own
-    window so it, too, is never repeated on every single message."""
-    if retry_count >= _PROPOSAL_STALLED_AFTER_ATTEMPTS:
-        if stalled_notifier is None or stalled_notifier.should_notify(member_id):
-            return _PROPOSAL_STALLED_REPLY
-    return _PROPOSAL_FAILED_REPLY
+    """Round-3-gate-3 / Athena's ruling (4), corrected round-3-gate-4 P1-a:
+    the DEFECT when the server keeps rejecting a submission (today, always
+    -- the live schema has no project_access kind) is the reply shape, not
+    the rejection itself. An unbounded repeat of "I'll try again" forever
+    reads as a permanent loop; sending "I've flagged it so a human can
+    look" with NO receiver anywhere is fabricating a receipt on a human-
+    decision channel -- exactly what the round-3-gate-3 build did.
+
+    Once the retry backoff table is exhausted, this creates a REAL
+    ``task_create`` item in this operator's own squad (never the member's
+    home squad -- see mupot_operator.FIRST_PERSON_ACTIONS's note on why
+    this is not a manage_access surface), correlated with a deterministic
+    ``request_id`` and the durable stall marker below, and returns the
+    reply that matches what ACTUALLY happened: the flagged line only if
+    the task really was created, an honest "couldn't reach the team"
+    line if it wasn't. The escalation itself (and any WARNING/task_create
+    call) is rate-limited via ``stalled_notifier`` to at most once per
+    ``_PROPOSAL_STALLED_REPLY_WINDOW_SECONDS`` -- round-3-gate-4 P3-a:
+    every OTHER check-in during that window gets
+    ``_PROPOSAL_STILL_STALLED_REPLY``, NEVER a revert to the unbounded
+    ``_PROPOSAL_FAILED_REPLY``/``_PROPOSAL_RETRY_WAIT_REPLY`` pair used
+    before the threshold."""
+    if retry_count < _PROPOSAL_STALLED_AFTER_ATTEMPTS:
+        return _PROPOSAL_FAILED_REPLY
+    if stalled_notifier is not None and not stalled_notifier.should_notify(member_id):
+        return _PROPOSAL_STILL_STALLED_REPLY
+
+    request_id = hashlib.sha256(f"first-person-stall:{member_id}:{retry_count}".encode("utf-8")).hexdigest()[:32]
+    runtime.store.record_stall(member_id, retry_count, runtime.wall_now())
+
+    def create_task() -> dict[str, Any]:
+        return client.call(
+            "task_create",
+            {
+                "squad_id": client.settings.squad_id,
+                "assignee_agent_id": client.settings.agent_id,
+                "title": f"First-person intake stalled for member_id={member_id}",
+                "done_when": (
+                    "A human has reviewed why routine_proposal_submit keeps rejecting this "
+                    "member's project-access proposal and either fixed the mupot-side contract "
+                    "gap or manually completed the intake."
+                ),
+                "body": f"request_id={request_id} retry_count={retry_count} project_id={project_id}",
+            },
+        )
+
+    try:
+        response = await asyncio.to_thread(create_task)
+    except Exception as exc:
+        response = {"ok": False, "error": type(exc).__name__}
+
+    flagged = isinstance(response, dict) and response.get("ok") is True
+    if flagged:
+        logger.warning(
+            "mupot plugin: first-person proposal STALLED member_id=%s retry_count=%d "
+            "request_id=%s -- flagged via task_create",
+            member_id,
+            retry_count,
+            request_id,
+        )
+        return _PROPOSAL_STALLED_REPLY
+    logger.warning(
+        "mupot plugin: first-person proposal STALLED member_id=%s retry_count=%d "
+        "request_id=%s -- task_create FAILED error=%s (durable stall marker recorded)",
+        member_id,
+        retry_count,
+        request_id,
+        response.get("error") if isinstance(response, dict) else "unknown",
+    )
+    return _PROPOSAL_STALLED_REPLY_FLAG_FAILED
 
 
 async def _submit_proposal(
@@ -1948,7 +2233,14 @@ async def _submit_proposal(
             retry_count=retry_count,
         )
         await message.reply_text(
-            _proposal_failure_reply(retry_count=retry_count, member_id=intake.member_id, stalled_notifier=stalled_notifier)
+            await _stall_reply(
+                retry_count=retry_count,
+                member_id=intake.member_id,
+                project_id=project_id,
+                client=client,
+                runtime=runtime,
+                stalled_notifier=stalled_notifier,
+            )
         )
         return
 
@@ -2015,7 +2307,14 @@ async def _submit_proposal(
             retry_count=retry_count,
         )
         await message.reply_text(
-            _proposal_failure_reply(retry_count=retry_count, member_id=intake.member_id, stalled_notifier=stalled_notifier)
+            await _stall_reply(
+                retry_count=retry_count,
+                member_id=intake.member_id,
+                project_id=project_id,
+                client=client,
+                runtime=runtime,
+                stalled_notifier=stalled_notifier,
+            )
         )
         return
 
@@ -2044,13 +2343,18 @@ async def _retry_proposal_if_due(
         # Athena's ruling (4): the same bounded/escalating reply shape as an
         # actual failed attempt -- a check-in during backoff must not repeat
         # the plain wait line forever once the backoff table is exhausted.
-        await message.reply_text(
-            _proposal_failure_reply(
-                retry_count=intake.proposal_retry_count, member_id=intake.member_id, stalled_notifier=stalled_notifier
+        if intake.proposal_retry_count >= _PROPOSAL_STALLED_AFTER_ATTEMPTS:
+            reply = await _stall_reply(
+                retry_count=intake.proposal_retry_count,
+                member_id=intake.member_id,
+                project_id=intake.project_id,
+                client=client,
+                runtime=runtime,
+                stalled_notifier=stalled_notifier,
             )
-            if intake.proposal_retry_count >= _PROPOSAL_STALLED_AFTER_ATTEMPTS
-            else _PROPOSAL_RETRY_WAIT_REPLY
-        )
+        else:
+            reply = _PROPOSAL_RETRY_WAIT_REPLY
+        await message.reply_text(reply)
         return
     await _submit_proposal(
         message, chat_key, intake, client=client, runtime=runtime, clock=clock, stalled_notifier=stalled_notifier
@@ -2071,6 +2375,7 @@ async def handle_first_contact(
     lag_reply_notifier: "_NotifyOncePerWindow | None" = None,
     home_wait_notifier: "_NotifyOncePerWindow | None" = None,
     stalled_notifier: "_NotifyOncePerWindow | None" = None,
+    clock: Any = time.monotonic,
 ) -> bool:
     """Handle one inbound Telegram update for the first-person flow.
 
@@ -2119,6 +2424,21 @@ async def handle_first_contact(
     # see the `cache=` argument below.
     pending = runtime.get_pending(chat_key)
 
+    # Round-3-gate-4 P0: a sender-limiter denial for a member who already
+    # has a live pending record is not "no information" -- we necessarily
+    # probed successfully for this exact member very recently (that is WHY
+    # the limiter is now denying a repeat so soon), so the safe, bounded
+    # fallback is "assume still pending, same identity" for the length of
+    # the limiter's own short window, never "unknown, hold". A stranger (no
+    # local pending record) gets no fallback and keeps the old fail-safe.
+    fallback = (
+        StatusResolution(
+            bound=True, member_id=pending.member_id, home_squad_id=pending.home_squad_id, intake_state="pending"
+        )
+        if pending is not None
+        else None
+    )
+
     def resolve() -> StatusResolution:
         return resolve_member_status(
             settings,
@@ -2139,6 +2459,7 @@ async def handle_first_contact(
             cache=None if pending is not None else status_cache,
             probe_limiter=probe_limiter,
             sender_limiter=sender_probe_limiter,
+            fallback=fallback,
         )
 
     status = await asyncio.to_thread(resolve)
@@ -2153,17 +2474,30 @@ async def handle_first_contact(
             # message re-probes (see the cache bypass above).
             return False
         # Unbound, or a DEFINITIVE 'none'/'complete' -- fail-safe for the
-        # intake: never consumed, the host handler owns the turn. Drop any
-        # stale local record; store nothing.
+        # intake: never consumed, the host handler owns the turn.
         if pending is not None:
-            runtime.abandon(chat_key)
+            # Round-3-gate-4 P1-b: prune the local AND durable record only
+            # once CONFIRMED (a second consecutive non-pending reading) --
+            # a single reading leaves everything exactly as it is, so a
+            # flap back to 'pending' next message resumes with every
+            # engram intact.
+            if runtime.note_non_pending(pending.member_id):
+                runtime.abandon(chat_key)
         return False
 
     if pending is not None and pending.member_id != status.member_id:
         # A different member now resolves for this chat (e.g. a rebind) --
-        # never carry progress across identities.
+        # never carry progress across identities. This IS itself the
+        # confirming signal (the SAME probe that just gave us status.
+        # member_id also tells us it isn't pending.member_id) -- no second
+        # reading needed.
         runtime.abandon(chat_key)
         pending = None
+
+    if pending is not None:
+        # A genuine, member-matched 'pending' reading -- reset any partial
+        # non-pending sighting from a prior flap (round-3-gate-4 P1-b).
+        runtime.note_pending(pending.member_id)
 
     if pending is None:
         held_proposal_id = runtime.held_proposal_id(status.member_id)
@@ -2230,12 +2564,20 @@ async def handle_first_contact(
         # answered record uses below, never index past the last question.
         if started.index >= len(FIRST_PERSON_QUESTIONS):
             pending_text = getattr(message, "text", None)
+            if _is_escape_text(pending_text):
+                # Round-3-gate-4 P2-b: an escape word must pause the
+                # retry-wait loop too, not just a mid-question turn.
+                runtime.touch(chat_key)
+                await message.reply_text(_PAUSED_REPLY)
+                return True
             if isinstance(pending_text, str) and is_verdict_shaped(pending_text):
                 # Round-3-gate-2 P2 (:1455-1458): never captured even here --
                 # the host owns a genuine approve/reject regardless of where
                 # this member's OWN intake happens to be.
                 return False
-            await _retry_proposal_if_due(message, chat_key, started, client=client, runtime=runtime, stalled_notifier=stalled_notifier)
+            await _retry_proposal_if_due(
+                message, chat_key, started, client=client, runtime=runtime, clock=clock, stalled_notifier=stalled_notifier
+            )
             return True
         # Round-3-gate-2 P0 / Athena's RESUME REBINDS: ask the FIRST
         # UNANSWERED question. This message itself is the trigger that
@@ -2246,18 +2588,26 @@ async def handle_first_contact(
 
     if pending.index >= len(FIRST_PERSON_QUESTIONS):
         pending_text = getattr(message, "text", None)
+        if _is_escape_text(pending_text):
+            # Round-3-gate-4 P2-b: same fix as the resume branch above.
+            runtime.touch(chat_key)
+            await message.reply_text(_PAUSED_REPLY)
+            return True
         if isinstance(pending_text, str) and is_verdict_shaped(pending_text):
             # Round-3-gate-2 P2 (:1455-1458): never captured even in the
             # proposal-retry-wait phase -- the host owns a genuine
             # approve/reject regardless of where this member's OWN intake
             # happens to be.
             return False
-        await _retry_proposal_if_due(message, chat_key, pending, client=client, runtime=runtime, stalled_notifier=stalled_notifier)
+        await _retry_proposal_if_due(
+            message, chat_key, pending, client=client, runtime=runtime, clock=clock, stalled_notifier=stalled_notifier
+        )
         return True
 
     handled = await _handle_answer(
         message, chat_key, pending, client=client, runtime=runtime,
         settings=settings, envelope=envelope, secret_owner=secret_owner,
+        clock=clock, stalled_notifier=stalled_notifier,
     )
     return handled
 

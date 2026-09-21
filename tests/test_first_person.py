@@ -41,8 +41,11 @@ from plugin.first_person import (
     _PENDING_ABSOLUTE_TTL_SECONDS,
     _PENDING_IDLE_TTL_SECONDS,
     _PROPOSAL_FAILED_REPLY,
+    _PROPOSAL_RETRY_WAIT_REPLY,
     _PROPOSAL_STALLED_AFTER_ATTEMPTS,
     _PROPOSAL_STALLED_REPLY,
+    _PROPOSAL_STALLED_REPLY_FLAG_FAILED,
+    _PROPOSAL_STILL_STALLED_REPLY,
     _NotifyOncePerWindow,
     _ProbeLimiter,
     _SenderProbeLimiter,
@@ -154,6 +157,11 @@ class FakeClient:
     def __init__(self, responses: dict[str, Any] | None = None) -> None:
         self.responses = responses or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        # Round-3-gate-4 P1-a: _stall_reply reads client.settings.squad_id /
+        # .agent_id to build the task_create payload -- a real
+        # MupotOperatorClient always has these; this stand-in mirrors the
+        # shape.
+        self.settings = types.SimpleNamespace(squad_id="squad-test", agent_id="agent-test")
 
     def call(self, action: str, args: dict[str, Any]) -> Any:
         self.calls.append((action, dict(args)))
@@ -204,7 +212,15 @@ def install_status_stub(
     format (that gets its own dedicated tests below)."""
 
     def fake_resolve(
-        settings, user_id, chat_id, *, secret_owner=None, cache=None, probe_limiter=None, sender_limiter=None
+        settings,
+        user_id,
+        chat_id,
+        *,
+        secret_owner=None,
+        cache=None,
+        probe_limiter=None,
+        sender_limiter=None,
+        fallback=None,
     ):
         return resolver(user_id, chat_id)
 
@@ -536,14 +552,20 @@ async def test_unbind_mid_intake_drops_pending_and_stores_nothing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Round-2 P1-3: every answer re-checks bound/intake_state; an unbind
-    between messages must drop the local record, not keep writing to it."""
+    between messages must eventually drop the local record, not keep
+    writing to it.
+
+    Round-3-gate-4 P1-b: a SINGLE unbind reading is never enough (the same
+    rule as a 'complete' flap -- see the trigger-c tests) -- it survives
+    the first reading untouched, and is confirmed-and-dropped only on the
+    SECOND CONSECUTIVE unbind reading."""
     call_count = {"n": 0}
 
     def resolver(_user_id: Any, _chat_id: Any) -> StatusResolution:
         call_count["n"] += 1
         if call_count["n"] == 1:
             return pending_status()
-        return UNBOUND_STATUS  # unbound on the very next message
+        return UNBOUND_STATUS  # unbound from the second message on
 
     install_status_stub(monkeypatch, resolver)
     client = FakeClient()
@@ -553,17 +575,21 @@ async def test_unbind_mid_intake_drops_pending_and_stores_nothing(
     )
     assert runtime.get_pending("123") is not None
 
-    second_update = Update(message=Message(text="Ada Example"))
-    handled = await handle_first_contact(
-        second_update, settings=valid_settings(), client=client, runtime=runtime
-    )
-
+    first_unbind = Update(message=Message(text="Ada Example"))
+    handled = await handle_first_contact(first_unbind, settings=valid_settings(), client=client, runtime=runtime)
     assert handled is False
-    assert runtime.get_pending("123") is None
+    assert runtime.get_pending("123") is not None  # NOT dropped on a single reading
+    assert not any(action == "squad_remember" for action, _ in client.calls)
+    assert first_unbind.effective_message.replies == []
+
+    second_unbind = Update(message=Message(text="anything"))
+    handled = await handle_first_contact(second_unbind, settings=valid_settings(), client=client, runtime=runtime)
+    assert handled is False
+    assert runtime.get_pending("123") is None  # CONFIRMED (2nd consecutive reading) -- now dropped
     assert not any(action == "squad_remember" for action, _ in client.calls)
     # Athena round-2 (v): an unbind mid-intake must not claim any progress --
     # no reply at all, not even an honest-sounding one.
-    assert second_update.effective_message.replies == []
+    assert second_unbind.effective_message.replies == []
 
 
 @pytest.mark.asyncio
@@ -986,7 +1012,10 @@ async def test_proposal_failure_reply_becomes_stalled_and_rate_limited_after_bac
     _PROPOSAL_FAILED_REPLY/_PROPOSAL_RETRY_WAIT_REPLY forever) makes this go
     red -- the member would keep seeing the identical line with no
     escalation, indefinitely. Also proves the escalation reply itself is
-    rate-limited, not repeated on every single post-exhaustion attempt."""
+    rate-limited (never repeated on every single post-exhaustion attempt)
+    WITHOUT reverting to the pre-stall _PROPOSAL_FAILED_REPLY (round-3-
+    gate-4 P3-a) -- every rate-limited repeat gets the distinct
+    _PROPOSAL_STILL_STALLED_REPLY instead."""
     fake_clock = {"now": 0.0}
     fake_wall_clock = {"now": 0.0}
     runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
@@ -1020,11 +1049,22 @@ async def test_proposal_failure_reply_becomes_stalled_and_rate_limited_after_bac
 
     # Before exhaustion: the plain failed-attempt reply, every time. After
     # exhaustion, the distinct stalled reply fires -- but only ONCE within
-    # the notifier's window, never on every subsequent attempt.
+    # the notifier's window; every OTHER post-exhaustion attempt gets the
+    # STILL-stalled line, never a revert to the pre-stall failed reply
+    # (round-3-gate-4 P3-a).
     assert seen_replies.count(_PROPOSAL_STALLED_REPLY) == 1
     stalled_first_index = seen_replies.index(_PROPOSAL_STALLED_REPLY)
     assert all(reply == _PROPOSAL_FAILED_REPLY for reply in seen_replies[:stalled_first_index])
-    assert all(reply == _PROPOSAL_FAILED_REPLY for reply in seen_replies[stalled_first_index + 1 :])
+    assert all(reply == _PROPOSAL_STILL_STALLED_REPLY for reply in seen_replies[stalled_first_index + 1 :])
+
+    # A real task_create was actually made -- the receiver that makes
+    # "I've flagged it" true (round-3-gate-4 P1-a).
+    task_calls = [args for action, args in client.calls if action == "task_create"]
+    assert len(task_calls) == 1
+    assert task_calls[0]["squad_id"] == "squad-test"
+    assert "member-1" in task_calls[0]["title"]
+    stall_entries = runtime.store.stall_entries()
+    assert "member-1" in stall_entries
 
     # Advance the WALL clock (the notifier's own clock) past the window --
     # the very next exhausted attempt escalates again.
@@ -1038,6 +1078,50 @@ async def test_proposal_failure_reply_becomes_stalled_and_rate_limited_after_bac
     completed = json.loads(state_path.read_text()).get("completed", {}) if state_path.exists() else {}
     assert "member-1" not in completed
     assert runtime.get_pending("123") is not None
+
+
+@pytest.mark.asyncio
+async def test_stall_reply_is_honest_when_the_flag_call_itself_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round-3-gate-4 P1-a: if the task_create escalation call itself
+    fails, the member must NEVER be told "I've flagged it" (a fabricated
+    receipt) -- the distinct, honest _PROPOSAL_STALLED_REPLY_FLAG_FAILED is
+    used instead. The durable stall marker is still recorded regardless
+    (the audit trail survives even when the live receiver doesn't)."""
+
+    class _RejectingTaskCreateClient(FakeClient):
+        def call(self, action: str, args: dict[str, Any]) -> Any:
+            self.calls.append((action, dict(args)))
+            if action not in FIRST_PERSON_ACTIONS:
+                return {"ok": False, "error": "action_not_allowed"}
+            if action == "squad_remember":
+                return {"ok": True, "result": {"engram_id": f"engram-{len(self.calls)}"}}
+            if action == "task_create":
+                return {"ok": False, "error": "squad_not_found"}
+            return {"ok": False, "error": "unsupported_action_kind"}
+
+    fake_clock = {"now": 0.0}
+    runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
+    client = _RejectingTaskCreateClient()
+    install_status_stub(monkeypatch, lambda *_: pending_status())
+    monkeypatch.setattr("plugin.first_person._resolve_member_project", _default_project_resolver)
+    settings = valid_settings()
+
+    answers = ["Ada Example", "Engineer", "psychonom", "Ship it", "Nothing else"]
+    await handle_first_contact(Update(message=Message(text="hello!")), settings=settings, client=client, runtime=runtime)
+    for answer in answers:
+        await handle_first_contact(Update(message=Message(text=answer)), settings=settings, client=client, runtime=runtime)
+
+    for _ in range(_PROPOSAL_STALLED_AFTER_ATTEMPTS):
+        pending = runtime.get_pending("123")
+        runtime.schedule_proposal_retry("123", next_retry_at=fake_clock["now"], retry_count=pending.proposal_retry_count)
+        update = Update(message=Message(text="checking in"))
+        await handle_first_contact(update, settings=settings, client=client, runtime=runtime)
+
+    assert update.effective_message.replies[-1] == _PROPOSAL_STALLED_REPLY_FLAG_FAILED
+    assert update.effective_message.replies[-1] != _PROPOSAL_STALLED_REPLY  # never the fabricated-receipt line
+    assert "member-1" in runtime.store.stall_entries()  # audit trail still recorded
 
 
 # ---------------------------------------------------------------------------
@@ -1345,10 +1429,10 @@ async def test_condition_v_stale_bound_cache_unbind_mid_intake_aborts_cleanly(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """(v) stale bound cache: TTL + re-resolve on every answer; an unbind
-    mid-intake ABORTS the intake and marks nothing -- drop _pending, store
-    nothing, no reply claiming progress. (Same scenario as
-    test_unbind_mid_intake_drops_pending_and_stores_nothing above, named
-    explicitly to match Athena's round-2 gate condition list.)"""
+    mid-intake ABORTS the intake (once CONFIRMED -- round-3-gate-4 P1-b, a
+    single reading is never enough, see
+    test_unbind_mid_intake_drops_pending_and_stores_nothing) and marks
+    nothing -- drop _pending, store nothing, no reply claiming progress."""
     call_count = {"n": 0}
 
     def resolver(_user_id: Any, _chat_id: Any) -> StatusResolution:
@@ -1364,14 +1448,17 @@ async def test_condition_v_stale_bound_cache_unbind_mid_intake_aborts_cleanly(
     )
     assert runtime.get_pending("123") is not None
 
-    abort_update = Update(message=Message(text="Ada Example"))
+    first_unbind = Update(message=Message(text="Ada Example"))
+    await handle_first_contact(first_unbind, settings=valid_settings(), client=client, runtime=runtime)
+    assert runtime.get_pending("123") is not None  # unconfirmed, first reading
+
+    abort_update = Update(message=Message(text="anything"))
     handled = await handle_first_contact(
         abort_update, settings=valid_settings(), client=client, runtime=runtime
     )
 
     assert handled is False
     assert runtime.get_pending("123") is None
-    assert not state_path.exists()
     assert abort_update.effective_message.replies == []
 
 
@@ -1918,6 +2005,99 @@ def test_sender_probe_limiter_denies_repeat_probes_within_the_window(monkeypatch
     assert status_other.intake_state == "pending"
 
 
+# ---------------------------------------------------------------------------
+# Round-3-gate-4 P0 (:803): a sender-limiter denial must never reuse the
+# UNKNOWN sentinel while a live pending record exists -- that routed
+# straight into handle_first_contact's "hold, do nothing" branch, silently
+# dropping an entirely normal fast-typed answer (never sanitized,
+# credential-checked, stored, or replied to) through to the host's own LLM
+# turn instead. Fix: the denial carries the caller-supplied `fallback`.
+# ---------------------------------------------------------------------------
+
+
+def test_sender_limiter_denial_returns_the_given_fallback_not_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unit-level check of the fallback wiring in resolve_member_status
+    itself. Mutation-provable: reverting the denial branch to unconditional
+    `return _UNKNOWN_STATUS` (ignoring `fallback`) makes this go red."""
+    fake_time = {"now": 0.0}
+    install_probe(monkeypatch, response=status_response_bytes())
+    limiter = _SenderProbeLimiter(min_interval=15.0, clock=lambda: fake_time["now"])
+    fallback = pending_status(member_id="member-1", home_squad_id="home-squad-1")
+
+    status1 = resolve_member_status(valid_settings(), "flooder", "flooder", sender_limiter=limiter, fallback=fallback)
+    assert status1.intake_state == "pending"
+
+    opener2 = install_probe(monkeypatch, response=status_response_bytes())
+    status2 = resolve_member_status(valid_settings(), "flooder", "flooder", sender_limiter=limiter, fallback=fallback)
+    assert status2 == fallback  # NOT _UNKNOWN_STATUS
+    assert opener2.calls == []  # still never touches the network
+
+
+@pytest.mark.asyncio
+async def test_sender_limiter_denial_for_a_pending_member_still_stores_the_answer_and_refuses_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The end-to-end round-3-gate-4 P0 finding, reproduced exactly:
+    ordinary fast typing (a second message 3s after the first, well inside
+    the sender limiter's 15s window) must still be sanitized, credential-
+    checked, stored, and replied to -- never silently dropped to the host's
+    LLM turn just because the rate-limited probe denial reused the
+    'unknown, hold' branch."""
+    fake_time = {"now": 0.0}
+    monkeypatch.setattr("plugin.first_person.read_profile_secret", lambda _name: "secret")
+    monkeypatch.setattr(
+        "plugin.first_person.build_opener",
+        lambda *_: Opener(Response(status_response_bytes(home_squad_id="home-squad-1"))),
+    )
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    sender_probe_limiter = _SenderProbeLimiter(min_interval=15.0, clock=lambda: fake_time["now"])
+    client = _client_for_full_intake()
+    settings = valid_settings()
+
+    await handle_first_contact(
+        Update(message=Message(text="hello!")),
+        settings=settings,
+        client=client,
+        runtime=runtime,
+        sender_probe_limiter=sender_probe_limiter,
+    )
+    assert runtime.get_pending("123") is not None
+
+    # msg2 at t+3s -- well inside the 15s sender-limiter window, so the
+    # probe is denied and falls back to "assume still pending, same
+    # identity". An ordinary answer must still be fully processed.
+    fake_time["now"] = 3.0
+    answer_update = Update(message=Message(text="Ada Example"))
+    handled = await handle_first_contact(
+        answer_update,
+        settings=settings,
+        client=client,
+        runtime=runtime,
+        sender_probe_limiter=sender_probe_limiter,
+    )
+    assert handled is True
+    assert answer_update.effective_message.replies == [FIRST_PERSON_QUESTIONS[1][1]]
+    remember_calls = [args for action, args in client.calls if action == "squad_remember"]
+    assert len(remember_calls) == 1 and remember_calls[0]["text"] == "Ada Example"
+    pending = runtime.get_pending("123")
+    assert pending is not None and pending.index == 1
+
+    # A credential-shaped answer at t+6s (still inside the window) must
+    # still be refused, never silently stored.
+    fake_time["now"] = 6.0
+    credential_update = Update(message=Message(text="mupot_" + "A" * 32))
+    handled = await handle_first_contact(
+        credential_update,
+        settings=settings,
+        client=client,
+        runtime=runtime,
+        sender_probe_limiter=sender_probe_limiter,
+    )
+    assert handled is True
+    assert credential_update.effective_message.replies[-1].startswith(first_person._CREDENTIAL_REPLY)
+    assert len([args for action, args in client.calls if action == "squad_remember"]) == 1  # unchanged
+
+
 def test_concurrent_flood_cannot_latch_a_third_partys_status_for_900s(monkeypatch: pytest.MonkeyPatch) -> None:
     """End-to-end reproduction of the adversarial finding's own methodology
     ("EXECUTED with the limiter scaled to 4"): with the global pool scaled
@@ -1984,7 +2164,12 @@ async def test_missing_project_id_at_submission_never_completes_falsely(tmp_path
     update = Update(message=Message(text="anything"))
     await _submit_proposal(update.effective_message, "123", intake, client=client, runtime=runtime)
 
-    assert not state_path.exists()  # no completion marker written
+    # Round-3-gate-4 P3-b: schedule_proposal_retry now durably persists
+    # proposal_retry_count (so a restart doesn't reset backoff), so the
+    # main state file DOES now exist after even the first failure -- the
+    # actual invariant is "no completion marker", not "no file at all".
+    completed = json.loads(state_path.read_text()).get("completed", {}) if state_path.exists() else {}
+    assert "member-1" not in completed  # no completion marker written
     assert update.effective_message.replies == ["I couldn't send your request yet -- I'll try again."]
     assert not any(action == "routine_proposal_submit" for action, _ in client.calls)
     pending = runtime.get_pending("123")
@@ -2271,13 +2456,43 @@ async def test_trigger_a_gateway_restart_after_all_questions_answered_never_inde
     assert pending_before.project_id == "proj-1"
 
     # GATEWAY RESTART: a brand-new runtime, zero in-memory state, same file.
-    restarted_runtime = FirstPersonRuntime(state_path)
+    # Round-3-gate-4 P3-b: proposal_retry_count (1, from the failed attempt
+    # above) is restored durably, and start() recomputes a FRESH backoff
+    # window from it (never a raw persisted monotonic timestamp, which
+    # would be meaningless across a restart) -- so the very first post-
+    # restart message must NOT immediately retry.
+    # Round-3-gate-4 P3-e: handle_first_contact now accepts `clock` for
+    # exactly this reason -- without threading the SAME fake clock through
+    # (instead of the real time.monotonic() default), the backoff-due
+    # comparison inside _retry_proposal_if_due would compare a huge real
+    # timestamp against the small test-scale next_proposal_retry_at and
+    # always read as "due", masking the very thing this test checks.
+    fake_clock = {"now": 0.0}
+    restarted_runtime = FirstPersonRuntime(state_path, clock=lambda: fake_clock["now"])
     healthy_client = _client_for_full_intake()
     restart_update = Update(message=Message(text="are you there?"))
     handled = await handle_first_contact(
-        restart_update, settings=settings, client=healthy_client, runtime=restarted_runtime
+        restart_update,
+        settings=settings,
+        client=healthy_client,
+        runtime=restarted_runtime,
+        clock=lambda: fake_clock["now"],
     )  # must never raise IndexError
 
+    assert handled is True
+    resumed = restarted_runtime.get_pending("123")
+    assert resumed is not None  # NOT immediately retried -- respects the restored backoff
+    assert resumed.proposal_retry_count == 1
+    assert restart_update.effective_message.replies == [_PROPOSAL_RETRY_WAIT_REPLY]
+    assert not any(action == "routine_proposal_submit" for action, _ in healthy_client.calls)
+
+    # Advance past the restored backoff window -- NOW it actually retries,
+    # and (server healthy again) completes.
+    fake_clock["now"] = resumed.next_proposal_retry_at + 1.0
+    final_update = Update(message=Message(text="anything"))
+    handled = await handle_first_contact(
+        final_update, settings=settings, client=healthy_client, runtime=restarted_runtime, clock=lambda: fake_clock["now"]
+    )
     assert handled is True
     assert restarted_runtime.get_pending("123") is None  # completed, not stuck
     data = json.loads(state_path.read_text())
@@ -2339,15 +2554,16 @@ async def test_trigger_b_frequent_retry_wait_checkins_never_idle_drop_the_record
 
 
 @pytest.mark.asyncio
-async def test_trigger_c_status_flap_does_not_resurrect_a_stale_projectless_record(
+async def test_trigger_c_a_single_status_flap_never_prunes_the_durable_record(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Trigger (c) / Athena's ruling (3): abandon() must prune the durable
-    in_progress record it drops -- otherwise a 'pending -> complete ->
-    pending' status flap (a server bug or a detection race) abandons the
-    LOCAL record on the 'complete' read, and a later flap back to 'pending'
-    resumes start() from the stale record instead of starting this NEW
-    pending episode fresh."""
+    """Trigger (c) / Athena's ruling (3), corrected by round-3-gate-4 P1-b
+    (the reviewer's M7 probe): a SINGLE non-pending reading (here,
+    'complete') must NEVER durably prune in-progress engrams -- only a
+    SECOND CONSECUTIVE confirming reading may (see note_non_pending). A
+    flap back to 'pending' before that second reading must resume with
+    every engram intact, index unchanged, never re-asking an already-
+    answered question."""
     runtime = FirstPersonRuntime(tmp_path / "state.json")
     client = _client_for_full_intake()
     monkeypatch.setattr("plugin.first_person._resolve_member_project", _default_project_resolver)
@@ -2361,20 +2577,62 @@ async def test_trigger_c_status_flap_does_not_resurrect_a_stale_projectless_reco
     pending = runtime.get_pending("123")
     assert pending is not None and pending.index == 4
 
-    # Status flaps to 'complete' -- handle_first_contact abandons the local
-    # record; the durable in_progress record for member-1 must ALSO be
-    # pruned now, not just the in-memory one.
+    # ONE 'complete' reading -- unconfirmed, must leave everything intact
+    # (in-memory AND durable).
     install_status_stub(monkeypatch, lambda *_: COMPLETE_STATUS)
     handled = await handle_first_contact(
         Update(message=Message(text="anything")), settings=settings, client=client, runtime=runtime
+    )
+    assert handled is False
+    still_pending = runtime.get_pending("123")
+    assert still_pending is not None
+    assert still_pending.index == 4
+    assert set(still_pending.engrams) == {"name", "role", "project", "first_ask"}
+    data = json.loads((tmp_path / "state.json").read_text())
+    assert "member-1" in data.get("in_progress", {})  # NOT pruned on one reading
+
+    # Flap BACK to 'pending' -- resumes the SAME record, no reset, no
+    # re-asked/re-recorded question.
+    install_status_stub(monkeypatch, lambda *_: pending_status())
+    await handle_first_contact(Update(message=Message(text="Nothing else")), settings=settings, client=client, runtime=runtime)
+    remember_calls = [args for action, args in client.calls if action == "squad_remember"]
+    assert len(remember_calls) == 5  # never re-recorded name/role/project/first_ask
+    assert runtime.get_pending("123") is None  # completed normally
+
+
+@pytest.mark.asyncio
+async def test_trigger_c_two_consecutive_complete_readings_confirm_and_prune(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The companion positive case: TWO CONSECUTIVE 'complete' readings (no
+    pending reading between them) confirm the terminal state and prune the
+    durable record -- closing the original round-3-gate-2 trigger (c)
+    landmine (a status flap resurrecting a stale, never-produced-by-this-
+    episode record) while still requiring genuine confirmation."""
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    client = _client_for_full_intake()
+    monkeypatch.setattr("plugin.first_person._resolve_member_project", _default_project_resolver)
+    settings = valid_settings()
+
+    install_status_stub(monkeypatch, lambda *_: pending_status())
+    answers = ["Ada Example", "Engineer", "psychonom", "Ship it"]
+    await handle_first_contact(Update(message=Message(text="hello!")), settings=settings, client=client, runtime=runtime)
+    for answer in answers:
+        await handle_first_contact(Update(message=Message(text=answer)), settings=settings, client=client, runtime=runtime)
+
+    install_status_stub(monkeypatch, lambda *_: COMPLETE_STATUS)
+    await handle_first_contact(
+        Update(message=Message(text="first complete reading")), settings=settings, client=client, runtime=runtime
+    )
+    handled = await handle_first_contact(
+        Update(message=Message(text="second complete reading")), settings=settings, client=client, runtime=runtime
     )
     assert handled is False
     assert runtime.get_pending("123") is None
     data = json.loads((tmp_path / "state.json").read_text())
     assert "member-1" not in data.get("in_progress", {})  # pruned, not immortal
 
-    # Status flaps BACK to 'pending' -- must start a genuinely FRESH intake,
-    # never resume the stale 4-engram record from the abandoned episode.
+    # Flapping back to pending NOW starts a genuinely FRESH episode.
     install_status_stub(monkeypatch, lambda *_: pending_status())
     handled = await handle_first_contact(
         Update(message=Message(text="hello again")), settings=settings, client=client, runtime=runtime
@@ -2492,9 +2750,13 @@ def test_start_clamps_a_resumed_index_past_the_project_question_when_project_id_
     """Athena's ruling (1): a durable in_progress record with engrams past
     the project question but NO project_id (a partial/legacy write -- the
     exact shape a torn write, or a pre-fix build, could produce) must never
-    be trusted whole. start() clamps back to the project question instead
-    of manufacturing "every question answered, no project" -- self-healing,
-    since the very next answer simply re-resolves and overwrites it."""
+    be trusted whole. start() clamps ``index`` back to the project question
+    instead of manufacturing "every question answered, no project" -- but
+    (round-3-gate-4 P2-a, correcting a round-3-gate-3 bug) it must NOT drop
+    the project question's own already-recorded engram_id in the process,
+    since squad_remember is an INSERT and re-recording on the re-answer
+    would leave a permanent duplicate. The engram_id is kept so
+    _handle_answer can detect and reuse it."""
     state_path = tmp_path / "state.json"
     runtime = FirstPersonRuntime(state_path)
     project_index = next(i for i, (question_id, _) in enumerate(FIRST_PERSON_QUESTIONS) if question_id == "project")
@@ -2507,7 +2769,11 @@ def test_start_clamps_a_resumed_index_past_the_project_question_when_project_id_
     resumed = runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
     assert resumed.index == project_index
     assert resumed.project_id is None
-    assert set(resumed.engrams) == {question_id for question_id, _ in FIRST_PERSON_QUESTIONS[:project_index]}
+    # engrams through "project" INCLUSIVE are kept (not just the strict
+    # prefix before index) -- everything strictly after "project" is still
+    # dropped (unreachable without a project_id in the forward path).
+    assert set(resumed.engrams) == {question_id for question_id, _ in FIRST_PERSON_QUESTIONS[: project_index + 1]}
+    assert resumed.engrams["project"] == "engram-project"
 
 
 def test_start_trusts_a_resumed_index_past_the_project_question_when_project_id_is_present(tmp_path: Path) -> None:
@@ -2563,7 +2829,7 @@ async def test_every_reachable_resume_index_avoids_index_error(monkeypatch: pyte
         runtime = FirstPersonRuntime(state_path)
         engrams = {question_id: f"engram-{question_id}" for question_id, _ in FIRST_PERSON_QUESTIONS[:index]}
         project_id = "proj-1" if index > project_index else None
-        runtime._save_in_progress(member_id, engrams, project_id)  # noqa: SLF001 -- seed durable resume state
+        runtime._save_in_progress(member_id, engrams, project_id, 0)  # noqa: SLF001 -- seed durable resume state
 
         install_status_stub(monkeypatch, lambda *_, member_id=member_id: pending_status(member_id=member_id))
         client = _client_for_full_intake()
@@ -2772,6 +3038,43 @@ def test_read_journal_proposal_id_never_reads_more_than_the_capped_bytes(tmp_pat
     assert store.read_journal_proposal_id("member-tail") == "proposal-tail"
 
 
+def test_journal_read_cap_is_derived_from_the_entry_cap() -> None:
+    """Round-3-gate-4 P3-c: _JOURNAL_READ_CAP_BYTES (256KiB in round-3-
+    gate-3) picked independently of _JOURNAL_MAX_ENTRIES (2048) meant a
+    fully-compacted journal (2048 entries * a realistic ~150-200 bytes/line)
+    could already exceed one read -- append_journal's own read-then-
+    recompact-then-write cycle would then silently treat a PARTIAL read as
+    the whole journal and rewrite it without the entries that fell outside
+    the read window, permanently losing already-compacted proposal_ids.
+    The read cap must be DERIVED from the write cap so the two can never
+    silently diverge again."""
+    assert first_person._JOURNAL_READ_CAP_BYTES == (
+        first_person._JOURNAL_MAX_ENTRIES * first_person._JOURNAL_MAX_ENTRY_BYTES_ESTIMATE
+    )
+
+
+def test_journal_never_drops_entries_at_full_compaction_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Direct regression for the P3-c defect: fill the journal to EXACTLY
+    its compaction cap and confirm every single entry survives the
+    read-recompact-write cycle -- the oldest entry (the first casualty if
+    the read cap silently undercut the write cap) is still there."""
+    monkeypatch.setattr(first_person, "_JOURNAL_MAX_ENTRIES", 200)
+    monkeypatch.setattr(
+        first_person, "_JOURNAL_READ_CAP_BYTES", 200 * first_person._JOURNAL_MAX_ENTRY_BYTES_ESTIMATE
+    )
+    state_path = tmp_path / "state.json"
+    store = first_person.FirstPersonStateStore(state_path)
+    for n in range(200):
+        store.append_journal(f"member-{n:04d}", f"proposal-{n:04d}", float(n))
+
+    entries = store._read_journal_entries()  # noqa: SLF001
+    assert len(entries) == 200
+    assert store.read_journal_proposal_id("member-0000") == "proposal-0000"  # the oldest -- not dropped
+    assert store.read_journal_proposal_id("member-0199") == "proposal-0199"  # the newest
+
+
 @pytest.mark.asyncio
 async def test_double_proposal_prevented_even_when_store_was_corrupted_at_completion_time(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2846,7 +3149,10 @@ async def test_a_confirmed_unbind_still_abandons_a_pending_intake(
 ) -> None:
     """Contrast with the transient-unknown test above: a DEFINITIVE
     confirmation that the sender is not (or no longer) a member must still
-    abandon progress -- only genuine transport noise holds it."""
+    eventually abandon progress -- only genuine transport noise holds it
+    unconditionally. Round-3-gate-4 P1-b: even a definitive 'none' needs a
+    SECOND consecutive confirming reading before the durable record is
+    pruned (never a single reading -- see the trigger-c tests)."""
     call_count = {"n": 0}
 
     def resolver(_user_id: Any, _chat_id: Any) -> StatusResolution:
@@ -2861,11 +3167,16 @@ async def test_a_confirmed_unbind_still_abandons_a_pending_intake(
     )
     assert runtime.get_pending("123") is not None
 
-    handled = await handle_first_contact(
+    await handle_first_contact(
         Update(message=Message(text="Ada Example")), settings=valid_settings(), client=client, runtime=runtime
     )
+    assert runtime.get_pending("123") is not None  # 1st reading -- unconfirmed
+
+    handled = await handle_first_contact(
+        Update(message=Message(text="still Ada")), settings=valid_settings(), client=client, runtime=runtime
+    )
     assert handled is False
-    assert runtime.get_pending("123") is None  # DOES abandon -- confirmed, not transient
+    assert runtime.get_pending("123") is None  # 2nd reading -- CONFIRMED, now abandoned
 
 
 @pytest.mark.asyncio
@@ -2901,6 +3212,40 @@ async def test_pending_member_bypasses_the_status_cache_entirely(monkeypatch: py
     )
     assert len(cache) == 1  # unchanged -- this probe never touched the cache
     assert len(opener.calls) == 2  # a FRESH probe every time, never served from cache
+
+
+@pytest.mark.asyncio
+async def test_pending_member_never_reads_a_pre_seeded_shared_unknown_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Athena's final ruling on the cache split (round-3-gate-4): a
+    server-answered result may keep the normal (900s-for-unknown-capable)
+    shared cache; the ONE non-negotiable is that a member with local
+    pending progress must NEVER read a cached entry at all -- explicitly
+    asserted here with a stale 'unknown' entry PRE-SEEDED for the same
+    user_id, not merely assumed from the cache staying empty."""
+    cache = _StatusCache()
+    cache.put("123", UNKNOWN_STATUS)  # pre-seed a stale cached 'unknown' for this sender
+    assert cache.get("123") == UNKNOWN_STATUS  # sanity: the seed is actually live
+
+    opener = install_probe(monkeypatch, response=status_response_bytes(home_squad_id="home-squad-1"))
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    settings = valid_settings()
+
+    # Seed a local pending record directly (no network call) so the SECOND
+    # handle_first_contact call below takes the cache-bypass path.
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+
+    handled = await handle_first_contact(
+        Update(message=Message(text="Ada Example")),
+        settings=settings,
+        client=_client_for_full_intake(),
+        runtime=runtime,
+        status_cache=cache,
+    )
+    assert handled is True  # processed as a real answer, not held on a stale cached 'unknown'
+    assert len(opener.calls) == 1  # a REAL probe ran -- the pre-seeded entry was never read
+    assert runtime.get_pending("123") is not None and runtime.get_pending("123").index == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2955,6 +3300,61 @@ async def test_escape_then_non_escape_resumes_the_same_still_current_question(
     assert len(remember_calls) == 1
     assert remember_calls[0]["concepts"] == ["name"]
     assert remember_calls[0]["text"] == "Ada Example"
+
+
+@pytest.mark.asyncio
+async def test_escape_word_pauses_the_proposal_retry_wait_loop_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round-3-gate-4 P2-b: an escape word was only ever honoured
+    mid-question -- once every question was answered (index ==
+    len(FIRST_PERSON_QUESTIONS)), 'stop'/'cancel'/'not now' routed straight
+    to _retry_proposal_if_due with no escape check at all, becoming
+    permanently dead the instant a member finished the script. Verified in
+    BOTH reachable index==len entry points: the resume branch
+    (runtime.start() resuming into a fully-answered record) and the
+    already-pending branch (an existing in-memory pending record)."""
+    fake_clock = {"now": 0.0}
+    client = _client_rejecting_project_access()
+    monkeypatch.setattr("plugin.first_person._resolve_member_project", _default_project_resolver)
+    settings = valid_settings()
+
+    # Branch 1: an existing in-memory pending record at index == len.
+    install_status_stub(monkeypatch, lambda *_: pending_status())
+    runtime = FirstPersonRuntime(tmp_path / "state-a.json", clock=lambda: fake_clock["now"])
+    answers = ["Ada Example", "Engineer", "psychonom", "Ship it", "Nothing else"]
+    await handle_first_contact(Update(message=Message(text="hello!")), settings=settings, client=client, runtime=runtime)
+    for answer in answers:
+        await handle_first_contact(Update(message=Message(text=answer)), settings=settings, client=client, runtime=runtime)
+    assert runtime.get_pending("123").index == len(FIRST_PERSON_QUESTIONS)
+    # The 5th answer already triggered ONE real (failed) submission attempt
+    # via the normal forward path -- that's expected. What must NOT happen
+    # is a SECOND attempt triggered by the escape message itself.
+    submit_calls_before_escape = sum(1 for action, _ in client.calls if action == "routine_proposal_submit")
+
+    escape_update = Update(message=Message(text="stop"))
+    handled = await handle_first_contact(escape_update, settings=settings, client=client, runtime=runtime)
+    assert handled is True
+    assert escape_update.effective_message.replies == [_PAUSED_REPLY]
+    submit_calls_after_escape = sum(1 for action, _ in client.calls if action == "routine_proposal_submit")
+    assert submit_calls_after_escape == submit_calls_before_escape  # the escape itself never attempted a submit
+
+    # Branch 2: the RESUME entry point (start() resuming a fully-answered
+    # durable record with no in-memory _pending at all) -- a FRESH client
+    # and runtime, so any submit call at all here can only be from the
+    # escape message (there is no prior forward-path answer to attribute
+    # one to).
+    resume_client = _client_rejecting_project_access()
+    resume_runtime = FirstPersonRuntime(tmp_path / "state-b.json", clock=lambda: fake_clock["now"])
+    engrams = {question_id: f"engram-{question_id}" for question_id, _ in FIRST_PERSON_QUESTIONS}
+    resume_runtime._save_in_progress("member-1", engrams, "proj-1", 0)  # noqa: SLF001 -- seed a fully-answered record
+    escape_resume_update = Update(message=Message(text="cancel"))
+    handled = await handle_first_contact(
+        escape_resume_update, settings=settings, client=resume_client, runtime=resume_runtime
+    )
+    assert handled is True
+    assert escape_resume_update.effective_message.replies == [_PAUSED_REPLY]
+    assert not any(action == "routine_proposal_submit" for action, _ in resume_client.calls)
 
 
 @pytest.mark.parametrize(

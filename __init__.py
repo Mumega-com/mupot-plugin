@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
+from .first_person import FirstPersonSettings, register_first_person, register_first_person_skill
 from .mupot_operator import MupotOperatorClient, OperatorSettings, register_operator_tools
 from .schemas import (
     MUPOT_BRAIN_ENABLE_SCHEMA,
@@ -374,6 +375,7 @@ def register(ctx: Any) -> None:
         operator_settings = OperatorSettings.from_mapping(operator_value)
         telegram_control_settings = TelegramControlSettings.from_mapping(operator_value)
         inline_approval_settings = TelegramInlineApprovalSettings.from_mapping(operator_value)
+        first_person_settings = FirstPersonSettings.from_mapping(operator_value)
         secret_owner = ProfileSecretOwner.from_context(ctx)
         with secret_owner.activate():
             client = MupotOperatorClient(
@@ -391,6 +393,20 @@ def register(ctx: Any) -> None:
                 client=client,
                 secret_owner=secret_owner,
             )
+            register_first_person(
+                ctx,
+                first_person_settings,
+                client=client,
+                secret_owner=secret_owner,
+            )
+            if first_person_settings.enabled:
+                # Discovery receipt (2026-09-21): a native (kind: backend)
+                # plugin gets no directory-scan auto-discovery for skills/ --
+                # only this explicit call makes skills/first-person/SKILL.md
+                # resolvable as 'mupot:first-person' via skill_view()/
+                # skills_list(). Does NOT also register mupot-operator's own
+                # bundled skill -- that is a separate, pre-existing gap.
+                register_first_person_skill(ctx)
             if native_gateway:
                 from .mupot_gateway.adapter import register as register_native_gateway
                 register_native_gateway(

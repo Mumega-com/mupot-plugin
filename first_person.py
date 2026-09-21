@@ -221,9 +221,68 @@ _STATUS_PROBE_TIMEOUT_SECONDS = 5.0
 _STATUS_PROBE_MAX_CONCURRENCY = 32
 _STATUS_PROBE_ACQUIRE_TIMEOUT_SECONDS = 1.0
 
+# Round-3-gate-3 P1 (:1762): the per-user_id _StatusCache doubled as the ONLY
+# per-sender rate limit on real network probes -- bypassing it entirely for a
+# member with local pending progress (the fix for the round-3-gate-2 P2
+# latch) silently removed that limit for exactly the population most likely
+# to message repeatedly (an active, mid-intake member). This is its
+# independent replacement: a minimum interval between real probes for the
+# SAME user_id, enforced regardless of whether the shared cache is in play.
+# Reused at the same cadence the cache's own positive TTL already provided
+# (a pending member's status was already refreshed at most once per 15s).
+_SENDER_PROBE_MIN_INTERVAL_SECONDS = _STATUS_POSITIVE_TTL_SECONDS
+
+# Round-3-gate-3 P1 / Athena's ruling (2): the shared cache's TTL selection
+# now splits on whether the server actually ANSWERED. A CONFIRMED result
+# (bound=True with a real intake_state, or bound=False/"none" -- mupot said
+# something definite) uses the normal positive/negative TTL. An "unknown"
+# result -- a probe timeout, a malformed response, a secret-read failure, or
+# the global _ProbeLimiter pool being momentarily exhausted -- is NEVER
+# evidence about the sender at all, only about a transient condition on THIS
+# process; caching it for the full _STATUS_UNKNOWN_TTL_SECONDS (900s) let one
+# flood-causing sender (or one bad network blip) latch every OTHER sender's
+# status into "unknown" for 15 minutes. resolve_member_status caches an
+# "unknown" outcome, if at all, only for this much shorter window instead --
+# long enough to blunt a tight repeat against a still-failing condition,
+# nowhere near long enough to outlive whatever caused it. `_StatusCache`'s
+# own `unknown_ttl` default (used when something calls `cache.put()`
+# directly with an already-resolved value) is untouched by this -- this
+# constant governs only resolve_member_status's OWN caching decision for a
+# result it just produced.
+_STATUS_UNKNOWN_SHORT_TTL_SECONDS = 30.0
+
+# Round-3-gate-3 P3 (:836/:860): the completion journal is a rare fallback
+# (only written when the main store is unreadable at finish() time), but
+# nothing in this process may grow a local file without a bound. Compacted
+# on every write to at most one entry per member_id; oldest-by-completed_at
+# entries are dropped first once over this cap -- same bounded-LRU-by-another-
+# name discipline as _StatusCache/_NotifyOncePerWindow above.
+_JOURNAL_MAX_ENTRIES = 2048
+# read_journal_proposal_id must never read an unbounded amount of a file it
+# does not fully control the size of (e.g. a pre-existing file from before
+# this cap existed, or a hand-edited one) -- caps the read regardless of
+# on-disk size, reading only the tail (the newest entries) when oversized.
+_JOURNAL_READ_CAP_BYTES = 256 * 1024
+
 # Proposal-submission retry backoff (round-2 P0-3): a failed submit must not be
 # retried on literally the next keystroke.
 _PROPOSAL_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (5.0, 15.0, 60.0, 300.0)
+
+# Round-3-gate-3 / Athena's ruling (4): the DEFECT this closes is the reply
+# shape, not the underlying rejection -- the live routine_proposal_submit
+# schema rejecting the "project_access" kind (see _submit_proposal's own
+# comment) is a real, currently-permanent condition this module cannot fix
+# from here. Retrying forever at the max backoff is fine (self-healing once
+# the mupot-side contract ships); showing the member the IDENTICAL "I'll try
+# again shortly" on literally every check-in forever, with no acknowledgment
+# anything is actually stuck, is what made this read as a "permanent loop".
+# Once the backoff table itself is exhausted (this many failed attempts),
+# the member-facing reply switches to a distinct, bounded, honest one --
+# rate-limited on its own window, same _NotifyOncePerWindow shape as the
+# lag-guard's reassurance reply -- while retries keep happening in the
+# background at the max backoff cadence.
+_PROPOSAL_STALLED_AFTER_ATTEMPTS = len(_PROPOSAL_RETRY_BACKOFF_SECONDS)
+_PROPOSAL_STALLED_REPLY_WINDOW_SECONDS = 86400.0
 
 # Round-3-gate-2 P1 (:1408-1426) / P3: the held-proposal WARNING and its
 # paired member-facing reply are rate-limited on SEPARATE windows -- a
@@ -289,6 +348,16 @@ _CREDENTIAL_REPLY = (
 )
 _PROPOSAL_FAILED_REPLY = "I couldn't send your request yet -- I'll try again."
 _PROPOSAL_RETRY_WAIT_REPLY = "Still working on sending your request -- I'll try again shortly."
+# Round-3-gate-3 / Athena's ruling (4): once the retry backoff table itself
+# is exhausted (_PROPOSAL_STALLED_AFTER_ATTEMPTS failed attempts), the member
+# gets THIS distinct, rate-limited reply instead of an unbounded repeat of
+# the two lines above -- honest that something is actually stuck, never a
+# claim of completion, and never sent more than once per
+# _PROPOSAL_STALLED_REPLY_WINDOW_SECONDS.
+_PROPOSAL_STALLED_REPLY = (
+    "This is taking longer than it should -- I've flagged it so a human can "
+    "look into your request directly."
+)
 # Round-3 ruling (6): a mid-intake message that is not a usable answer (empty
 # or whitespace-only after stripping) is nudged with this fixed line rather
 # than silently captured as an answer or falling through to the host -- the
@@ -505,8 +574,12 @@ class _StatusCache:
             return self._unknown_ttl
         return self._negative_ttl
 
-    def put(self, user_id: str, resolution: StatusResolution) -> None:
-        ttl = self._ttl_for(resolution)
+    def put(self, user_id: str, resolution: StatusResolution, *, ttl_override: float | None = None) -> None:
+        # Round-3-gate-3 P1: a caller that already knows this particular
+        # resolution is a transient/capacity artifact (never fetched from a
+        # real probe result) can force a short TTL instead of the resolution-
+        # shaped default -- see resolve_member_status's pool_exhausted path.
+        ttl = self._ttl_for(resolution) if ttl_override is None else ttl_override
         with self._lock:
             self._entries[user_id] = (self._clock() + ttl, resolution)
             self._entries.move_to_end(user_id)
@@ -548,6 +621,52 @@ class _ProbeLimiter:
 
     def release(self) -> None:
         self._semaphore.release()
+
+
+class _SenderProbeLimiter:
+    """Per-user_id minimum-interval limiter on REAL network probes.
+
+    Round-3-gate-3 P1 (:1762): a pending member's local-progress bypass of
+    the shared ``_StatusCache`` (``cache=None`` in ``handle_first_contact``'s
+    ``resolve()``) intentionally forfeits the cache's freshness -- but the
+    cache was also, incidentally, the only thing bounding how often the SAME
+    sender could trigger a real network probe. This is the explicit,
+    independent replacement: at most one real probe per ``user_id`` per
+    ``min_interval``, enforced whether or not the shared cache is in play,
+    so a single flooding sender cannot alone exhaust the global
+    ``_ProbeLimiter`` pool and, downstream, cannot cause an innocent third
+    party's own probe to fail fast. A denial here means "we chose not to ask
+    again yet" -- resolve_member_status returns ``_UNKNOWN_STATUS`` without
+    ever writing it to the shared cache (see resolve_member_status), so it
+    never becomes a long-lived latch either.
+    """
+
+    def __init__(
+        self,
+        min_interval: float = _SENDER_PROBE_MIN_INTERVAL_SECONDS,
+        *,
+        max_entries: int = 2048,
+        clock: Any = time.monotonic,
+    ) -> None:
+        self._min_interval = min_interval
+        self._max_entries = max(1, max_entries)
+        self._clock = clock
+        self._last_at: "OrderedDict[str, float]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def should_probe(self, user_id: str) -> bool:
+        with self._lock:
+            now = self._clock()
+            last = self._last_at.get(user_id)
+            if last is not None:
+                self._last_at.move_to_end(user_id)
+                if (now - last) < self._min_interval:
+                    return False
+            self._last_at[user_id] = now
+            self._last_at.move_to_end(user_id)
+            while len(self._last_at) > self._max_entries:
+                self._last_at.popitem(last=False)  # evict least-recently-used
+            return True
 
 
 class _NotifyOncePerWindow:
@@ -655,6 +774,7 @@ def resolve_member_status(
     secret_owner: ProfileSecretOwner | None = None,
     cache: _StatusCache | None = None,
     probe_limiter: "_ProbeLimiter | None" = None,
+    sender_limiter: "_SenderProbeLimiter | None" = None,
 ) -> StatusResolution:
     """Resolve the Telegram sender's bound member + intake progress through the
     authenticated ``/im/webhook`` surface -- the ONLY channel this module
@@ -679,6 +799,17 @@ def resolve_member_status(
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
+
+    if sender_limiter is not None and not sender_limiter.should_probe(cache_key):
+        # Round-3-gate-3 P1: independent per-sender rate limit on REAL probes
+        # (see _SenderProbeLimiter) -- applies whether or not `cache` is set,
+        # so a pending member's cache bypass (see handle_first_contact's
+        # `resolve()`) no longer also means "no rate limit at all". A denial
+        # here means "chose not to ask again yet", not "mupot says unknown";
+        # never cached (a rate-limit denial is not information ABOUT the
+        # sender, and caching it would recreate exactly the latch this is
+        # meant to avoid).
+        return _UNKNOWN_STATUS
 
     require_supported_profile_runtime({})
     body = _status_probe_body(user_id, chat_id)
@@ -766,7 +897,20 @@ def resolve_member_status(
 
     resolution = _do_with_limit() if secret_owner is None else _with_secret_owner(secret_owner, _do_with_limit)
     if cache is not None:
-        cache.put(cache_key, resolution)
+        if resolution.intake_state == "unknown":
+            # Round-3-gate-3 P1 / Athena's ruling (2): a probe-produced
+            # "unknown" -- whatever the cause (timeout, malformed response,
+            # secret-read failure, or the global _ProbeLimiter pool being
+            # exhausted) -- is never cached with the resolution-shaped TTL
+            # (which, for "unknown", is the LONGEST of the three -- 900s).
+            # Only a server-ANSWERED state (confirmed bound/pending/complete,
+            # or a confirmed "none") earns the normal TTL below; an
+            # unanswered probe gets this much shorter window instead, so one
+            # bad probe (or one flood-causing sender emptying the pool)
+            # cannot latch every OTHER sender's status for 15 minutes.
+            cache.put(cache_key, resolution, ttl_override=_STATUS_UNKNOWN_SHORT_TTL_SECONDS)
+        else:
+            cache.put(cache_key, resolution)
     return resolution
 
 
@@ -833,52 +977,115 @@ class FirstPersonStateStore:
             except FileNotFoundError:
                 pass
 
-    def append_journal(self, member_id: str, proposal_id: str, completed_at: float) -> None:
-        """Best-effort, append-only. Never raises -- the caller has already
-        logged a WARNING; a journal write failure on top of a corrupted main
-        store is not something retrying harder here would fix."""
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            fd = os.open(self.journal_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            try:
-                with os.fdopen(fd, "a", encoding="utf-8") as handle:
-                    handle.write(
-                        json.dumps(
-                            {"member_id": member_id, "proposal_id": proposal_id, "completed_at": completed_at},
-                            ensure_ascii=False,
-                            sort_keys=True,
-                        )
-                    )
-                    handle.write("\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            finally:
-                os.chmod(self.journal_path, 0o600)
-        except OSError:
-            pass
+    def _read_journal_entries(self) -> dict[str, dict[str, Any]]:
+        """Tolerant of a partially-written last line (an fsync'd append can
+        still be torn by a concurrent crash on some filesystems) -- one bad
+        line is skipped, not fatal to the whole read.
 
-    def read_journal_proposal_id(self, member_id: str) -> str | None:
-        """Scan the journal for the most recent proposal_id recorded for
-        member_id. Tolerant of a partially-written last line (an fsync'd
-        append can still be torn by a concurrent crash on some filesystems)
-        -- one bad line is skipped, not fatal to the whole read."""
+        Round-3-gate-3 P3 (:860): bounded read -- never reads more than
+        ``_JOURNAL_READ_CAP_BYTES`` regardless of on-disk file size, and only
+        ever the TAIL of an oversized file (the newest entries are what a
+        compact-on-write journal needs; a file larger than the cap is itself
+        evidence something wrote to it outside this class's own bound, so
+        this reads defensively rather than trusting the on-disk size).
+        Returns at most one entry per ``member_id`` -- the LAST one seen
+        scanning forward, matching the previous append-only "most recent
+        wins" semantics.
+        """
         try:
-            raw = self.journal_path.read_text(encoding="utf-8")
-        except (FileNotFoundError, OSError):
-            return None
-        found: str | None = None
-        for line in raw.splitlines():
+            size = self.journal_path.stat().st_size
+        except OSError:
+            return {}
+        try:
+            with open(self.journal_path, "rb") as handle:
+                truncated_head = size > _JOURNAL_READ_CAP_BYTES
+                if truncated_head:
+                    handle.seek(size - _JOURNAL_READ_CAP_BYTES)
+                raw = handle.read(_JOURNAL_READ_CAP_BYTES + 1)
+        except OSError:
+            return {}
+        text = raw.decode("utf-8", errors="ignore")
+        lines = text.splitlines()
+        if truncated_head and lines:
+            # The first line read after an interior seek is very likely a
+            # partial line -- drop it rather than risk parsing a truncated
+            # JSON object as a real (and possibly wrong) record.
+            lines = lines[1:]
+        entries: dict[str, dict[str, Any]] = {}
+        for line in lines:
             if not line.strip():
                 continue
             try:
                 entry = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(entry, dict) and entry.get("member_id") == member_id:
-                candidate = entry.get("proposal_id")
-                if isinstance(candidate, str) and candidate.strip():
-                    found = candidate.strip()
-        return found
+            if not isinstance(entry, dict):
+                continue
+            member_id = entry.get("member_id")
+            proposal_id = entry.get("proposal_id")
+            if not isinstance(member_id, str) or not member_id.strip():
+                continue
+            if not isinstance(proposal_id, str) or not proposal_id.strip():
+                continue
+            entries[member_id] = entry
+        return entries
+
+    def append_journal(self, member_id: str, proposal_id: str, completed_at: float) -> None:
+        """Best-effort, compacted-on-write. Never raises -- the caller has
+        already logged a WARNING; a journal write failure on top of a
+        corrupted main store is not something retrying harder here would
+        fix.
+
+        Round-3-gate-3 P3 (:836): the previous shape was truly append-only
+        with no size bound at all -- 200 completions during one corrupted-
+        store window produced 201 growing lines forever. This reads the
+        existing (bounded) entries, keeps at most one per member_id, adds/
+        replaces this member's own entry, and if that leaves more than
+        ``_JOURNAL_MAX_ENTRIES`` distinct members, drops the OLDEST (by
+        ``completed_at``) first -- same bounded-cache discipline as
+        ``_StatusCache``/``_NotifyOncePerWindow``. Written back atomically
+        (temp file + fsync + rename), same shape as the main store's own
+        ``save``.
+        """
+        try:
+            entries = self._read_journal_entries()
+            entries[member_id] = {
+                "member_id": member_id,
+                "proposal_id": proposal_id,
+                "completed_at": completed_at,
+            }
+            if len(entries) > _JOURNAL_MAX_ENTRIES:
+                oldest_first = sorted(entries.values(), key=lambda entry: entry.get("completed_at", 0.0))
+                for stale in oldest_first[: len(entries) - _JOURNAL_MAX_ENTRIES]:
+                    entries.pop(stale["member_id"], None)
+
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            temporary = self.journal_path.with_suffix(self.journal_path.suffix + ".tmp")
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    for entry in entries.values():
+                        handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True))
+                        handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, self.journal_path)
+                os.chmod(self.journal_path, 0o600)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+        except OSError:
+            pass
+
+    def read_journal_proposal_id(self, member_id: str) -> str | None:
+        """Most recent proposal_id recorded for member_id, if any."""
+        entry = self._read_journal_entries().get(member_id)
+        if entry is None:
+            return None
+        candidate = entry.get("proposal_id")
+        return candidate.strip() if isinstance(candidate, str) and candidate.strip() else None
 
 
 def default_state_path() -> Path:
@@ -1013,47 +1220,77 @@ class FirstPersonRuntime:
         # main store is fixed/replaced.
         return self.store.read_journal_proposal_id(member_id)
 
-    def _load_in_progress_engrams(self, member_id: str) -> dict[str, str]:
-        """Durable, best-effort read of {question_id: engram_id} recorded so
-        far for an in-progress (not yet completed) intake -- round-3-gate-2
-        P0/Athena's RESUME REBINDS: lets :meth:`start` resume at the first
-        UNANSWERED question instead of re-asking (and re-labelling) already-
-        answered ones after an idle/absolute-TTL drop. Never raises; a
-        corrupted store just degrades this specific member's resume to
-        "start over" (the durable proposal-dedupe guarantee in
-        held_proposal_id/is_complete_or_unknown is unaffected -- this method
-        is purely a UX aid, not a security-relevant gate)."""
+    def _load_in_progress_state(self, member_id: str) -> tuple[dict[str, str], str | None]:
+        """Durable, best-effort read of everything :meth:`start` needs to
+        resume -- the {question_id: engram_id} map AND ``project_id`` --
+        round-3-gate-2 P0/Athena's RESUME REBINDS: lets :meth:`start` resume
+        at the first UNANSWERED question instead of re-asking (and
+        re-labelling) already-answered ones after an idle/absolute-TTL drop.
+
+        Round-3-gate-3 P0 (:1856): round-2's version returned ONLY the
+        engram map -- ``project_id`` was never persisted at all, so a member
+        who had already answered the "project" question but not yet
+        completed (the live schema rejects the ``project_access`` proposal
+        kind -- see :func:`_submit_proposal` -- so this is the DEFAULT
+        outcome today) resumed with ``index`` reflecting all 5 engrams but
+        ``project_id`` silently reset to ``None``: a state the forward path
+        can never produce, and the exact partial restore that made the
+        member's proposal retry fail forever. Both fields are now written
+        together (see :meth:`_save_in_progress`) so a resume either has
+        BOTH the answer for a question and (once past it) the project_id
+        that answer resolved to, or neither.
+
+        Never raises; a corrupted store just degrades this specific
+        member's resume to "start over" (the durable proposal-dedupe
+        guarantee in held_proposal_id/is_complete_or_unknown is unaffected
+        -- this method is purely a UX aid, not a security-relevant gate)."""
         data, valid = self.store.load_checked()
         if not valid:
-            return {}
+            return {}, None
         in_progress = data.get("in_progress")
         if not isinstance(in_progress, dict) or member_id not in in_progress:
-            return {}
+            return {}, None
         entry = in_progress[member_id]
-        raw_engrams = entry.get("engram_ids") if isinstance(entry, dict) else None
-        if not isinstance(raw_engrams, dict):
-            return {}
-        return {
-            question_id: engram_id.strip()
-            for question_id, engram_id in raw_engrams.items()
-            if isinstance(question_id, str) and isinstance(engram_id, str) and engram_id.strip()
-        }
+        if not isinstance(entry, dict):
+            return {}, None
+        raw_engrams = entry.get("engram_ids")
+        engrams = (
+            {
+                question_id: engram_id.strip()
+                for question_id, engram_id in raw_engrams.items()
+                if isinstance(question_id, str) and isinstance(engram_id, str) and engram_id.strip()
+            }
+            if isinstance(raw_engrams, dict)
+            else {}
+        )
+        raw_project_id = entry.get("project_id")
+        project_id = raw_project_id.strip() if isinstance(raw_project_id, str) and raw_project_id.strip() else None
+        return engrams, project_id
 
-    def _save_in_progress(self, member_id: str, engrams: dict[str, str]) -> None:
+    def _save_in_progress(self, member_id: str, engrams: dict[str, str], project_id: str | None) -> None:
         """Sender-scoped, validity-gated (round-3-gate-2 P1 :931 discipline
         applied here too): read, validate, merge ONLY this member's
         in-progress record, write. On an invalid read this is a best-effort
-        UX aid (see :meth:`_load_in_progress_engrams`), so it simply skips
+        UX aid (see :meth:`_load_in_progress_state`), so it simply skips
         the write rather than journaling -- unlike the completion marker,
         losing one round of in-progress resume data is not a duplicate-
-        proposal risk, just a degraded-to-"start over" resume next time."""
+        proposal risk, just a degraded-to-"start over" resume next time.
+
+        Round-3-gate-3 P0: ``project_id`` is now written alongside
+        ``engrams`` on every call, not only the engram map -- see
+        :meth:`_load_in_progress_state`'s docstring for why a partial write
+        of just one of the two is itself the defect class."""
         data, valid = self.store.load_checked()
         if not valid:
             return
         in_progress = data.get("in_progress")
         if not isinstance(in_progress, dict):
             in_progress = {}
-        in_progress[member_id] = {"engram_ids": dict(engrams), "updated_at": self._wall_clock()}
+        in_progress[member_id] = {
+            "engram_ids": dict(engrams),
+            "project_id": project_id,
+            "updated_at": self._wall_clock(),
+        }
         data["in_progress"] = in_progress
         self.store.save(data)
 
@@ -1139,27 +1376,62 @@ class FirstPersonRuntime:
         ``engrams``/``index`` are trimmed to the longest CONTIGUOUS
         already-answered prefix of :data:`FIRST_PERSON_QUESTIONS` (strictly
         sequential asking means a gap should never occur, but this is
-        defensive rather than trusting the persisted shape blindly)."""
-        prior_engrams = self._load_in_progress_engrams(member_id)
+        defensive rather than trusting the persisted shape blindly).
+
+        Round-3-gate-3 P0 (:1856): the returned ``index`` can legitimately
+        equal ``len(FIRST_PERSON_QUESTIONS)`` -- ALL questions already
+        answered, proposal submission never yet succeeded (the live schema
+        rejects the ``project_access`` kind today, so this is the common
+        case, not an edge case). Callers must route that case to the
+        submit-or-retry path, never index ``FIRST_PERSON_QUESTIONS`` with
+        it directly (see :func:`handle_first_contact`'s bounds check right
+        after calling this). This method's own commitment
+        (``self._pending[chat_key] = intake``) happens ONLY after every
+        field -- including ``project_id`` -- has been computed and
+        validated below; nothing after that point can raise, so a caller
+        can never observe a record committed here that is missing a field
+        the caller might then use unguarded.
+
+        A resumed ``index`` past the "project" question is only trusted
+        when the durable record ALSO carries a ``project_id`` -- both are
+        written together by :meth:`_save_in_progress`/:meth:`record_answer`,
+        so a mismatch here means a prior write was itself partial (e.g. an
+        older build, or a torn write). Rather than manufacture "all
+        questions answered, no project" -- a state the forward path can
+        never produce -- this clamps back to the project question so the
+        very next answer re-resolves it (self-healing; the project engram
+        already on disk is simply overwritten, which is always safe)."""
+        prior_engrams, prior_project_id = self._load_in_progress_state(member_id)
         index = 0
         for question_id, _ in FIRST_PERSON_QUESTIONS:
             if question_id in prior_engrams:
                 index += 1
             else:
                 break
+
+        project_question_index = next(
+            (position for position, (question_id, _) in enumerate(FIRST_PERSON_QUESTIONS) if question_id == "project"),
+            None,
+        )
+        project_id = prior_project_id
+        if project_question_index is not None and index > project_question_index and project_id is None:
+            index = project_question_index
+            project_id = None
+
         engrams = {question_id: prior_engrams[question_id] for question_id, _ in FIRST_PERSON_QUESTIONS[:index]}
         now = self._clock()
+        intake = Intake(
+            member_id=member_id,
+            home_squad_id=home_squad_id,
+            index=index,
+            project_id=project_id,
+            engrams=engrams,
+            created_at=now,
+            last_activity_at=now,
+        )
         with self._lock:
-            intake = Intake(
-                member_id=member_id,
-                home_squad_id=home_squad_id,
-                index=index,
-                engrams=engrams,
-                created_at=now,
-                last_activity_at=now,
-            )
             self._pending[chat_key] = intake
-            return intake
+        return intake
 
     def record_answer(self, chat_key: str, question_id: str, engram_id: str) -> Intake | None:
         """Advance progress by building a NEW frozen ``Intake`` (P3-G) --
@@ -1184,19 +1456,28 @@ class FirstPersonRuntime:
                 last_activity_at=self._clock(),
             )
             self._pending[chat_key] = updated
-        self._save_in_progress(updated.member_id, updated.engrams)
+        self._save_in_progress(updated.member_id, updated.engrams, updated.project_id)
         return updated
 
     def set_project_id(self, chat_key: str, project_id: str) -> Intake | None:
         """Same replace-in-place shape as :meth:`record_answer`, for the one
-        other progress field mutated outside ``finish``/``abandon``."""
+        other progress field mutated outside ``finish``/``abandon``.
+
+        Round-3-gate-3 P0: also persisted durably (same "lock only the
+        in-memory dict, do disk I/O after" shape as :meth:`record_answer`)
+        so a crash between resolving the project and recording the
+        "project" question's own engram still leaves project_id resumable
+        -- see :meth:`start`'s docstring for why a partial durable record
+        (engrams without project_id, or vice versa) is the defect class
+        this closes."""
         with self._lock:
             intake = self._pending.get(chat_key)
             if intake is None:
                 return None
             updated = replace(intake, project_id=project_id)
             self._pending[chat_key] = updated
-            return updated
+        self._save_in_progress(updated.member_id, updated.engrams, updated.project_id)
+        return updated
 
     def schedule_proposal_retry(self, chat_key: str, *, next_retry_at: float, retry_count: int) -> Intake | None:
         """Same replace-in-place shape as :meth:`record_answer`, for the
@@ -1249,8 +1530,43 @@ class FirstPersonRuntime:
         self.store.save(data)
 
     def abandon(self, chat_key: str) -> None:
+        """Drop the in-memory record AND prune the durable in-progress resume
+        record for that member.
+
+        Round-3-gate-3 P3 (:1251): round-2-gate-2's version only popped the
+        in-memory dict, leaving the durable {question_id: engram_id} record
+        (and now project_id) on disk untouched. Callers invoke ``abandon()``
+        specifically when local progress is no longer trustworthy for THIS
+        chat -- a definitive non-pending status, or a member mismatch (see
+        :func:`handle_first_contact`) -- and leaving the durable record
+        behind was exactly the round-3-gate-2 P0's trigger (c): a status
+        flap from 'pending' to 'complete' abandons the in-memory record
+        here, and if the durable in_progress record survives, a LATER flap
+        back to 'pending' resumes :meth:`start` from a stale record that
+        this NEW pending episode never actually produced. TTL-based expiry
+        (:meth:`get_pending`) deliberately does NOT route through here --
+        that path (a member who is still genuinely mid-conversation, just
+        idle) is the one case resume MUST keep working for, so it prunes
+        nothing."""
         with self._lock:
-            self._pending.pop(chat_key, None)
+            intake = self._pending.pop(chat_key, None)
+        if intake is not None:
+            self._clear_in_progress(intake.member_id)
+
+    def _clear_in_progress(self, member_id: str) -> None:
+        """Sender-scoped, validity-gated (same discipline as
+        :meth:`_save_in_progress`/:meth:`finish`): on an invalid read, skip
+        the write entirely rather than rewriting the whole store from a
+        truncated read, which would silently erase every OTHER member's
+        in-progress record."""
+        data, valid = self.store.load_checked()
+        if not valid:
+            return
+        in_progress = data.get("in_progress")
+        if isinstance(in_progress, dict) and member_id in in_progress:
+            del in_progress[member_id]
+            data["in_progress"] = in_progress
+            self.store.save(data)
 
 
 def _build_resolve_project_request(
@@ -1515,6 +1831,11 @@ async def _handle_answer(
     # resumes the SAME still-current question), and a plain-text
     # approve/reject command is NEVER captured as an answer at all.
     if cleaned_answer.strip().lower().lstrip("/") in _ESCAPE_WORDS:
+        # Round-3-gate-3 P3 (:1119): an escape/pause message is genuine
+        # engagement, not silence -- refresh last_activity_at so a member
+        # who pauses and checks back in repeatedly is never idle-TTL'd out
+        # mid-pause (touch() previously had zero call sites anywhere).
+        runtime.touch(chat_key)
         await message.reply_text(_PAUSED_REPLY)
         return True
     if is_verdict_shaped(cleaned_answer):
@@ -1581,6 +1902,22 @@ async def _handle_answer(
     return True
 
 
+def _proposal_failure_reply(
+    *, retry_count: int, member_id: str, stalled_notifier: "_NotifyOncePerWindow | None"
+) -> str:
+    """Round-3-gate-3 / Athena's ruling (4): the DEFECT is the reply shape
+    when the server keeps rejecting a submission (today, always: the live
+    schema has no project_access kind), not the rejection itself -- an
+    unbounded repeat of the same "I'll try again" line forever reads as a
+    permanent loop. Once the retry backoff table is exhausted, switch to the
+    distinct, honest _PROPOSAL_STALLED_REPLY -- rate-limited on its own
+    window so it, too, is never repeated on every single message."""
+    if retry_count >= _PROPOSAL_STALLED_AFTER_ATTEMPTS:
+        if stalled_notifier is None or stalled_notifier.should_notify(member_id):
+            return _PROPOSAL_STALLED_REPLY
+    return _PROPOSAL_FAILED_REPLY
+
+
 async def _submit_proposal(
     message: Any,
     chat_key: str,
@@ -1589,6 +1926,7 @@ async def _submit_proposal(
     client: MupotOperatorClient,
     runtime: FirstPersonRuntime,
     clock: Any = time.monotonic,
+    stalled_notifier: "_NotifyOncePerWindow | None" = None,
 ) -> None:
     project_id = intake.project_id
     if not project_id:
@@ -1603,12 +1941,15 @@ async def _submit_proposal(
             "-- treating as a failed submission, not completing",
             intake.member_id,
         )
+        retry_count = intake.proposal_retry_count + 1
         runtime.schedule_proposal_retry(
             chat_key,
             next_retry_at=clock() + _next_backoff(intake.proposal_retry_count),
-            retry_count=intake.proposal_retry_count + 1,
+            retry_count=retry_count,
         )
-        await message.reply_text(_PROPOSAL_FAILED_REPLY)
+        await message.reply_text(
+            _proposal_failure_reply(retry_count=retry_count, member_id=intake.member_id, stalled_notifier=stalled_notifier)
+        )
         return
 
     def submit() -> dict[str, Any]:
@@ -1667,12 +2008,15 @@ async def _submit_proposal(
             project_id,
             response.get("error") if isinstance(response, dict) else "unknown",
         )
+        retry_count = intake.proposal_retry_count + 1
         runtime.schedule_proposal_retry(
             chat_key,
             next_retry_at=clock() + _next_backoff(intake.proposal_retry_count),
-            retry_count=intake.proposal_retry_count + 1,
+            retry_count=retry_count,
         )
-        await message.reply_text(_PROPOSAL_FAILED_REPLY)
+        await message.reply_text(
+            _proposal_failure_reply(retry_count=retry_count, member_id=intake.member_id, stalled_notifier=stalled_notifier)
+        )
         return
 
     runtime.finish(chat_key, proposal_id=proposal_id)
@@ -1687,11 +2031,30 @@ async def _retry_proposal_if_due(
     client: MupotOperatorClient,
     runtime: FirstPersonRuntime,
     clock: Any = time.monotonic,
+    stalled_notifier: "_NotifyOncePerWindow | None" = None,
 ) -> None:
+    # Round-3-gate-3 P3 (:1119): a message during the proposal-retry-wait
+    # phase is a genuine check-in, not silence -- refresh last_activity_at
+    # first so repeated check-ins during a slow backoff cannot idle the
+    # record out mid-wait (round-3-gate-2's trigger (b): "601s idle in the
+    # retry-wait phase" was reachable specifically because touch() was never
+    # called from anywhere).
+    runtime.touch(chat_key)
     if clock() < intake.next_proposal_retry_at:
-        await message.reply_text(_PROPOSAL_RETRY_WAIT_REPLY)
+        # Athena's ruling (4): the same bounded/escalating reply shape as an
+        # actual failed attempt -- a check-in during backoff must not repeat
+        # the plain wait line forever once the backoff table is exhausted.
+        await message.reply_text(
+            _proposal_failure_reply(
+                retry_count=intake.proposal_retry_count, member_id=intake.member_id, stalled_notifier=stalled_notifier
+            )
+            if intake.proposal_retry_count >= _PROPOSAL_STALLED_AFTER_ATTEMPTS
+            else _PROPOSAL_RETRY_WAIT_REPLY
+        )
         return
-    await _submit_proposal(message, chat_key, intake, client=client, runtime=runtime, clock=clock)
+    await _submit_proposal(
+        message, chat_key, intake, client=client, runtime=runtime, clock=clock, stalled_notifier=stalled_notifier
+    )
 
 
 async def handle_first_contact(
@@ -1703,9 +2066,11 @@ async def handle_first_contact(
     secret_owner: ProfileSecretOwner | None = None,
     status_cache: _StatusCache | None = None,
     probe_limiter: "_ProbeLimiter | None" = None,
+    sender_probe_limiter: "_SenderProbeLimiter | None" = None,
     lag_warning_notifier: "_NotifyOncePerWindow | None" = None,
     lag_reply_notifier: "_NotifyOncePerWindow | None" = None,
     home_wait_notifier: "_NotifyOncePerWindow | None" = None,
+    stalled_notifier: "_NotifyOncePerWindow | None" = None,
 ) -> bool:
     """Handle one inbound Telegram update for the first-person flow.
 
@@ -1767,9 +2132,13 @@ async def handle_first_contact(
             # status has changed. This also means a transient probe failure
             # for a pending member is never cached, so the very next message
             # re-probes live instead of replaying a stale "unknown" for the
-            # whole latch window.
+            # whole latch window. The shared cache's incidental per-sender
+            # rate-limiting is lost along with it for this branch -- that is
+            # what `sender_limiter` restores, independently of `cache`
+            # (round-3-gate-3 P1).
             cache=None if pending is not None else status_cache,
             probe_limiter=probe_limiter,
+            sender_limiter=sender_probe_limiter,
         )
 
     status = await asyncio.to_thread(resolve)
@@ -1847,10 +2216,29 @@ async def handle_first_contact(
             return False
 
         started = runtime.start(chat_key, member_id=status.member_id, home_squad_id=home_squad_id)
+        # Round-3-gate-3 P0 (:1856): `started.index` reflects any durable
+        # prior progress FirstPersonRuntime.start() just resumed, and CAN
+        # equal len(FIRST_PERSON_QUESTIONS) -- every question already
+        # answered, but the proposal was never successfully submitted (the
+        # live schema rejects the project_access kind today -- see
+        # _submit_proposal -- so this is the common outcome, not an edge
+        # case: a gateway restart, an idle drop during the retry-wait phase,
+        # or a status flap all resume here with a fully-answered record).
+        # Indexing FIRST_PERSON_QUESTIONS[started.index] unconditionally was
+        # the round-2-gate-2 defect -- IndexError once index == len. Route
+        # to the exact same submit-or-retry path an already-pending fully-
+        # answered record uses below, never index past the last question.
+        if started.index >= len(FIRST_PERSON_QUESTIONS):
+            pending_text = getattr(message, "text", None)
+            if isinstance(pending_text, str) and is_verdict_shaped(pending_text):
+                # Round-3-gate-2 P2 (:1455-1458): never captured even here --
+                # the host owns a genuine approve/reject regardless of where
+                # this member's OWN intake happens to be.
+                return False
+            await _retry_proposal_if_due(message, chat_key, started, client=client, runtime=runtime, stalled_notifier=stalled_notifier)
+            return True
         # Round-3-gate-2 P0 / Athena's RESUME REBINDS: ask the FIRST
-        # UNANSWERED question -- `started.index` reflects any durable prior
-        # progress FirstPersonRuntime.start() just resumed (0 for a
-        # genuinely fresh start). This message itself is the trigger that
+        # UNANSWERED question. This message itself is the trigger that
         # opens/resumes the conversation, same convention as a fresh start's
         # first message -- never treated as an answer in the same turn.
         await message.reply_text(FIRST_PERSON_QUESTIONS[started.index][1])
@@ -1864,7 +2252,7 @@ async def handle_first_contact(
             # approve/reject regardless of where this member's OWN intake
             # happens to be.
             return False
-        await _retry_proposal_if_due(message, chat_key, pending, client=client, runtime=runtime)
+        await _retry_proposal_if_due(message, chat_key, pending, client=client, runtime=runtime, stalled_notifier=stalled_notifier)
         return True
 
     handled = await _handle_answer(
@@ -1891,9 +2279,11 @@ def register_first_person(
     runtime: FirstPersonRuntime | None = None,
     status_cache: _StatusCache | None = None,
     probe_limiter: "_ProbeLimiter | None" = None,
+    sender_probe_limiter: "_SenderProbeLimiter | None" = None,
     lag_warning_notifier: "_NotifyOncePerWindow | None" = None,
     lag_reply_notifier: "_NotifyOncePerWindow | None" = None,
     home_wait_notifier: "_NotifyOncePerWindow | None" = None,
+    stalled_notifier: "_NotifyOncePerWindow | None" = None,
 ) -> None:
     settings.validate()
     if not settings.enabled:
@@ -1905,12 +2295,16 @@ def register_first_person(
         status_cache = _StatusCache()
     if probe_limiter is None:
         probe_limiter = _ProbeLimiter()
+    if sender_probe_limiter is None:
+        sender_probe_limiter = _SenderProbeLimiter()
     if lag_warning_notifier is None:
         lag_warning_notifier = _NotifyOncePerWindow(_LAG_WARNING_WINDOW_SECONDS)
     if lag_reply_notifier is None:
         lag_reply_notifier = _NotifyOncePerWindow(_LAG_REPLY_WINDOW_SECONDS)
     if home_wait_notifier is None:
         home_wait_notifier = _NotifyOncePerWindow(_HOME_NOT_READY_WINDOW_SECONDS)
+    if stalled_notifier is None:
+        stalled_notifier = _NotifyOncePerWindow(_PROPOSAL_STALLED_REPLY_WINDOW_SECONDS)
     wired_applications: list[tuple[Any, Any]] = []
 
     def factory(application: Any, adapter: Any) -> None:
@@ -1931,9 +2325,11 @@ def register_first_person(
                 secret_owner=secret_owner,
                 status_cache=status_cache,
                 probe_limiter=probe_limiter,
+                sender_probe_limiter=sender_probe_limiter,
                 lag_warning_notifier=lag_warning_notifier,
                 lag_reply_notifier=lag_reply_notifier,
                 home_wait_notifier=home_wait_notifier,
+                stalled_notifier=stalled_notifier,
             )
             if handled:
                 raise ApplicationHandlerStop

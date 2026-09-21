@@ -56,12 +56,17 @@ Design ruling pinned into this build (Athena G-FP2-S2, seq 5064, 2026-09-21, plu
 the round-2 correction above):
   (a) HOME-CREATION AUTHORITY: bind first. The member row exists only via the
       invite door or admin create; the Telegram bind itself is out of scope here
-      (mupot#1411, migration 0154, already live). ``create_home_for_member`` runs
-      only once the SERVER'S OWN status resolves ``bound=True`` and
-      ``intake_state=="pending"`` for that sender -- never speculatively, never
-      from a local guess, never from a synthesized ``/start`` per message (round-2
-      P1-1/P1-2: that was stranger-floodable and leaked the sender's display name
-      to the bind surface on every message).
+      (mupot#1411, migration 0154, already live). Home creation is mupot's job
+      alone (brief 2f(a)) -- this module never invents a call for it (round-3:
+      ``create_home_for_member`` was verified to have NO exposed MCP action or
+      ``/im`` route on mupot's kasra/fp01-slice2-proposal-chain branch, only an
+      internal TypeScript function called by that repo's own unit tests; see
+      :func:`handle_first_contact`). A bound, pending member with a null
+      ``home_squad_id`` is left completely untouched until a later status
+      probe reports one -- never speculatively, never from a local guess,
+      never from a synthesized ``/start`` per message (round-2 P1-1/P1-2:
+      that was stranger-floodable and leaked the sender's display name to
+      the bind surface on every message).
   (b) FIRST-DM RAW TEXT: write-through, no durable local copy. An answer lives in
       a local variable only until ``squad_remember``'s response itself carries an
       ``engram_id`` (never a read-back -- recall is eventually consistent in
@@ -246,7 +251,6 @@ def register_first_person_skill(ctx: Any) -> None:
         logger.warning("mupot plugin: could not register the first-person skill", exc_info=True)
 
 
-_HOME_FAILURE_REPLY = "Something went wrong opening your space -- please try sending that again in a moment."
 _WRITE_FAILURE_REPLY = "I couldn't save that -- please send it again."
 _COMPLETE_REPLY = "Thanks -- I've sent your access request to the team for a decision."
 # Round-3 ruling (8): keep the refusal as-is (a false positive beats a leaked
@@ -757,9 +761,11 @@ class Intake:
     marker -- see :func:`_submit_proposal`).
 
     Round-3 P3-G / ruling (7): frozen. ``home_squad_id`` (and ``member_id``)
-    are set exactly once, from a server response (``StatusResolution.
-    home_squad_id`` or ``create_home_for_member``'s result), in
-    :meth:`FirstPersonRuntime.start`, and NOTHING in this module ever
+    are set exactly once, from ``StatusResolution.home_squad_id`` (server
+    status is the ONLY source now -- see :func:`handle_first_contact`'s
+    HOME-CREATION AUTHORITY note; this module has no call of its own that
+    could mint one), in :meth:`FirstPersonRuntime.start`, and NOTHING in
+    this module ever
     reassigns them afterward -- in particular never derives them from an
     answer's text (round-2 mutation M4). Progress fields (``index``,
     ``project_id``, ``engrams``, the proposal-retry pair) still change over
@@ -811,8 +817,8 @@ class FirstPersonRuntime:
         via :func:`resolve_member_status`) is what actually gates every
         decision to consume an update; this only exists as a short local
         dedupe window so a burst of messages within one completed intake
-        cannot double-trigger ``create_home_for_member``/a second intake
-        before the server's own state has had a chance to reflect it. Once
+        cannot double-trigger a second intake before the server's own state
+        has had a chance to reflect it. Once
         that window (``_COMPLETION_CACHE_TTL_SECONDS``) has passed, this
         defers entirely back to whatever the server says next.
         """
@@ -939,38 +945,125 @@ class FirstPersonRuntime:
             self._pending.pop(chat_key, None)
 
 
-def _resolve_project_id(client: MupotOperatorClient, member_id: str, name: str) -> str | None:
+def _build_resolve_project_request(
+    settings: FirstPersonSettings,
+    secret: str,
+    envelope: Mapping[str, Any],
+    query: str,
+) -> Request:
+    """Builds the ONE request this module ever sends to resolve a project
+    reference. Isolated in this single function ON PURPOSE (Athena's ruling,
+    2026-09-21) so that any future fence change to this route is a
+    one-function edit.
+
+    History: mupot#1488 first exposed ``POST /im/resolve-project`` keyed on a
+    bare ``chat_id`` field. Adversarial review of #1488's grant chain found
+    that fence is NO fence at all -- any holder of the shared webhook secret
+    could supply an arbitrary ``chat_id`` and act as whichever member happens
+    to be bound to it; a bare id is not proof of provenance the way an
+    authenticated Telegram update is. Athena's ruling: the fix is ENVELOPE
+    IDENTITY, not a per-intake token (a token idea was floated and withdrawn).
+    This request now carries the SAME authenticated Telegram envelope shape
+    ``telegram_control.py``'s ``_sanitized_envelope``/``relay_telegram_update``
+    already relay to ``/im/webhook`` -- ``{update_id, message: {from: {id},
+    chat: {id, type}, text}}`` -- built from THIS turn's own already-fenced
+    envelope (:func:`sanitized_first_contact_envelope`), never a synthesized
+    or stale one, plus a top-level ``query``. The server is expected to
+    derive the member from the envelope exactly as ``/webhook`` does; this
+    module never sends ``member_id`` or a bare ``chat_id`` as a selector.
+
+    ASSUMPTION FLAG -- re-verify before this ships: coded against
+    "envelope + query" per Athena's ruling. The successor branch
+    (``kasra/fp01-slice2-proposal-chain-v2``) did not exist yet as of this
+    build -- only ``kasra/fp01-slice2-proposal-chain``, whose
+    ``/resolve-project`` still used the now-superseded bare-``chat_id``
+    fence (verified by reading that branch's ``src/im/index.ts`` directly).
+    Confirm this exact request shape against the successor's actual handler
+    once it exists.
+
+    ``message.from`` deliberately carries ONLY ``id`` -- no display-name field,
+    matching every other first-person probe's "never send a display name"
+    rule (round-2 P1-1/P1-2) -- and ``message.text`` is left empty: the
+    project name the human typed travels ONLY in ``query``, never duplicated
+    into the envelope's own text field.
+    """
+    body = {
+        "update_id": envelope["update_id"],
+        "message": {
+            "from": {"id": envelope["user_id"]},
+            "chat": {"id": envelope["chat_id"], "type": "private"},
+            "text": "",
+        },
+        "query": query,
+    }
+    return Request(
+        urljoin(settings.base_url.rstrip("/") + "/", "/im/resolve-project"),
+        data=json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-Telegram-Bot-Api-Secret-Token": secret,
+        },
+        method="POST",
+    )
+
+
+def _resolve_member_project(
+    settings: FirstPersonSettings,
+    envelope: Mapping[str, Any],
+    query: str,
+    *,
+    secret_owner: ProfileSecretOwner | None = None,
+) -> str | None:
     """Resolve a project reference typed by a human against ONLY the projects
     that member can read (round-2 P2-1: never Mubot's own operator-wide
-    ``project_list``). ``resolve_member_project`` is a mupot-side contract
-    dependency this build codes against -- see PR body. Fails closed (``None``)
-    on any transport/shape failure.
+    ``project_list``), via the authenticated ``/im/resolve-project`` surface
+    -- see :func:`_build_resolve_project_request` for the exact request shape
+    and the fence history. Response shape (mupot#1488, chat_id-fence version
+    verified live; the successor's is assumed identical apart from the
+    request's own identity fence): ``{bound: bool, member_id: str|null,
+    projects: [{id, slug, name}, ...]}``. Fails closed (``None``) on any
+    transport/shape failure, an unbound result, no match, or an AMBIGUOUS
+    multi-candidate result with no exact slug match -- this module never
+    guesses among fuzzy candidates; the member is re-asked instead."""
 
-    Carry-over note (mupot#1488): mupot's own server-side implementation of
-    this action is documented as ``POST /im/resolve-project`` rather than a
-    handler on the generic ``/actions/<tool>`` catalog. This module keeps
-    calling it BY ACTION NAME through the shared
-    :class:`MupotOperatorClient` (the args shape, ``{member_id, name}`` ->
-    ``{project_id: str|null}``, is unchanged from round 2) on the working
-    assumption that mupot's action router forwards this specific action to
-    that route internally -- that forwarding is NOT confirmed live as of this
-    build. If it turns out ``/actions/resolve_member_project`` and
-    ``/im/resolve-project`` are two independent surfaces and only the latter
-    is wired up, this call keeps failing closed (``project_id=None``,
-    re-asked at question 3) rather than silently trusting the wrong
-    authority -- same documented-gap posture as ``create_home_for_member``
-    and ``routine_proposal_submit``'s ``project_access`` kind."""
+    def _do() -> str | None:
+        try:
+            secret = read_profile_secret(settings.webhook_secret_env)
+        except RuntimeError:
+            return None
+        if len(secret) > 256:
+            return None
+        request = _build_resolve_project_request(settings, secret, envelope, query)
+        if len(request.data or b"") > _MAX_REQUEST_BYTES:
+            return None
+        try:
+            with build_opener(_NoRedirect()).open(
+                request, timeout=min(float(settings.timeout), _STATUS_PROBE_TIMEOUT_SECONDS)
+            ) as response:
+                raw = response.read(_MAX_RESPONSE_BYTES + 1)
+        except Exception:
+            return None
+        if len(raw) > _MAX_RESPONSE_BYTES:
+            return None
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(parsed, dict) or parsed.get("bound") is not True:
+            return None
+        projects = parsed.get("projects")
+        if not isinstance(projects, list) or not projects:
+            return None
+        top = projects[0]
+        if not isinstance(top, dict):
+            return None
+        exact = isinstance(top.get("slug"), str) and top["slug"].strip().lower() == query.strip().lower()
+        if len(projects) > 1 and not exact:
+            return None  # ambiguous -- never guess among fuzzy candidates
+        candidate = top.get("id")
+        return candidate.strip() if isinstance(candidate, str) and candidate.strip() else None
 
-    response = client.call("resolve_member_project", {"member_id": member_id, "name": name})
-    if not isinstance(response, dict) or response.get("ok") is not True:
-        return None
-    result = response.get("result")
-    if not isinstance(result, dict):
-        return None
-    candidate = result.get("project_id")
-    if isinstance(candidate, str) and candidate.strip():
-        return candidate.strip()
-    return None
+    return _do() if secret_owner is None else _with_secret_owner(secret_owner, _do)
 
 
 # --------------------------------------------------------------------------
@@ -1036,6 +1129,9 @@ async def _handle_answer(
     *,
     client: MupotOperatorClient,
     runtime: FirstPersonRuntime,
+    settings: FirstPersonSettings,
+    envelope: Mapping[str, Any],
+    secret_owner: ProfileSecretOwner | None = None,
 ) -> None:
     raw_answer = getattr(message, "text", None)
     if not isinstance(raw_answer, str) or not raw_answer.strip():
@@ -1066,7 +1162,7 @@ async def _handle_answer(
 
     if question_id == "project" and intake.project_id is None:
         def resolve_project() -> str | None:
-            return _resolve_project_id(client, intake.member_id, cleaned_answer)
+            return _resolve_member_project(settings, envelope, cleaned_answer, secret_owner=secret_owner)
 
         project_id = await asyncio.to_thread(resolve_project)
         # cleaned_answer used only to compose this reply; this call frame ends
@@ -1332,25 +1428,23 @@ async def handle_first_contact(
         if runtime.is_complete_or_unknown(status.member_id):
             return False
 
-        home_squad_id = status.home_squad_id
-        if not home_squad_id:
-            def create_home() -> dict[str, Any]:
-                return client.call("create_home_for_member", {"member_id": status.member_id})
+        if not status.home_squad_id:
+            # Verified on mupot's kasra/fp01-slice2-proposal-chain, 2026-09-21:
+            # createHomeForMember exists ONLY as an internal TypeScript
+            # function (src/org/service.ts) -- grepping every call site in
+            # that repo found none outside its own unit tests, which call it
+            # directly by import. There is NO exposed MCP action and NO /im
+            # route for it; `FIRST_PERSON_ACTIONS` no longer lists it (see
+            # mupot_operator.py) precisely so nothing here can pretend
+            # otherwise. Per brief 2f(a), home creation is gated by the
+            # member's own first contact and is mupot's job alone -- this
+            # module never invents a call for it. Fail-safe for the intake:
+            # a bound, pending member with no home yet is left completely
+            # untouched (no reply, no state) until a later status probe
+            # reports a non-null home_squad_id.
+            return False
 
-            home_response = await asyncio.to_thread(create_home)
-            home_result = home_response.get("result") if isinstance(home_response, dict) else None
-            candidate = home_result.get("squad_id") if isinstance(home_result, dict) else None
-            if (
-                not isinstance(home_response, dict)
-                or home_response.get("ok") is not True
-                or not isinstance(candidate, str)
-                or not candidate.strip()
-            ):
-                await message.reply_text(_HOME_FAILURE_REPLY)
-                return True
-            home_squad_id = candidate.strip()
-
-        runtime.start(chat_key, member_id=status.member_id, home_squad_id=home_squad_id)
+        runtime.start(chat_key, member_id=status.member_id, home_squad_id=status.home_squad_id)
         await message.reply_text(FIRST_PERSON_QUESTIONS[0][1])
         return True
 
@@ -1358,7 +1452,10 @@ async def handle_first_contact(
         await _retry_proposal_if_due(message, chat_key, pending, client=client, runtime=runtime)
         return True
 
-    await _handle_answer(message, chat_key, pending, client=client, runtime=runtime)
+    await _handle_answer(
+        message, chat_key, pending, client=client, runtime=runtime,
+        settings=settings, envelope=envelope, secret_owner=secret_owner,
+    )
     return True
 
 

@@ -10,7 +10,7 @@ description: >
   registered tool for any capability-granting surface. Load this skill only to
   understand, document, or extend the flow -- it is reference material, not a
   script an LLM turn executes live.
-version: "0.3.0"
+version: "0.4.0"
 tools: []
 disallowed_tools:
   - project_squad_set
@@ -97,9 +97,14 @@ touches the conversation when that status says intake is actually pending.
    state stored, no stopped propagation. This is what lets a bound member's
    plain `approve <id>` message (#1425) and a stranger's message both fall
    through exactly as if this skill did not exist.
-3. **Home, once pending.** If `home_squad_id` is still null, the plugin calls
-   the mupot action `create_home_for_member` for that member (see "Mupot-side
-   contract" below) and only then asks question 1.
+3. **Home, once pending -- read-only.** If `home_squad_id` is still null, the
+   plugin does **not** try to create one (round 3: `create_home_for_member`
+   was verified to have no exposed MCP action or `/im` route at all on
+   mupot's kasra/fp01-slice2-proposal-chain branch -- it is an internal
+   TypeScript function called only by that repo's own unit tests). Home
+   creation is mupot's job alone (brief 2f(a), gated by the member's own
+   first contact); this module waits, untouched, for a later status probe to
+   report a non-null `home_squad_id` before asking question 1.
 4. **Write-through, no durable raw copy.** Each answer is checked for anything
    credential-shaped (refused, re-asked, never stored or logged) and stripped
    of control/bidi-override characters, then held in a local variable only
@@ -109,9 +114,10 @@ touches the conversation when that status says intake is actually pending.
    `{question_id: engram_id}` survives, and only in one completion marker
    written once, at the very end of a **successfully submitted** intake.
 5. **Propose, never grant.** After the fifth answer, the plugin resolves the
-   named project against only the projects that member can read (never
-   Mubot's own project catalog) and calls `routine_proposal_submit` asking for
-   `write` access on that project for this member, reason
+   named project via the authenticated `/im/resolve-project` surface (never
+   Mubot's own project catalog, and never through a plugin-action call --
+   see "Mupot-side contract" below) and calls `routine_proposal_submit`
+   asking for `write` access on that project for this member, reason
    `"first-person intake"`. **A failed submission never writes the completion
    marker** -- the member is told honestly that it didn't go through yet, the
    plugin retries (with backoff) the next time they message, and nothing is
@@ -165,24 +171,39 @@ Slice 2 chain PR lands these contracts.**
   on the authenticated status-probe surface. Any response missing or malformed
   in these fields resolves as `intake_state: "unknown"` here, which this module
   treats exactly like "not pending".
-- **`create_home_for_member`** is called as a plugin action
-  (`{"member_id": "<uuid>"}`, expected result `{"squad_id": "<uuid>"}`). If this
-  action does not exist yet on `main`, that is the dependency -- see
-  mupot#1443's Slice 1 acceptance criteria for the intended shape.
-- **`resolve_member_project`** (new): `{"member_id": "<uuid>", "name": "<typed
-  text>"}` → `{"project_id": "<uuid>"|null}`, scoped server-side to projects
-  that member can actually read. Round-2 P2-1: this replaced a plain
-  `project_list` call, which would have resolved against Mubot's own
-  operator-wide catalog instead of the member's own standing. mupot#1488
-  documents mupot's own server-side implementation of this action as
-  `POST /im/resolve-project` (not a handler on the generic `/actions/<tool>`
-  catalog). This plugin still calls it BY ACTION NAME through the shared
-  operator actions surface (args/result shape unchanged) on the working
-  assumption mupot's action router forwards it internally to that route --
-  **not confirmed live as of this build.** If that forwarding turns out not
-  to exist, the call keeps failing closed (`project_id: null`, re-asked at
-  question 3) rather than trusting the wrong authority; flagged here with the
-  same documented-gap posture as the two contracts above.
+- **Home creation** has NO plugin-callable surface at all (round 3, verified
+  by reading mupot's kasra/fp01-slice2-proposal-chain branch directly:
+  `createHomeForMember` is an internal `src/org/service.ts` function with no
+  MCP action and no `/im` route; every call site outside its own definition
+  is that repo's own unit tests). This plugin does not call it, and does not
+  invent a substitute -- see point 3 above and `handle_first_contact`'s
+  HOME-CREATION AUTHORITY note. Whatever wires a home into existence for a
+  first-time member is entirely mupot's responsibility.
+- **`POST /im/resolve-project`** -- the SAME shared-secret auth as
+  `/im/webhook` (`X-Telegram-Bot-Api-Secret-Token`, timing-safe compared
+  against `IM_WEBHOOK_SECRET`). **Fence history, load-bearing:** mupot#1488
+  first exposed this route keyed on a bare `{chat_id, query, limit?}` body --
+  adversarial review of #1488's grant chain found that fence is NO fence at
+  all: any holder of the shared secret could supply an arbitrary `chat_id`
+  and act as whichever member happens to be bound to it. Athena's ruling
+  (2026-09-21): the fix is **ENVELOPE IDENTITY**, not a per-intake token (a
+  token design was floated and explicitly withdrawn). This plugin now sends
+  the SAME authenticated Telegram envelope shape `telegram_control.py`
+  already relays to `/im/webhook` -- `{update_id, message: {from: {id},
+  chat: {id, type}, text: ""}, query}` -- built from THIS turn's own
+  already-fenced envelope, never a synthesized or stale one; the server is
+  expected to derive the member from the envelope exactly as `/webhook`
+  does, never from a caller-supplied `member_id` or bare `chat_id`. Expected
+  response: `{bound: bool, member_id: str|null, projects: [{id, slug,
+  name}, ...]}` (verified live on the chat_id-fence version; the
+  successor's response shape is assumed identical). **ASSUMPTION FLAG:**
+  the successor branch (`kasra/fp01-slice2-proposal-chain-v2`) did not exist
+  yet as of this build -- re-verify this exact request shape against its
+  actual handler before this ships. All request-building for this route is
+  isolated in ONE function, `first_person.py`'s
+  `_build_resolve_project_request`, precisely so that verification is a
+  one-function edit. Multiple candidates with no exact slug match are
+  treated as ambiguous and refused (never guessed).
 - **`routine_proposal_submit`**'s live schema (`version: "routine.proposal/v1"`,
   `action.kind` one of `create_task | dispatch_flight | request_review |
   ask_human | no_action`) has **no project-access kind**. This skill submits
@@ -220,7 +241,7 @@ skills:
 ```
 
 **G-FP3 assertion** (what to actually check on the live gateway, not what to
-assume): `hermes plugins show mupot` reports version `0.6.0` (bumped in this
+assume): `hermes plugins show mupot` reports version `0.7.0` (bumped in this
 PR) at the installed git rev, and `hermes skills list` shows `mupot:first-person`
 present. SKILL.md's own `version:` frontmatter field is documentation only --
 nothing in Hermes parses it; the plugin-level version + git rev is the only
@@ -232,7 +253,12 @@ Never through a registered LLM tool -- see `mupot_operator.py`'s
 `FIRST_PERSON_ACTIONS` frozenset, which is deliberately its own allowlist,
 never merged into the set of tools Mubot's model can call:
 
-- `create_home_for_member`
 - `squad_remember`
-- `resolve_member_project`
 - `routine_proposal_submit`
+
+Project resolution (`POST /im/resolve-project`) and the status probe
+(`POST /im/webhook`) are NOT plugin actions -- both are raw, shared-secret-
+authenticated HTTP calls this module makes directly (`_resolve_member_project`
+and `resolve_member_status` respectively), never routed through
+`MupotOperatorClient`/`FIRST_PERSON_ACTIONS`. Home creation has no call of
+any kind (see "Mupot-side contract" above).

@@ -35,8 +35,10 @@ from plugin.first_person import (
     _ProbeLimiter,
     _StatusCache,
     _UNRELATED_ANSWER_REPLY,
+    _build_resolve_project_request,
     _classify_intake_state,
     _looks_like_credential,
+    _resolve_member_project,
     _sanitize_answer,
     handle_first_contact,
     register_first_person,
@@ -427,7 +429,7 @@ async def test_unknown_status_fails_open_when_contract_fields_are_absent(
 @pytest.mark.asyncio
 async def test_edited_message_is_never_consumed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     install_status_stub(monkeypatch, lambda *_: pending_status())
-    client = FakeClient({"create_home_for_member": {"ok": True, "result": {"squad_id": "home-squad-1"}}})
+    client = FakeClient()
     runtime = FirstPersonRuntime(tmp_path / "state.json")
     update = Update(message=Message(text="edited text"), edited_message=object())
 
@@ -438,26 +440,29 @@ async def test_edited_message_is_never_consumed(monkeypatch: pytest.MonkeyPatch,
 
 
 @pytest.mark.asyncio
-async def test_pending_status_with_no_home_yet_creates_one_and_asks_q1(
+async def test_pending_status_with_no_home_yet_is_left_untouched(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Round 3: create_home_for_member has NO exposed MCP action or /im route
+    (verified on mupot's kasra/fp01-slice2-proposal-chain branch) -- this
+    module never invents a call for it. A bound, pending member with a null
+    home_squad_id is left completely untouched (no reply, no state) rather
+    than trying to provision one."""
     install_status_stub(monkeypatch, lambda *_: pending_status(home_squad_id=None))
-    client = FakeClient({"create_home_for_member": {"ok": True, "result": {"squad_id": "home-squad-1"}}})
+    client = FakeClient()
     runtime = FirstPersonRuntime(tmp_path / "state.json")
     update = Update(message=Message(text="hello!"))
 
     handled = await handle_first_contact(update, settings=valid_settings(), client=client, runtime=runtime)
 
-    assert handled is True
-    assert update.effective_message.replies == [FIRST_PERSON_QUESTIONS[0][1]]
-    pending = runtime.get_pending("123")
-    assert pending is not None
-    assert pending.home_squad_id == "home-squad-1"
-    assert ("create_home_for_member", {"member_id": "member-1"}) in client.calls
+    assert handled is False
+    assert update.effective_message.replies == []
+    assert runtime.get_pending("123") is None
+    assert client.calls == []
 
 
 @pytest.mark.asyncio
-async def test_pending_status_with_existing_home_skips_home_creation(
+async def test_pending_status_with_existing_home_starts_intake(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     install_status_stub(monkeypatch, lambda *_: pending_status(home_squad_id="home-squad-1"))
@@ -468,7 +473,11 @@ async def test_pending_status_with_existing_home_skips_home_creation(
     handled = await handle_first_contact(update, settings=valid_settings(), client=client, runtime=runtime)
 
     assert handled is True
-    assert ("create_home_for_member", {"member_id": "member-1"}) not in client.calls
+    assert update.effective_message.replies == [FIRST_PERSON_QUESTIONS[0][1]]
+    pending = runtime.get_pending("123")
+    assert pending is not None
+    assert pending.home_squad_id == "home-squad-1"
+    assert client.calls == []  # no plugin-action call of any kind for home
 
 
 @pytest.mark.asyncio
@@ -519,7 +528,7 @@ async def test_member_mismatch_mid_chat_abandons_stale_progress(
         return pending_status(member_id="member-2")  # a different member now resolves
 
     install_status_stub(monkeypatch, resolver)
-    client = FakeClient({"create_home_for_member": {"ok": True, "result": {"squad_id": "home-squad-2"}}})
+    client = FakeClient()
     runtime = FirstPersonRuntime(tmp_path / "state.json")
     await handle_first_contact(
         Update(message=Message(text="hello!")), settings=valid_settings(), client=client, runtime=runtime
@@ -572,12 +581,6 @@ def _client_for_full_intake() -> FakeClient:
             self.calls.append((action, dict(args)))
             if action not in FIRST_PERSON_ACTIONS:
                 return {"ok": False, "error": "action_not_allowed"}
-            if action == "create_home_for_member":
-                return {"ok": True, "result": {"squad_id": "home-squad-1"}}
-            if action == "resolve_member_project":
-                if args.get("name", "").strip().lower() == "psychonom":
-                    return {"ok": True, "result": {"project_id": "proj-1"}}
-                return {"ok": True, "result": {"project_id": None}}
             if action == "squad_remember":
                 engram_counter["n"] += 1
                 return {"ok": True, "result": {"engram_id": f"engram-{engram_counter['n']}"}}
@@ -588,8 +591,29 @@ def _client_for_full_intake() -> FakeClient:
     return _SequencedClient()
 
 
-async def _run_intake(monkeypatch, client, runtime, answers, *, member_id="member-1", home_squad_id="home-squad-1"):
+def _default_project_resolver(_settings: Any, _envelope: Any, query: str, *, secret_owner: Any = None) -> str | None:
+    """Round 3: project resolution moved off client.call onto the
+    authenticated /im/resolve-project surface (_resolve_member_project) --
+    tests bypass ITS wire format the same way install_status_stub bypasses
+    resolve_member_status's, since the wire format gets its own dedicated
+    tests below. Matches round-2's fixture project ("psychonom" -> "proj-1")."""
+    return "proj-1" if query.strip().lower() == "psychonom" else None
+
+
+async def _run_intake(
+    monkeypatch,
+    client,
+    runtime,
+    answers,
+    *,
+    member_id="member-1",
+    home_squad_id="home-squad-1",
+    project_resolver=None,
+):
     install_status_stub(monkeypatch, lambda *_: pending_status(member_id=member_id, home_squad_id=home_squad_id))
+    monkeypatch.setattr(
+        "plugin.first_person._resolve_member_project", project_resolver or _default_project_resolver
+    )
     settings = valid_settings()
     update = Update(message=Message(text="hello!"))
     await handle_first_contact(update, settings=settings, client=client, runtime=runtime)
@@ -609,15 +633,26 @@ async def test_full_five_question_intake_writes_to_home_and_submits_proposal(
     runtime = FirstPersonRuntime(state_path)
     answers = ["Ada Example", "Engineer", "psychonom", "Wire up the intake flow", "Nothing else"]
 
-    last_update = await _run_intake(monkeypatch, client, runtime, answers)
+    project_calls: list[tuple[Any, str]] = []
+
+    def project_resolver(_settings: Any, envelope: Any, query: str, *, secret_owner: Any = None) -> str | None:
+        project_calls.append((envelope, query))
+        return "proj-1" if query.strip().lower() == "psychonom" else None
+
+    last_update = await _run_intake(monkeypatch, client, runtime, answers, project_resolver=project_resolver)
 
     remember_calls = [args for action, args in client.calls if action == "squad_remember"]
     assert len(remember_calls) == 5
     assert all(args["squad_id"] == "home-squad-1" for args in remember_calls)
     assert [args["text"] for args in remember_calls] == answers
 
-    project_calls = [args for action, args in client.calls if action == "resolve_member_project"]
-    assert project_calls == [{"member_id": "member-1", "name": "psychonom"}]
+    # Round 3: project resolution is a raw /im/resolve-project call keyed on
+    # the CURRENT turn's own identity envelope, never member_id/name via
+    # client.call.
+    assert [query for _envelope, query in project_calls] == ["psychonom"]
+    envelope_used = project_calls[0][0]
+    assert envelope_used["chat_id"] == 123
+    assert envelope_used["user_id"] == 123
 
     proposal_calls = [args for action, args in client.calls if action == "routine_proposal_submit"]
     assert len(proposal_calls) == 1
@@ -670,17 +705,12 @@ async def test_home_squad_id_is_never_derived_from_an_answer(
 ) -> None:
     """Round-2 mutation M4: even a project answer engineered to look like a
     squad id must never change home_squad_id."""
-    client = _client_for_full_intake()
     runtime = FirstPersonRuntime(tmp_path / "state.json")
     suspicious_project_answer = "home-squad-EVIL psychonom"  # contains "squad" and resolves via name match below
 
     class _ClientWithMatchingProject(FakeClient):
         def call(self, action: str, args: dict[str, Any]) -> Any:
             self.calls.append((action, dict(args)))
-            if action == "create_home_for_member":
-                return {"ok": True, "result": {"squad_id": "home-squad-1"}}
-            if action == "resolve_member_project":
-                return {"ok": True, "result": {"project_id": "proj-1"}}
             if action == "squad_remember":
                 return {"ok": True, "result": {"engram_id": "engram-x"}}
             if action == "routine_proposal_submit":
@@ -689,6 +719,10 @@ async def test_home_squad_id_is_never_derived_from_an_answer(
 
     client = _ClientWithMatchingProject()
     install_status_stub(monkeypatch, lambda *_: pending_status(home_squad_id="home-squad-1"))
+    monkeypatch.setattr(
+        "plugin.first_person._resolve_member_project",
+        lambda _settings, _envelope, _query, *, secret_owner=None: "proj-1",
+    )
     settings = valid_settings()
     update = Update(message=Message(text="hello!"))
     await handle_first_contact(update, settings=settings, client=client, runtime=runtime)
@@ -799,10 +833,6 @@ async def test_proposal_failure_keeps_pending_and_replies_honestly_then_retries(
     class _FlakyClient(FakeClient):
         def call(self, action: str, args: dict[str, Any]) -> Any:
             self.calls.append((action, dict(args)))
-            if action == "create_home_for_member":
-                return {"ok": True, "result": {"squad_id": "home-squad-1"}}
-            if action == "resolve_member_project":
-                return {"ok": True, "result": {"project_id": "proj-1"}}
             if action == "squad_remember":
                 return {"ok": True, "result": {"engram_id": f"engram-{len(self.calls)}"}}
             if action == "routine_proposal_submit":
@@ -816,6 +846,10 @@ async def test_proposal_failure_keeps_pending_and_replies_honestly_then_retries(
     state_path = tmp_path / "state.json"
     runtime = FirstPersonRuntime(state_path)
     install_status_stub(monkeypatch, lambda *_: pending_status())
+    monkeypatch.setattr(
+        "plugin.first_person._resolve_member_project",
+        lambda _settings, _envelope, _query, *, secret_owner=None: "proj-1",
+    )
     settings = valid_settings()
 
     answers = ["Ada Example", "Engineer", "psychonom", "Wire this up", "Nothing else"]
@@ -1326,6 +1360,106 @@ async def test_bidi_obfuscated_credential_is_refused_end_to_end_never_reaches_me
     pending = runtime.get_pending("123")
     assert pending is not None and pending.index == 0
     assert pending.engrams == {}
+
+
+# ---------------------------------------------------------------------------
+# resolve-project transport: envelope identity, never member_id/chat_id as a
+# bare selector (Athena's ruling on the /im/resolve-project fence, 2026-09-21)
+# ---------------------------------------------------------------------------
+
+
+def _sample_envelope() -> dict[str, Any]:
+    return {"update_id": 456, "chat_id": 123, "user_id": 123, "text": "psychonom"}
+
+
+def test_resolve_project_request_carries_the_authenticated_envelope_never_a_bare_selector() -> None:
+    request = _build_resolve_project_request(valid_settings(), "the-secret", _sample_envelope(), "psychonom")
+    assert request.get_header("X-telegram-bot-api-secret-token") == "the-secret"
+    body = json.loads(request.data.decode("utf-8"))
+    assert body == {
+        "update_id": 456,
+        "message": {"from": {"id": 123}, "chat": {"id": 123, "type": "private"}, "text": ""},
+        "query": "psychonom",
+    }
+    # Never a bare member_id/chat_id selector at the top level -- identity
+    # travels ONLY inside the envelope's message.chat/message.from.
+    assert "member_id" not in body
+    assert "chat_id" not in body
+
+
+def test_resolve_project_request_never_carries_a_display_name() -> None:
+    request = _build_resolve_project_request(valid_settings(), "the-secret", _sample_envelope(), "psychonom")
+    body = json.loads(request.data.decode("utf-8"))
+    assert set(body["message"]["from"]) == {"id"}
+
+
+def test_resolve_member_project_wire_happy_path_single_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
+    opener = install_probe(
+        monkeypatch,
+        response=json.dumps(
+            {"bound": True, "member_id": "member-1", "projects": [{"id": "proj-1", "slug": "psychonom", "name": "Psychonom"}]}
+        ).encode(),
+    )
+    project_id = _resolve_member_project(valid_settings(), _sample_envelope(), "psychonom")
+    assert project_id == "proj-1"
+    request = opener.calls[0]
+    assert request.full_url.endswith("/im/resolve-project")
+
+
+def test_resolve_member_project_no_match_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_probe(monkeypatch, response=json.dumps({"bound": True, "member_id": "member-1", "projects": []}).encode())
+    assert _resolve_member_project(valid_settings(), _sample_envelope(), "nonexistent") is None
+
+
+def test_resolve_member_project_unbound_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_probe(monkeypatch, response=json.dumps({"bound": False, "member_id": None, "projects": []}).encode())
+    assert _resolve_member_project(valid_settings(), _sample_envelope(), "psychonom") is None
+
+
+def test_resolve_member_project_ambiguous_multi_candidate_refuses_to_guess(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two fuzzy matches, neither an exact slug match -- never guess."""
+    install_probe(
+        monkeypatch,
+        response=json.dumps(
+            {
+                "bound": True,
+                "member_id": "member-1",
+                "projects": [
+                    {"id": "proj-1", "slug": "psychonomics", "name": "Psychonomics"},
+                    {"id": "proj-2", "slug": "psycho-analysis", "name": "Psycho Analysis"},
+                ],
+            }
+        ).encode(),
+    )
+    assert _resolve_member_project(valid_settings(), _sample_envelope(), "psycho") is None
+
+
+def test_resolve_member_project_exact_slug_match_wins_among_multiple(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An exact slug match at the top (ORDER BY slug=? DESC on the server) is
+    trusted even when other fuzzy candidates are also present."""
+    install_probe(
+        monkeypatch,
+        response=json.dumps(
+            {
+                "bound": True,
+                "member_id": "member-1",
+                "projects": [
+                    {"id": "proj-1", "slug": "psychonom", "name": "Psychonom"},
+                    {"id": "proj-2", "slug": "psychonom-labs", "name": "Psychonom Labs"},
+                ],
+            }
+        ).encode(),
+    )
+    assert _resolve_member_project(valid_settings(), _sample_envelope(), "psychonom") == "proj-1"
+
+
+def test_resolve_member_project_transport_failure_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("plugin.first_person.read_profile_secret", lambda _name: "secret")
+    monkeypatch.setattr(
+        "plugin.first_person.build_opener",
+        lambda *_: Opener(RuntimeError("boom")),
+    )
+    assert _resolve_member_project(valid_settings(), _sample_envelope(), "psychonom") is None
 
 
 # ---------------------------------------------------------------------------

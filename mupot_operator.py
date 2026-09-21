@@ -53,7 +53,7 @@ VERDICT_ACTIONS = frozenset({"task_verdict"})
 # MupotOperatorClient.call() -- same "own frozenset, never a registered LLM tool"
 # shape as VERDICT_ACTIONS above, for the same reason: Mubot (the model) must
 # never be ABLE to reach these, not merely instructed not to. register_operator_tools
-# below never maps any of these four to a tool name, so there is no registered
+# below never maps any of these to a tool name, so there is no registered
 # surface for a model to call even if it tried. Deliberately excludes
 # project_squad_set / grant_agent_capability / grant_gate_capability / any other
 # manage_access surface -- first_person.py proposes access via
@@ -61,18 +61,23 @@ VERDICT_ACTIONS = frozenset({"task_verdict"})
 # tests/test_first_person.py::test_first_person_actions_exclude_every_manage_access_surface
 # and ::test_first_person_actions_are_never_registered_as_llm_tools.
 #
-# "resolve_member_project" (not the raw "project_list" catalog) is deliberate
-# (adversarial round-2 P2-1, PR#17): a project reference typed by a human must
-# resolve only against projects THAT MEMBER can read, scoped server-side by
-# their own standing -- never Mubot's own operator-wide project_list. This is
-# itself a mupot-side contract this build depends on (see PR body): the action
-# does not exist on main yet.
+# Round 3 (kasra/first-person-skill-v2, 2026-09-21): "create_home_for_member"
+# and "resolve_member_project" were REMOVED from this set. Both were verified
+# by reading mupot's kasra/fp01-slice2-proposal-chain branch directly to have
+# no exposed MCP action of that name at all -- create_home_for_member is an
+# internal TypeScript function (src/org/service.ts) called only by that
+# repo's own unit tests, and project resolution instead lives on the
+# authenticated `/im/resolve-project` surface (same shared secret as
+# `/im/webhook`, envelope-derived identity per Athena's ruling on that
+# route's fence) that first_person.py's `_resolve_member_project` calls
+# directly via urllib -- never through this operator-actions allowlist.
+# Calling either of these two names through MupotOperatorClient.call() would
+# just get `action_not_allowed`; keeping dead names in this set would be
+# actively misleading about what this module can reach.
 FIRST_PERSON_ACTIONS = frozenset(
     {
-        "create_home_for_member",
         "squad_remember",
         "routine_proposal_submit",
-        "resolve_member_project",
     }
 )
 

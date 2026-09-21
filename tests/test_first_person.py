@@ -21,6 +21,8 @@ from typing import Any, Callable
 import pytest
 import yaml
 
+import dataclasses
+
 import plugin.first_person as first_person
 from plugin.first_person import (
     FIRST_PERSON_QUESTIONS,
@@ -29,7 +31,11 @@ from plugin.first_person import (
     FirstPersonSettings,
     Intake,
     StatusResolution,
+    _AWAITING_HUMANS_REPLY,
+    _ProbeLimiter,
     _StatusCache,
+    _UNRELATED_ANSWER_REPLY,
+    _classify_intake_state,
     _looks_like_credential,
     _sanitize_answer,
     handle_first_contact,
@@ -179,7 +185,7 @@ def install_status_stub(
     handle_first_contact's gating logic, not resolve_member_status's own wire
     format (that gets its own dedicated tests below)."""
 
-    def fake_resolve(settings, user_id, chat_id, *, secret_owner=None, cache=None):
+    def fake_resolve(settings, user_id, chat_id, *, secret_owner=None, cache=None, probe_limiter=None):
         return resolver(user_id, chat_id)
 
     monkeypatch.setattr("plugin.first_person.resolve_member_status", fake_resolve)
@@ -834,8 +840,10 @@ async def test_proposal_failure_keeps_pending_and_replies_honestly_then_retries(
         "Still working on sending your request -- I'll try again shortly."
     )
 
-    # Force the backoff to have elapsed, then retry succeeds.
-    pending.next_proposal_retry_at = 0.0
+    # Force the backoff to have elapsed, then retry succeeds. Intake is
+    # frozen (round-3 P3-G) -- go through the runtime's replace-in-place
+    # method rather than direct attribute assignment.
+    runtime.schedule_proposal_retry("123", next_retry_at=0.0, retry_count=pending.proposal_retry_count)
     final_update = Update(message=Message(text="anything else"))
     await handle_first_contact(final_update, settings=settings, client=client, runtime=runtime)
     assert attempts["n"] == 2
@@ -1244,3 +1252,389 @@ def test_register_first_person_skill_never_raises_on_registration_failure() -> N
 
     ctx = types.SimpleNamespace(register_skill=failing_register_skill)
     register_first_person_skill(ctx)  # must not raise
+
+
+# ===========================================================================
+# Round 3 successor (kasra/first-person-skill-v2, off PR#17 @ ecea2501):
+# adversarial round 2 RED (2 P0 / 2 P1 / 2 P2 / 2 P3), Athena's rulings on
+# the successor pinned inline at each fix. See PR body's Round-1 table for
+# the item -> test mapping.
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# P0-A / ruling (2): normalize-then-check credential pipeline
+# ---------------------------------------------------------------------------
+
+
+def test_credential_check_runs_after_normalization_not_before() -> None:
+    """Mutation-regression receipt for the round-2 order bug: checking
+    credential-shape on the RAW text lets an embedded bidi/control char split
+    the token so the regex's contiguous match never fires -- only
+    normalization AFTER that (which strips exactly that character)
+    reassembles it into a valid token. Proves the fix is load-bearing: revert
+    the order (check raw before sanitize) and this exact evading string
+    slips through uncaught."""
+    exploit = "mupot_" + "A" * 4 + "‮" + "A" * 28  # Athena's exact evading string
+    cleaned = _sanitize_answer(exploit)
+    assert _looks_like_credential(cleaned) is True  # correct order: catches it
+    assert _looks_like_credential(exploit) is False  # old (broken) order: would not have
+
+
+@pytest.mark.parametrize(
+    "hidden_char",
+    ["‮", "\x01", "⁦", "‭"],
+    ids=["RLO-U+202E", "control-x01", "LRI-U+2066", "LRO-U+202D"],
+)
+@pytest.mark.parametrize(
+    "prefix,suffix",
+    [("mupot_", "A" * 28), ("ghp_", "A" * 24), ("sk-", "A" * 20), ("AKIA", "A" * 16)],
+    ids=["mupot_", "ghp_", "sk-", "AKIA"],
+)
+def test_obfuscated_credential_variants_are_caught_after_normalization(
+    hidden_char: str, prefix: str, suffix: str
+) -> None:
+    exploit = prefix + "AAAA" + hidden_char + suffix
+    assert _looks_like_credential(_sanitize_answer(exploit)) is True
+
+
+def test_plain_text_credential_refusal_still_works_after_reordering() -> None:
+    """The P0-A reorder must not regress the ordinary, non-obfuscated case."""
+    assert _looks_like_credential(_sanitize_answer("sk-abcdefghijklmnopqrst")) is True
+    assert _looks_like_credential(_sanitize_answer("Ada Example")) is False
+
+
+@pytest.mark.asyncio
+async def test_bidi_obfuscated_credential_is_refused_end_to_end_never_reaches_memory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = _client_for_full_intake()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    install_status_stub(monkeypatch, lambda *_: pending_status())
+    settings = valid_settings()
+    await handle_first_contact(
+        Update(message=Message(text="hello!")), settings=settings, client=client, runtime=runtime
+    )
+
+    exploit = "mupot_" + "A" * 4 + "‮" + "A" * 28
+    answer_update = Update(message=Message(text=exploit))
+    handled = await handle_first_contact(answer_update, settings=settings, client=client, runtime=runtime)
+
+    assert handled is True
+    assert "Please don't share" in answer_update.effective_message.replies[0]
+    assert not any(action == "squad_remember" for action, _ in client.calls)
+    pending = runtime.get_pending("123")
+    assert pending is not None and pending.index == 0
+    assert pending.engrams == {}
+
+
+# ---------------------------------------------------------------------------
+# P0-B / ruling (1): held proposal_id blocks re-intake, even past the
+# completion-cache TTL, for as long as the server keeps saying 'pending'
+# ---------------------------------------------------------------------------
+
+
+def test_held_proposal_id_reads_a_durable_marker_ignoring_the_completion_cache_ttl(
+    tmp_path: Path,
+) -> None:
+    fake_wall_clock = {"now": 0.0}
+    runtime = FirstPersonRuntime(tmp_path / "state.json", wall_clock=lambda: fake_wall_clock["now"])
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    runtime.finish("123", proposal_id="proposal-1")
+    assert runtime.held_proposal_id("member-1") == "proposal-1"
+
+    fake_wall_clock["now"] += 10_000.0  # far past the 3600s completion-cache TTL
+    assert runtime.held_proposal_id("member-1") == "proposal-1"  # still durable
+
+
+def test_held_proposal_id_is_none_for_an_untouched_member(tmp_path: Path) -> None:
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    assert runtime.held_proposal_id("member-1") is None
+
+
+def test_held_proposal_id_is_none_when_marker_has_no_proposal(tmp_path: Path) -> None:
+    """Legacy/corrupted marker shape (should not be written going forward,
+    see P2-E) must never be mistaken for a held proposal."""
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"completed": {"member-1": {"proposal_id": None}}}))
+    runtime = FirstPersonRuntime(state_path)
+    assert runtime.held_proposal_id("member-1") is None
+
+
+@pytest.mark.asyncio
+async def test_held_proposal_lag_logs_exactly_one_warning_no_pii(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = _client_for_full_intake()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    answers = ["Ada Example", "Engineer", "psychonom", "Ship it", "Nothing else"]
+    await _run_intake(monkeypatch, client, runtime, answers)
+
+    install_status_stub(monkeypatch, lambda *_: pending_status(home_squad_id="home-squad-1"))
+    settings = valid_settings()
+    caplog.clear()
+    caplog.set_level("WARNING")
+    update = Update(message=Message(text="hello again"))
+    handled = await handle_first_contact(update, settings=settings, client=client, runtime=runtime)
+
+    assert handled is True
+    assert update.effective_message.replies == [_AWAITING_HUMANS_REPLY]
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    logged = warnings[0].getMessage()
+    assert "member-1" in logged
+    assert "proposal-1" in logged
+    assert "Ada Example" not in logged  # no answer text / PII
+
+
+@pytest.mark.asyncio
+async def test_held_proposal_id_blocks_reintake_even_two_hours_past_completion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round-3 P0-B HARD RULE, end to end: a server that keeps reporting
+    intake_state == 'pending' for 2 simulated hours after a successful
+    proposal (well past the 3600s completion-cache TTL -- see
+    test_condition_ii, a SEPARATE, softer mechanism this does not rely on)
+    must produce zero re-asked questions, zero engram rewrites, and zero
+    second proposals."""
+    fake_wall_clock = {"now": 1_000_000.0}
+    state_path = tmp_path / "state.json"
+    runtime = FirstPersonRuntime(state_path, wall_clock=lambda: fake_wall_clock["now"])
+    client = _client_for_full_intake()
+    answers = ["Ada Example", "Engineer", "psychonom", "Ship it", "Nothing else"]
+    last_update = await _run_intake(monkeypatch, client, runtime, answers)
+    assert last_update.effective_message.replies[-1] == (
+        "Thanks -- I've sent your access request to the team for a decision."
+    )
+    calls_after_completion = len(client.calls)
+
+    install_status_stub(monkeypatch, lambda *_: pending_status(home_squad_id="home-squad-1"))
+    settings = valid_settings()
+    caplog.set_level("WARNING")
+    minutes = range(0, 121, 15)  # 0, 15, ..., 120 minutes -- 9 messages
+    for minute in minutes:
+        fake_wall_clock["now"] += 15 * 60.0
+        update = Update(message=Message(text=f"still there? (minute {minute})"))
+        handled = await handle_first_contact(update, settings=settings, client=client, runtime=runtime)
+        assert handled is True
+        assert update.effective_message.replies == [_AWAITING_HUMANS_REPLY]
+
+    assert len(client.calls) == calls_after_completion  # zero new mupot calls at all
+    data = json.loads(state_path.read_text())
+    assert data["completed"]["member-1"]["proposal_id"] == "proposal-1"  # unchanged, still the first
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == len(minutes)  # exactly one per message in this state
+
+
+# ---------------------------------------------------------------------------
+# P1-C / ruling (3): intake_state TYPE is normalized, never raises
+# ---------------------------------------------------------------------------
+
+
+def test_classify_intake_state_normalizes_the_type_not_only_the_value() -> None:
+    """`x in frozenset(...)` raises TypeError for an unhashable value (a list
+    or a dict) -- classify must handle ANY shape without raising."""
+    assert _classify_intake_state("pending") == "pending"
+    assert _classify_intake_state("none") == "none"
+    assert _classify_intake_state("complete") == "complete"
+    assert _classify_intake_state("bogus") == "unknown"
+    assert _classify_intake_state(["pending"]) == "unknown"
+    assert _classify_intake_state({"state": "pending"}) == "unknown"
+    assert _classify_intake_state(True) == "unknown"
+    assert _classify_intake_state(None) == "unknown"
+    assert _classify_intake_state(123) == "unknown"
+
+
+@pytest.mark.parametrize("bad_intake_state", [["pending"], {"a": 1}, 42, True, None], ids=str)
+def test_resolve_member_status_never_raises_on_a_non_str_intake_state(
+    monkeypatch: pytest.MonkeyPatch, bad_intake_state: Any
+) -> None:
+    install_probe(
+        monkeypatch,
+        response=json.dumps(
+            {
+                "ok": True,
+                "bound": True,
+                "member_id": "m-1",
+                "home_squad_id": None,
+                "intake_state": bad_intake_state,
+            }
+        ).encode(),
+    )
+    status = resolve_member_status(valid_settings(), 123, 123)  # must not raise
+    assert status.intake_state == "unknown"
+    assert status.is_pending is False
+
+
+# ---------------------------------------------------------------------------
+# P1-D / ruling (4): bounded status cache, harder unknown TTL, short probe
+# timeout, global concurrency cap
+# ---------------------------------------------------------------------------
+
+
+def test_status_cache_is_bounded_under_two_hundred_thousand_distinct_senders() -> None:
+    cache = _StatusCache(max_entries=2048)
+    for n in range(200_000):
+        cache.put(f"user-{n}", UNBOUND_STATUS)
+    assert len(cache) <= 2048
+
+
+def test_status_cache_uses_a_harder_ttl_for_genuinely_unknown_results() -> None:
+    fake_time = {"now": 0.0}
+    cache = _StatusCache(positive_ttl=1.0, negative_ttl=10.0, unknown_ttl=1000.0, clock=lambda: fake_time["now"])
+    cache.put("stranger", UNKNOWN_STATUS)
+    fake_time["now"] = 500.0  # past the 10s negative TTL, well within the 1000s unknown TTL
+    assert cache.get("stranger") == UNKNOWN_STATUS
+
+
+def test_status_probe_uses_a_short_timeout_never_longer_than_five_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded_timeouts: list[float] = []
+    monkeypatch.setattr("plugin.first_person.read_profile_secret", lambda _name: "secret")
+
+    class _RecordingOpener:
+        def open(self, request: object, timeout: float) -> Response:
+            recorded_timeouts.append(timeout)
+            return Response(status_response_bytes())
+
+    monkeypatch.setattr("plugin.first_person.build_opener", lambda *_: _RecordingOpener())
+    resolve_member_status(valid_settings(timeout=100.0), 123, 123)  # configured well above 5s
+    assert recorded_timeouts == [5.0]
+
+
+def test_status_probe_limiter_fails_fast_to_unknown_when_exhausted(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_probe(monkeypatch, response=status_response_bytes())
+    limiter = _ProbeLimiter(max_concurrent=1, acquire_timeout=0.05)
+    assert limiter.try_acquire() is True  # occupy the single slot
+    try:
+        status = resolve_member_status(valid_settings(), 999, 999, probe_limiter=limiter)
+    finally:
+        limiter.release()
+    assert status == StatusResolution(bound=False, member_id=None, home_squad_id=None, intake_state="unknown")
+
+
+# ---------------------------------------------------------------------------
+# P2-E / ruling (5): no false-success completion without a real proposal_id
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_missing_project_id_at_submission_never_completes_falsely(tmp_path: Path) -> None:
+    """Mutation-proof for the killed false-success branch: run
+    _submit_proposal with project_id still None (bypassing the question-3
+    gate that normally prevents this) and assert an honest failure -- no
+    completion marker, no "Thanks" reply, pending retained, retry scheduled."""
+    from plugin.first_person import _submit_proposal
+
+    state_path = tmp_path / "state.json"
+    runtime = FirstPersonRuntime(state_path)
+    client = FakeClient()
+    intake = runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    assert intake.project_id is None
+
+    update = Update(message=Message(text="anything"))
+    await _submit_proposal(update.effective_message, "123", intake, client=client, runtime=runtime)
+
+    assert not state_path.exists()  # no completion marker written
+    assert update.effective_message.replies == ["I couldn't send your request yet -- I'll try again."]
+    assert not any(action == "routine_proposal_submit" for action, _ in client.calls)
+    pending = runtime.get_pending("123")
+    assert pending is not None
+    assert pending.proposal_retry_count == 1
+
+
+# ---------------------------------------------------------------------------
+# P2-F / ruling (6): an unrelated mid-intake message is nudged, not silently
+# captured as an answer and not fallen through
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unrelated_empty_answer_is_nudged_not_captured_or_fallen_through(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = FakeClient()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    install_status_stub(monkeypatch, lambda *_: pending_status())
+    settings = valid_settings()
+    await handle_first_contact(
+        Update(message=Message(text="hello!")), settings=settings, client=client, runtime=runtime
+    )
+
+    blank_update = Update(message=Message(text="   "))
+    handled = await handle_first_contact(blank_update, settings=settings, client=client, runtime=runtime)
+
+    assert handled is True  # chosen option: nudge, don't fall through
+    assert blank_update.effective_message.replies == [_UNRELATED_ANSWER_REPLY]
+    pending = runtime.get_pending("123")
+    assert pending is not None and pending.index == 0  # not advanced
+    assert not any(action == "squad_remember" for action, _ in client.calls)
+
+
+# ---------------------------------------------------------------------------
+# P3-G / ruling (7): Intake is frozen; home_squad_id pinned to a constant,
+# not a literal duplicated in the assertion
+# ---------------------------------------------------------------------------
+
+
+def test_intake_is_a_frozen_dataclass() -> None:
+    intake = Intake(member_id="member-1", home_squad_id="home-squad-1")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        intake.home_squad_id = "some-other-squad"  # type: ignore[misc]
+
+
+def test_runtime_replace_methods_return_none_when_pending_is_gone(tmp_path: Path) -> None:
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    assert runtime.record_answer("missing-chat", "name", "engram-1") is None
+    assert runtime.set_project_id("missing-chat", "proj-1") is None
+    assert runtime.schedule_proposal_retry("missing-chat", next_retry_at=0.0, retry_count=1) is None
+
+
+_PINNED_HOME_SQUAD_ID = "home-squad-const-9f2b1a"  # named constant, referenced by setup AND assertion
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer_text",
+    [
+        "Ada Example",
+        "squad-evil-override",
+        "home-squad-evil-override",
+        "SQUAD-ABC",
+        _PINNED_HOME_SQUAD_ID,
+    ],
+)
+async def test_home_squad_id_is_immutable_regardless_of_any_answer_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, answer_text: str
+) -> None:
+    """Pin the invariant to the CONSTANT, not a literal string duplicated in
+    the assertion -- a mutation deriving home_squad_id from any answer that
+    e.g. `startswith("squad-")` must go red regardless of which specific
+    text triggers it."""
+    client = _client_for_full_intake()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    install_status_stub(monkeypatch, lambda *_: pending_status(home_squad_id=_PINNED_HOME_SQUAD_ID))
+    settings = valid_settings()
+    await handle_first_contact(
+        Update(message=Message(text="hello!")), settings=settings, client=client, runtime=runtime
+    )
+    pending = runtime.get_pending("123")
+    assert pending is not None
+    assert pending.home_squad_id == _PINNED_HOME_SQUAD_ID
+
+    await handle_first_contact(
+        Update(message=Message(text=answer_text)), settings=settings, client=client, runtime=runtime
+    )
+    pending = runtime.get_pending("123")
+    assert pending is None or pending.home_squad_id == _PINNED_HOME_SQUAD_ID
+
+
+# ---------------------------------------------------------------------------
+# P3-H / ruling (8): keep the refusal, document the rephrase path
+# ---------------------------------------------------------------------------
+
+
+def test_credential_reply_documents_the_rephrase_path() -> None:
+    assert "Please don't share" in first_person._CREDENTIAL_REPLY
+    assert "rephrasing" in first_person._CREDENTIAL_REPLY

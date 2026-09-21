@@ -10,7 +10,7 @@ description: >
   registered tool for any capability-granting surface. Load this skill only to
   understand, document, or extend the flow -- it is reference material, not a
   script an LLM turn executes live.
-version: "0.2.0"
+version: "0.3.0"
 tools: []
 disallowed_tools:
   - project_squad_set
@@ -120,6 +120,38 @@ touches the conversation when that status says intake is actually pending.
 6. **One-line confirmation** back to the member once the proposal actually
    lands.
 
+## Completion contract (round 3, successor to PR#17)
+
+**Completion = the project_access proposal exists.** mupot PR#1488 makes
+`routine_proposal_submit` itself the completion writer: the server derives
+`intake_state == "complete"` from the EXISTENCE of the member's project_access
+proposal. There is no separate "mark this member's intake complete" call on
+either side -- a successfully accepted proposal submission IS completion, full
+stop. A denied proposal still counts as complete (the person was asked,
+proposed for, and a human decided); the flow does not re-open on a denial.
+
+**Re-intake requires human word.** This module never re-opens intake for a
+member on its own initiative. The only way `intake_state` goes back to
+`"pending"`/`"none"` for someone who already has a proposal on record is a
+deliberate, server-side, human-directed action (clearing/replacing the
+proposal). Nothing in this plugin infers that from conversation content.
+
+**Server lag/bug is not license to re-intake.** This module holds the durable
+evidence of its own completion locally: a real `proposal_id`, written ONLY
+once mupot accepts the submission (never speculatively, never on a failed or
+project-less submission -- see the false-success fix below). If the server
+still reports `intake_state == "pending"` for a member this module already
+holds a `proposal_id` for, that is server lag or a server-side bug, never a
+reason to restart. The plugin: asks nothing, writes nothing, submits nothing a
+second time, logs exactly one WARNING (member_id + the held proposal_id only,
+no PII), and replies the fixed line **"Your request is awaiting the humans."**
+This is a hard rule, gate-checked, and holds for as long as the server keeps
+reporting `pending` -- not just within the local completion-cache's 3600s
+freshness window (that window governs a separate, softer question: how long a
+FRESH completion is trusted without even checking the held-proposal case
+first; see `FirstPersonRuntime.is_complete_or_unknown` vs. `held_proposal_id`
+in `first_person.py`).
+
 ## Mupot-side contract this build depends on
 
 Athena's round-1 ruling on this reshape (2026-09-21) is binding: this plugin
@@ -141,7 +173,16 @@ Slice 2 chain PR lands these contracts.**
   text>"}` → `{"project_id": "<uuid>"|null}`, scoped server-side to projects
   that member can actually read. Round-2 P2-1: this replaced a plain
   `project_list` call, which would have resolved against Mubot's own
-  operator-wide catalog instead of the member's own standing.
+  operator-wide catalog instead of the member's own standing. mupot#1488
+  documents mupot's own server-side implementation of this action as
+  `POST /im/resolve-project` (not a handler on the generic `/actions/<tool>`
+  catalog). This plugin still calls it BY ACTION NAME through the shared
+  operator actions surface (args/result shape unchanged) on the working
+  assumption mupot's action router forwards it internally to that route --
+  **not confirmed live as of this build.** If that forwarding turns out not
+  to exist, the call keeps failing closed (`project_id: null`, re-asked at
+  question 3) rather than trusting the wrong authority; flagged here with the
+  same documented-gap posture as the two contracts above.
 - **`routine_proposal_submit`**'s live schema (`version: "routine.proposal/v1"`,
   `action.kind` one of `create_task | dispatch_flight | request_review |
   ask_human | no_action`) has **no project-access kind**. This skill submits
@@ -179,7 +220,7 @@ skills:
 ```
 
 **G-FP3 assertion** (what to actually check on the live gateway, not what to
-assume): `hermes plugins show mupot` reports version `0.5.0` (bumped in this
+assume): `hermes plugins show mupot` reports version `0.6.0` (bumped in this
 PR) at the installed git rev, and `hermes skills list` shows `mupot:first-person`
 present. SKILL.md's own `version:` frontmatter field is documentation only --
 nothing in Hermes parses it; the plugin-level version + git rev is the only

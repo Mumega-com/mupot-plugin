@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
-from .first_person import FirstPersonSettings, register_first_person
+from .first_person import FirstPersonSettings, register_first_person, register_first_person_skill
 from .mupot_operator import MupotOperatorClient, OperatorSettings, register_operator_tools
 from .schemas import (
     MUPOT_BRAIN_ENABLE_SCHEMA,
@@ -399,6 +399,14 @@ def register(ctx: Any) -> None:
                 client=client,
                 secret_owner=secret_owner,
             )
+            if first_person_settings.enabled:
+                # Discovery receipt (2026-09-21): a native (kind: backend)
+                # plugin gets no directory-scan auto-discovery for skills/ --
+                # only this explicit call makes skills/first-person/SKILL.md
+                # resolvable as 'mupot:first-person' via skill_view()/
+                # skills_list(). Does NOT also register mupot-operator's own
+                # bundled skill -- that is a separate, pre-existing gap.
+                register_first_person_skill(ctx)
             if native_gateway:
                 from .mupot_gateway.adapter import register as register_native_gateway
                 register_native_gateway(

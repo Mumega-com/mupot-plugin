@@ -57,14 +57,22 @@ VERDICT_ACTIONS = frozenset({"task_verdict"})
 # surface for a model to call even if it tried. Deliberately excludes
 # project_squad_set / grant_agent_capability / grant_gate_capability / any other
 # manage_access surface -- first_person.py proposes access via
-# routine_proposal_submit, it never grants it (tests/test_operator.py's
-# test_first_person_actions_exclude_manage_access_surfaces pins this).
+# routine_proposal_submit, it never grants it. Pinned by
+# tests/test_first_person.py::test_first_person_actions_exclude_every_manage_access_surface
+# and ::test_first_person_actions_are_never_registered_as_llm_tools.
+#
+# "resolve_member_project" (not the raw "project_list" catalog) is deliberate
+# (adversarial round-2 P2-1, PR#17): a project reference typed by a human must
+# resolve only against projects THAT MEMBER can read, scoped server-side by
+# their own standing -- never Mubot's own operator-wide project_list. This is
+# itself a mupot-side contract this build depends on (see PR body): the action
+# does not exist on main yet.
 FIRST_PERSON_ACTIONS = frozenset(
     {
         "create_home_for_member",
         "squad_remember",
         "routine_proposal_submit",
-        "project_list",
+        "resolve_member_project",
     }
 )
 

@@ -2,7 +2,7 @@
 # Production agents must use operator mode with an agent-bound MUPOT_AGENT_TOKEN.
 
 name: mupot
-version: "0.4.0"
+version: "0.5.0"
 kind: backend
 description: >
   Integrate Hermes with Mupot in one of two isolated modes. Provisioner mode exposes
@@ -14,6 +14,10 @@ description: >
   to the operator's existing private human conversations.
   Optional deterministic Telegram project-control handlers relay only five scoped
   commands to Mupot without starting an LLM turn.
+  Optional deterministic first-person intake (skills/first-person) meets a newly
+  bound member on Telegram, only when mupot's own status says intake is pending,
+  and proposes -- never grants -- project access; also without starting an LLM
+  turn for the in-flight capture.
 
 provides_tools:
   - name: mupot_provision

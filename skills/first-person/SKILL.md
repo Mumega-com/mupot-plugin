@@ -10,7 +10,7 @@ description: >
   registered tool for any capability-granting surface. Load this skill only to
   understand, document, or extend the flow -- it is reference material, not a
   script an LLM turn executes live.
-version: "0.1.0"
+version: "0.2.0"
 tools: []
 disallowed_tools:
   - project_squad_set
@@ -74,39 +74,73 @@ fails the build if the two drift apart.
 
 ## Flow (enforced by `first_person.py`, not by this document)
 
-1. **Bind first.** On a Telegram sender's first message, the plugin resolves
-   whether that sender is already a bound mupot member through the *same*
-   authenticated `/im/webhook` envelope `telegram_control.py` uses for `/start` --
-   never a local guess, never a match against the server's human-readable reply
-   text. Unbound → a fixed "ask for an invite" reply, and **nothing is stored
-   anywhere**: no memory entry, no state.json row, no log line carrying anything
-   from that message.
-2. **Home, once bound.** The plugin calls the mupot action `create_home_for_member`
-   for that member (see "Mupot-side contract" below) and only then asks question 1.
-3. **Write-through, no durable raw copy.** Each answer is held in a local
-   variable only until `squad_remember`'s own response carries an `engram_id` --
-   that response IS the confirmation; the plugin never reads recall back to
-   check (production recall is eventually consistent). Once confirmed, only
+**Round 2 correction (adversarial gate, PR#17, 2026-09-21):** "is intake actually
+in progress" is decided by mupot, never locally. Round 1 used a local "have I
+seen this chat before" marker, which preempted a bound member's ordinary
+`approve <id>` messages and Hermes's own conversation for anyone this module
+hadn't locally seen finish. Every private DM now re-checks a structured status
+the mupot side is adding to its identity surface, and the handler only ever
+touches the conversation when that status says intake is actually pending.
+
+1. **Status, not a local guess, on every message.** The plugin resolves
+   `{bound, member_id, home_squad_id, intake_state}` for the sender through a
+   dedicated, minimal, authenticated status probe (identity coordinates only --
+   never the sender's display name, never their message text) over the same
+   authenticated surface `telegram_control.py` uses, rate-limited and cached
+   per user (a negative/not-pending result is cached far longer than a pending
+   one, specifically so a stranger hammering the bot never reaches the network
+   more than once per cache window).
+2. **Consume only when `intake_state == "pending"`.** Unbound, `"none"`
+   (never started), `"complete"` (already onboarded), or the contract fields
+   simply not existing yet on a given deployment (`"unknown"`) -- every one of
+   these returns control to Hermes's own handling untouched: no reply, no
+   state stored, no stopped propagation. This is what lets a bound member's
+   plain `approve <id>` message (#1425) and a stranger's message both fall
+   through exactly as if this skill did not exist.
+3. **Home, once pending.** If `home_squad_id` is still null, the plugin calls
+   the mupot action `create_home_for_member` for that member (see "Mupot-side
+   contract" below) and only then asks question 1.
+4. **Write-through, no durable raw copy.** Each answer is checked for anything
+   credential-shaped (refused, re-asked, never stored or logged) and stripped
+   of control/bidi-override characters, then held in a local variable only
+   until `squad_remember`'s own response carries an `engram_id` -- that
+   response IS the confirmation; the plugin never reads recall back to check
+   (production recall is eventually consistent). Once confirmed, only
    `{question_id: engram_id}` survives, and only in one completion marker
-   written at the very end of the whole intake.
-4. **Propose, never grant.** After the fifth answer, the plugin resolves the
-   named project (by slug/name via `project_list`) and calls
-   `routine_proposal_submit` asking for `write` access on that project for this
-   member, with a reason of `"first-person intake"`. The proposal lands in
-   `needs_you` for a human (the project's captain, or mem-hadi) to decide.
-   Nothing writes a capability row until that human verdict lands.
-5. **One-line confirmation** back to the member that their request went to the
-   team.
+   written once, at the very end of a **successfully submitted** intake.
+5. **Propose, never grant.** After the fifth answer, the plugin resolves the
+   named project against only the projects that member can read (never
+   Mubot's own project catalog) and calls `routine_proposal_submit` asking for
+   `write` access on that project for this member, reason
+   `"first-person intake"`. **A failed submission never writes the completion
+   marker** -- the member is told honestly that it didn't go through yet, the
+   plugin retries (with backoff) the next time they message, and nothing is
+   silently treated as done that isn't. Nothing writes a capability row until
+   a human verdict lands on the resulting proposal.
+6. **One-line confirmation** back to the member once the proposal actually
+   lands.
 
 ## Mupot-side contract this build depends on
 
-Checked live against the currently-registered `mupot` MCP tool schemas during
-this build (2026-09-21) -- two gaps this plugin-side PR cannot close itself:
+Athena's round-1 ruling on this reshape (2026-09-21) is binding: this plugin
+codes against the fields below NOW and fails OPEN (falls through untouched)
+everywhere they are absent or malformed. **This PR must not merge before the
+mupot Slice 2 chain PR lands these contracts.**
 
+- **Status probe response** (new): `{"ok": true, "bound": bool, "member_id":
+  str|null, "home_squad_id": str|null, "intake_state": "none"|"pending"|"complete"}`
+  on the authenticated status-probe surface. Any response missing or malformed
+  in these fields resolves as `intake_state: "unknown"` here, which this module
+  treats exactly like "not pending".
 - **`create_home_for_member`** is called as a plugin action
   (`{"member_id": "<uuid>"}`, expected result `{"squad_id": "<uuid>"}`). If this
   action does not exist yet on `main`, that is the dependency -- see
   mupot#1443's Slice 1 acceptance criteria for the intended shape.
+- **`resolve_member_project`** (new): `{"member_id": "<uuid>", "name": "<typed
+  text>"}` → `{"project_id": "<uuid>"|null}`, scoped server-side to projects
+  that member can actually read. Round-2 P2-1: this replaced a plain
+  `project_list` call, which would have resolved against Mubot's own
+  operator-wide catalog instead of the member's own standing.
 - **`routine_proposal_submit`**'s live schema (`version: "routine.proposal/v1"`,
   `action.kind` one of `create_task | dispatch_flight | request_review |
   ask_human | no_action`) has **no project-access kind**. This skill submits
@@ -114,8 +148,41 @@ this build (2026-09-21) -- two gaps this plugin-side PR cannot close itself:
   `input: {member_id, project_id, access_level: "write", reason}` -- the exact
   shape the flight brief specifies. Until mupot's server adds that kind (or an
   equivalent), the call in production will fail server-side schema validation;
-  the plugin fails soft on that (tells the member "something went wrong", does
-  not lose their answers) rather than silently dropping the request.
+  the plugin fails soft on that today (tells the member honestly, keeps their
+  progress, retries with backoff) rather than silently dropping the request or
+  claiming success it didn't achieve.
+
+## Profile pin
+
+**Verified mechanism** (read-only Hermes-source discovery, 2026-09-21): a
+native (`plugin.yaml`, `kind: backend`) plugin like this one gets NO
+directory-scan auto-discovery for a `skills/` folder -- only an explicit
+`ctx.register_skill(name, path, description, frontmatter)` call inside
+`register(ctx)` makes a bundled `SKILL.md` loadable at all
+(`hermes_cli/plugins.py:994-1020`). **`skills/mupot-operator/SKILL.md` ships in
+this repo but was never registered anywhere** -- `hermes skills list` does not
+show it and `skill_view('mupot:mupot-operator')` returns not-found on the live
+gateway today; fixing that is a separate, pre-existing issue, not this one.
+
+This PR closes that gap for `first-person` only: `__init__.py`'s `register()`
+now calls `register_first_person_skill(ctx)` (gated on
+`first_person_settings.enabled`), which registers this file as
+`mupot:first-person`. `skills.auto_load` is a real, existing config.yaml key
+(`config_defaults.py`, `agent/skill_commands.py`'s `build_auto_load_prompt`)
+that resolves a plugin-qualified name once it is actually registered this way
+-- so, once this PR is installed, the pin line for the kayhermes profile is:
+
+```yaml
+skills:
+  auto_load: ["mupot:first-person"]
+```
+
+**G-FP3 assertion** (what to actually check on the live gateway, not what to
+assume): `hermes plugins show mupot` reports version `0.5.0` (bumped in this
+PR) at the installed git rev, and `hermes skills list` shows `mupot:first-person`
+present. SKILL.md's own `version:` frontmatter field is documentation only --
+nothing in Hermes parses it; the plugin-level version + git rev is the only
+queryable pin.
 
 ## Companion tools this skill's code calls directly
 
@@ -125,5 +192,5 @@ never merged into the set of tools Mubot's model can call:
 
 - `create_home_for_member`
 - `squad_remember`
-- `project_list`
+- `resolve_member_project`
 - `routine_proposal_submit`

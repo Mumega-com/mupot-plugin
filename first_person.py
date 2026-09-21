@@ -160,10 +160,20 @@ _MAX_REQUEST_BYTES = 32 * 1024
 _MAX_RESPONSE_BYTES = 64 * 1024
 _FIRST_PERSON_HANDLER_GROUP = -5
 
-# How long a local, in-progress intake record survives with no forward progress
-# before it is treated as abandoned (round-2 P1-3). A member who goes quiet
-# mid-intake and comes back a week later starts clean, not mid-sentence.
-_PENDING_TTL_SECONDS = 600.0
+# Round-3-gate-2 P0: TWO separate timers, not one. `_PENDING_IDLE_TTL_SECONDS`
+# is an IDLE timeout -- measured from `last_activity_at`, which is refreshed
+# on every accepted answer (see FirstPersonRuntime.record_answer/touch) -- so
+# a member answering thoughtfully every few minutes never trips it no matter
+# how long the WHOLE conversation takes. The round-2 bug measured this same
+# 600s window from `created_at` (set once, at the very first message): a
+# member averaging more than 600s/5 = 120s per question got dropped and
+# silently restarted at question 1 mid-conversation, with every subsequent
+# answer then written to squad_remember under the WRONG question_id (whatever
+# `index` the fresh restart happened to be at). `_PENDING_ABSOLUTE_TTL_SECONDS`
+# is the separate hard cap on total session length regardless of activity, so
+# a member who never quite goes idle cannot hold a local record open forever.
+_PENDING_IDLE_TTL_SECONDS = 600.0
+_PENDING_ABSOLUTE_TTL_SECONDS = 86400.0
 
 # How long the LOCAL completion marker is trusted as a dedupe cache before this
 # module defers entirely back to the server's own intake_state (Athena's
@@ -214,6 +224,21 @@ _STATUS_PROBE_ACQUIRE_TIMEOUT_SECONDS = 1.0
 # Proposal-submission retry backoff (round-2 P0-3): a failed submit must not be
 # retried on literally the next keystroke.
 _PROPOSAL_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (5.0, 15.0, 60.0, 300.0)
+
+# Round-3-gate-2 P1 (:1408-1426) / P3: the held-proposal WARNING and its
+# paired member-facing reply are rate-limited on SEPARATE windows -- a
+# WARNING is an operational signal (cheap to want more often; capped at once
+# per member per hour) while the reply is member-facing (capped at once per
+# member per DAY, so a member who keeps messaging during a genuine server
+# lag isn't told the same reassurance on every single message).
+_LAG_WARNING_WINDOW_SECONDS = 3600.0
+_LAG_REPLY_WINDOW_SECONDS = 86400.0
+
+# Round-3-gate-2, Athena's addition: bound + pending + a null home_squad_id
+# (mupot's own home-provisioning simply hasn't run yet for this member) gets
+# a member-facing reply too, on the SAME "once per hour per member" cadence
+# as the WARNING above -- never on every message, never inventing a home.
+_HOME_NOT_READY_WINDOW_SECONDS = 3600.0
 
 # Discovery receipt (2026-09-21, read-only Hermes-source arm): a native
 # (plugin.yaml, kind: backend) plugin like this one gets NO directory-scan
@@ -275,6 +300,16 @@ _UNRELATED_ANSWER_REPLY = "Please answer the current question."
 # lag, or a server-side bug) -- never a new question, never a second
 # proposal, just this.
 _AWAITING_HUMANS_REPLY = "Your request is awaiting the humans."
+# Round-3-gate-2, Athena's addition: bound + pending + no home yet (mupot's
+# own home-provisioning hasn't run for this member) -- never invented,
+# never a question asked without a real home id behind it.
+_HOME_NOT_READY_REPLY = "Opening your space — one moment, I'll come back to you."
+# Round-3-gate-2 P2 (:1455-1458): a fixed, small escape vocabulary pauses the
+# intake instead of being captured as an answer to whatever question is
+# current -- engrams/index are left exactly as they are; the very next
+# non-escape message resumes at the same still-pending question.
+_ESCAPE_WORDS = frozenset({"stop", "cancel", "later", "no thanks", "not now"})
+_PAUSED_REPLY = "No problem -- message me whenever you're ready to continue."
 
 
 def _project_not_found_reply(name: str) -> str:
@@ -515,6 +550,45 @@ class _ProbeLimiter:
         self._semaphore.release()
 
 
+class _NotifyOncePerWindow:
+    """Bounded, per-key "have I already notified about this recently" tracker.
+
+    Round-3-gate-2 P1 (:1408-1426): the held-proposal "awaiting the humans"
+    reply and its paired WARNING must each fire at most once per their own
+    window per member -- never on every single message, which round 2's
+    unconditional per-message reply would have turned into either a
+    permanent DM lockout (if paired with ``return True``) or, once fixed to
+    ``return False``, spam on every message the member sends from then on.
+    LRU-bounded (``max_entries``) for the same reason ``_StatusCache`` is:
+    an unbounded number of distinct members must not grow this dict without
+    limit. Wall-clock based (not monotonic) since these windows are measured
+    in hours, and the whole point is "not more than once per real-world
+    hour/day" -- a process restart legitimately resets the count, same as
+    any other in-memory-only state in this module.
+    """
+
+    def __init__(self, window_seconds: float, *, max_entries: int = 2048, clock: Any = time.time) -> None:
+        self._window = window_seconds
+        self._max_entries = max(1, max_entries)
+        self._clock = clock
+        self._last_at: "OrderedDict[str, float]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def should_notify(self, key: str) -> bool:
+        with self._lock:
+            now = self._clock()
+            last = self._last_at.get(key)
+            if last is not None:
+                self._last_at.move_to_end(key)
+                if (now - last) < self._window:
+                    return False
+            self._last_at[key] = now
+            self._last_at.move_to_end(key)
+            while len(self._last_at) > self._max_entries:
+                self._last_at.popitem(last=False)
+            return True
+
+
 def sanitized_first_contact_envelope(update: Any) -> dict[str, Any]:
     """Validate + shape the SAME authenticated-DM fence telegram_control.py's
     ``_sanitized_envelope`` enforces (private chat, sender == chat, not
@@ -657,7 +731,15 @@ def resolve_member_status(
         if not isinstance(bound, bool):
             return _UNKNOWN_STATUS
         if not bound:
-            return StatusResolution(bound=False, member_id=None, home_squad_id=None, intake_state="unknown")
+            # Round-3-gate-2 P2 (:1391-1399, :186): a CONFIRMED "you are not
+            # a member" response is a DEFINITIVE result, not a transport
+            # failure -- align with mupot's own memberIntakeEnvelope
+            # semantics ("'none' -- chatId maps to no member at all") rather
+            # than the generic "unknown" sentinel, which handle_first_contact
+            # now treats specially (hold a pending record rather than
+            # abandoning it) precisely BECAUSE it means "the response itself
+            # was malformed/absent", never "mupot said no."
+            return StatusResolution(bound=False, member_id=None, home_squad_id=None, intake_state="none")
         if not isinstance(member_id, str) or not member_id.strip():
             return _UNKNOWN_STATUS
         if home_squad_id is not None and (not isinstance(home_squad_id, str) or not home_squad_id.strip()):
@@ -711,6 +793,14 @@ class FirstPersonStateStore:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path).expanduser()
+        # Round-3-gate-2 P1 (:931): append-only, SENDER-SCOPED fallback --
+        # written ONLY when the main store is unreadable at completion time.
+        # Overwriting the main store's JSON built from a truncated/invalid
+        # read would silently erase every OTHER member's completed record
+        # (they would then read back as never-completed and double-propose).
+        # Appending one line never touches, reads, or risks anyone else's
+        # data -- see FirstPersonRuntime.finish/held_proposal_id.
+        self.journal_path = self.path.with_name(self.path.name + ".journal")
 
     def load_checked(self) -> tuple[dict[str, Any], bool]:
         try:
@@ -742,6 +832,53 @@ class FirstPersonStateStore:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
+
+    def append_journal(self, member_id: str, proposal_id: str, completed_at: float) -> None:
+        """Best-effort, append-only. Never raises -- the caller has already
+        logged a WARNING; a journal write failure on top of a corrupted main
+        store is not something retrying harder here would fix."""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(self.journal_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {"member_id": member_id, "proposal_id": proposal_id, "completed_at": completed_at},
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                    )
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                os.chmod(self.journal_path, 0o600)
+        except OSError:
+            pass
+
+    def read_journal_proposal_id(self, member_id: str) -> str | None:
+        """Scan the journal for the most recent proposal_id recorded for
+        member_id. Tolerant of a partially-written last line (an fsync'd
+        append can still be torn by a concurrent crash on some filesystems)
+        -- one bad line is skipped, not fatal to the whole read."""
+        try:
+            raw = self.journal_path.read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError):
+            return None
+        found: str | None = None
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict) and entry.get("member_id") == member_id:
+                candidate = entry.get("proposal_id")
+                if isinstance(candidate, str) and candidate.strip():
+                    found = candidate.strip()
+        return found
 
 
 def default_state_path() -> Path:
@@ -782,6 +919,10 @@ class Intake:
     project_id: str | None = None
     engrams: dict[str, str] = field(default_factory=dict)
     created_at: float = field(default_factory=time.monotonic)
+    # Round-3-gate-2 P0: separate from created_at on purpose -- refreshed on
+    # every accepted answer (see FirstPersonRuntime.record_answer/touch) so
+    # the IDLE timeout measures silence, not total conversation length.
+    last_activity_at: float = field(default_factory=time.monotonic)
     proposal_retry_count: int = 0
     next_proposal_retry_at: float = 0.0
 
@@ -846,38 +987,177 @@ class FirstPersonRuntime:
         ``intake_state=='complete'`` from the EXISTENCE of exactly this
         proposal -- if the server still reports ``'pending'`` while this
         module holds a real ``proposal_id`` here, the server is lagging or
-        buggy, never a reason to re-onboard. Returns ``None`` on a missing
-        entry, a missing/blank ``proposal_id`` field, or an unreadable store
-        (deliberately permissive here -- :meth:`is_complete_or_unknown`'s
-        TTL-bounded check is what fails closed on a corrupted store; this
+        buggy, never a reason to re-onboard. Checks the main store first,
+        then ALWAYS also the journal (round-3-gate-2 P1 :931: a completion
+        recorded to the journal because the main store was corrupted at
+        ``finish()`` time must keep blocking re-intake even later, once the
+        main store looks fine again). Returns ``None`` only when NEITHER
+        source has an entry -- :meth:`is_complete_or_unknown`'s TTL-bounded
+        check is what fails closed on an otherwise-corrupted store; this
         method only ever adds an EXTRA reason to refuse, never a reason to
-        proceed that the other check wouldn't already allow).
+        proceed that the other check wouldn't already allow.
         """
         data, valid = self.store.load_checked()
+        if valid:
+            completed = data.get("completed")
+            if isinstance(completed, dict) and member_id in completed:
+                entry = completed[member_id]
+                if isinstance(entry, dict):
+                    proposal_id = entry.get("proposal_id")
+                    if isinstance(proposal_id, str) and proposal_id.strip():
+                        return proposal_id.strip()
+        # Round-3-gate-2 P1 (:931): ALWAYS also check the journal, whether
+        # the main store was valid-but-missing-this-member or outright
+        # corrupted -- a completion recorded there during a prior corrupted
+        # read (see finish()) must keep blocking re-intake even after the
+        # main store is fixed/replaced.
+        return self.store.read_journal_proposal_id(member_id)
+
+    def _load_in_progress_engrams(self, member_id: str) -> dict[str, str]:
+        """Durable, best-effort read of {question_id: engram_id} recorded so
+        far for an in-progress (not yet completed) intake -- round-3-gate-2
+        P0/Athena's RESUME REBINDS: lets :meth:`start` resume at the first
+        UNANSWERED question instead of re-asking (and re-labelling) already-
+        answered ones after an idle/absolute-TTL drop. Never raises; a
+        corrupted store just degrades this specific member's resume to
+        "start over" (the durable proposal-dedupe guarantee in
+        held_proposal_id/is_complete_or_unknown is unaffected -- this method
+        is purely a UX aid, not a security-relevant gate)."""
+        data, valid = self.store.load_checked()
         if not valid:
-            return None
+            return {}
+        in_progress = data.get("in_progress")
+        if not isinstance(in_progress, dict) or member_id not in in_progress:
+            return {}
+        entry = in_progress[member_id]
+        raw_engrams = entry.get("engram_ids") if isinstance(entry, dict) else None
+        if not isinstance(raw_engrams, dict):
+            return {}
+        return {
+            question_id: engram_id.strip()
+            for question_id, engram_id in raw_engrams.items()
+            if isinstance(question_id, str) and isinstance(engram_id, str) and engram_id.strip()
+        }
+
+    def _save_in_progress(self, member_id: str, engrams: dict[str, str]) -> None:
+        """Sender-scoped, validity-gated (round-3-gate-2 P1 :931 discipline
+        applied here too): read, validate, merge ONLY this member's
+        in-progress record, write. On an invalid read this is a best-effort
+        UX aid (see :meth:`_load_in_progress_engrams`), so it simply skips
+        the write rather than journaling -- unlike the completion marker,
+        losing one round of in-progress resume data is not a duplicate-
+        proposal risk, just a degraded-to-"start over" resume next time."""
+        data, valid = self.store.load_checked()
+        if not valid:
+            return
+        in_progress = data.get("in_progress")
+        if not isinstance(in_progress, dict):
+            in_progress = {}
+        in_progress[member_id] = {"engram_ids": dict(engrams), "updated_at": self._wall_clock()}
+        data["in_progress"] = in_progress
+        self.store.save(data)
+
+    def mark_quarantined(self, member_id: str, question_id: str) -> bool:
+        """Post-hoc scrub (round-3-gate-2, Athena's addition): flags
+        ``question_id``'s engram as quarantined in the durable completed
+        record -- NEVER deletes the engram_id itself (a human/operator may
+        still need it; see :func:`scrub_quarantine_candidates`). Sender-
+        scoped and validity-gated exactly like :meth:`finish`: refuses (logs
+        a WARNING) rather than rewriting the store from an invalid read.
+        Returns True iff the flag was actually written."""
+        data, valid = self.store.load_checked()
+        if not valid:
+            logger.warning(
+                "mupot plugin: cannot mark member_id=%s question_id=%s quarantined -- "
+                "completion store is unreadable",
+                member_id,
+                question_id,
+            )
+            return False
+        completed = data.get("completed")
+        if not isinstance(completed, dict) or member_id not in completed or not isinstance(completed[member_id], dict):
+            return False
+        quarantined = completed[member_id].get("quarantined")
+        quarantined_set = set(quarantined) if isinstance(quarantined, list) else set()
+        quarantined_set.add(question_id)
+        completed[member_id]["quarantined"] = sorted(quarantined_set)
+        data["completed"] = completed
+        self.store.save(data)
+        return True
+
+    def is_quarantined(self, member_id: str, question_id: str) -> bool:
+        data, valid = self.store.load_checked()
+        if not valid:
+            return False
         completed = data.get("completed")
         if not isinstance(completed, dict) or member_id not in completed:
-            return None
+            return False
         entry = completed[member_id]
-        if not isinstance(entry, dict):
-            return None
-        proposal_id = entry.get("proposal_id")
-        return proposal_id.strip() if isinstance(proposal_id, str) and proposal_id.strip() else None
+        quarantined = entry.get("quarantined") if isinstance(entry, dict) else None
+        return isinstance(quarantined, list) and question_id in quarantined
 
     def get_pending(self, chat_key: str) -> Intake | None:
+        """Round-3-gate-2 P0: TWO independent expiries, either one drops the
+        record -- an IDLE timeout measured from ``last_activity_at`` (a
+        thoughtfully-paced conversation never trips this no matter how long
+        the whole thing takes) and a hard ABSOLUTE cap measured from
+        ``created_at`` (a conversation that never quite goes idle cannot
+        hold a local record open forever)."""
         with self._lock:
             intake = self._pending.get(chat_key)
             if intake is None:
                 return None
-            if self._clock() - intake.created_at > _PENDING_TTL_SECONDS:
+            now = self._clock()
+            if now - intake.last_activity_at > _PENDING_IDLE_TTL_SECONDS:
+                del self._pending[chat_key]
+                return None
+            if now - intake.created_at > _PENDING_ABSOLUTE_TTL_SECONDS:
                 del self._pending[chat_key]
                 return None
             return intake
 
-    def start(self, chat_key: str, *, member_id: str, home_squad_id: str) -> Intake:
+    def touch(self, chat_key: str) -> Intake | None:
+        """Refresh last_activity_at without changing anything else -- used
+        for interactions with an existing pending record that are genuine
+        engagement (an escape/pause message, a retry-wait check-in) but not
+        themselves an "accepted answer" (see :meth:`record_answer`, which
+        also refreshes activity as part of its own replace())."""
         with self._lock:
-            intake = Intake(member_id=member_id, home_squad_id=home_squad_id, created_at=self._clock())
+            intake = self._pending.get(chat_key)
+            if intake is None:
+                return None
+            updated = replace(intake, last_activity_at=self._clock())
+            self._pending[chat_key] = updated
+            return updated
+
+    def start(self, chat_key: str, *, member_id: str, home_squad_id: str) -> Intake:
+        """Round-3-gate-2 P0 / Athena's RESUME REBINDS: if this member has a
+        durable in-progress record (from a PRIOR local Intake that idle/
+        absolute-TTL dropped, or a process restart), resume at the first
+        UNANSWERED question -- never re-ask, never re-label, never re-write
+        an engram for a question that already has one. The resumed
+        ``engrams``/``index`` are trimmed to the longest CONTIGUOUS
+        already-answered prefix of :data:`FIRST_PERSON_QUESTIONS` (strictly
+        sequential asking means a gap should never occur, but this is
+        defensive rather than trusting the persisted shape blindly)."""
+        prior_engrams = self._load_in_progress_engrams(member_id)
+        index = 0
+        for question_id, _ in FIRST_PERSON_QUESTIONS:
+            if question_id in prior_engrams:
+                index += 1
+            else:
+                break
+        engrams = {question_id: prior_engrams[question_id] for question_id, _ in FIRST_PERSON_QUESTIONS[:index]}
+        now = self._clock()
+        with self._lock:
+            intake = Intake(
+                member_id=member_id,
+                home_squad_id=home_squad_id,
+                index=index,
+                engrams=engrams,
+                created_at=now,
+                last_activity_at=now,
+            )
             self._pending[chat_key] = intake
             return intake
 
@@ -888,7 +1168,11 @@ class FirstPersonRuntime:
         drift regardless of ``question_id``/``engram_id``. Returns the
         updated ``Intake``, or ``None`` if the pending record vanished
         (TTL/abandon race) -- the caller must treat that as "nothing left to
-        advance", never retry the mutation."""
+        advance", never retry the mutation. Refreshes ``last_activity_at``
+        (round-3-gate-2 P0: an accepted answer IS activity) and durably
+        persists the updated engram map (Athena's RESUME REBINDS) OUTSIDE
+        the lock, same "lock only the in-memory dict, do disk I/O after"
+        shape :meth:`finish` already uses."""
         with self._lock:
             intake = self._pending.get(chat_key)
             if intake is None:
@@ -897,9 +1181,11 @@ class FirstPersonRuntime:
                 intake,
                 engrams={**intake.engrams, question_id: engram_id},
                 index=intake.index + 1,
+                last_activity_at=self._clock(),
             )
             self._pending[chat_key] = updated
-            return updated
+        self._save_in_progress(updated.member_id, updated.engrams)
+        return updated
 
     def set_project_id(self, chat_key: str, project_id: str) -> Intake | None:
         """Same replace-in-place shape as :meth:`record_answer`, for the one
@@ -924,11 +1210,29 @@ class FirstPersonRuntime:
             return updated
 
     def finish(self, chat_key: str, *, proposal_id: str | None) -> None:
+        """Round-3-gate-2 P1 (:931): sender-scoped and validity-gated. On an
+        INVALID read, this method must never rewrite the whole store from
+        that truncated ``{}`` -- doing so (the round-3-gate-1 bug) silently
+        erases every OTHER member's completed record, since ``load_checked``
+        cannot return partial data on a parse failure (it always returns an
+        empty dict alongside ``valid=False``). Instead: append this ONE
+        member's own record to the journal (never touches, reads, or risks
+        anyone else's data) and log a WARNING. The normal merge-and-save
+        path only ever runs when the read was actually valid."""
         with self._lock:
             intake = self._pending.pop(chat_key, None)
         if intake is None:
             return
-        data, _valid = self.store.load_checked()
+        data, valid = self.store.load_checked()
+        if not valid:
+            if proposal_id is not None:
+                self.store.append_journal(intake.member_id, proposal_id, self._wall_clock())
+            logger.warning(
+                "mupot plugin: first-person completion store is unreadable -- "
+                "recorded member_id=%s to the journal instead of rewriting the main store",
+                intake.member_id,
+            )
+            return
         completed = data.get("completed")
         if not isinstance(completed, dict):
             completed = {}
@@ -938,6 +1242,10 @@ class FirstPersonRuntime:
             "completed_at": self._wall_clock(),
         }
         data["completed"] = completed
+        in_progress = data.get("in_progress")
+        if isinstance(in_progress, dict) and intake.member_id in in_progress:
+            del in_progress[intake.member_id]
+            data["in_progress"] = in_progress
         self.store.save(data)
 
     def abandon(self, chat_key: str) -> None:
@@ -1084,37 +1392,80 @@ def _looks_like_credential(text: str) -> bool:
     return any(pattern.search(text) for pattern in _CREDENTIAL_PATTERNS)
 
 
-# Bidi override / isolate control points -- can make a pasted answer render as
-# something other than what it contains.
-_BIDI_CONTROL_CHARS = frozenset(
-    "‪‫‬‭‮‎‏⁦⁧⁨⁩"
-)
+# Round-3-gate-2, Athena's addition: strip by INVARIANT (Unicode general
+# category), not a hand-maintained, ever-growing list of individual code
+# points. Cc (control) and Cf (format) TOGETHER already cover every
+# invisible/format character that can split a token past a contiguous regex
+# match: bidi overrides/embeds/isolates (U+202A-U+202E, U+2066-U+2069,
+# U+200E/U+200F), zero-width joiner/non-joiner/space (U+200D/U+200C/U+200B),
+# soft hyphen (U+00AD), word joiner (U+2060), BOM/ZWNBSP (U+FEFF), and the
+# Mongolian vowel separator (U+180E) -- every one of those IS category Cf,
+# so this single class constant is a strict superset of round-2's
+# hand-picked bidi-only list (removed; category coverage subsumes it). ONE
+# constant this predicate is defined against, not a list that grows every
+# time someone finds one more invisible character.
+_STRIPPED_UNICODE_CATEGORIES = frozenset({"Cc", "Cf"})
 
 
 def _sanitize_answer(text: str) -> str:
     """Normalize FIRST: this is the front half of the round-3 P0-A pipeline
     invariant ("the store never receives an un-normalized byte sequence") --
     NFKC first (collapses compatibility/full-width lookalikes), then strip
-    bidi-override/isolate and Cc control characters. Credential-refusal in
-    :func:`_handle_answer` runs on THIS function's output, never on the raw
-    text, so an obfuscated token (a real credential with an invisible
-    character spliced into the middle) is caught: normalize reassembles it
-    into its plain form BEFORE the credential check ever sees it, instead of
-    the round-2 bug's order (check raw text, then normalize), which let the
-    control character break the regex's contiguous match and only spliced
-    the valid token back together afterward."""
+    every character in :data:`_STRIPPED_UNICODE_CATEGORIES`. Credential-
+    refusal in :func:`_handle_answer` runs on THIS function's output, never
+    on the raw text, so an obfuscated token (a real credential with an
+    invisible character spliced into the middle) is caught: normalize
+    reassembles it into its plain form BEFORE the credential check ever
+    sees it, instead of the round-2 bug's order (check raw text, then
+    normalize), which let the invisible character break the regex's
+    contiguous match and only spliced the valid token back together
+    afterward."""
     normalized = unicodedata.normalize("NFKC", text)
     cleaned_chars = []
     for ch in normalized:
-        if ch in _BIDI_CONTROL_CHARS:
-            continue
         if ch in ("\n", "\t"):
             cleaned_chars.append(ch)
             continue
-        if unicodedata.category(ch) == "Cc":
+        if unicodedata.category(ch) in _STRIPPED_UNICODE_CATEGORIES:
             continue
         cleaned_chars.append(ch)
     return "".join(cleaned_chars).strip()[:_MAX_ANSWER_CHARS]
+
+
+# --------------------------------------------------------------------------
+# Escape hatch + plain-text verdict pass-through (round-3-gate-2 P2 :1455-1458)
+# --------------------------------------------------------------------------
+
+# Mirrors mupot's OWN server-side plain-text command shape (src/im/index.ts's
+# parseIntent verdictMatch) exactly, on purpose: this module must recognize
+# the SAME messages the host's own approve/reject decision path (#1425) will
+# act on, so it can fall through untouched rather than capturing them as an
+# intake answer.
+_VERDICT_COMMAND_PATTERN = re.compile(r"^/?(approve|reject)\s+([A-Za-z0-9_-]{6,64})(?:\s+(.+))?$", re.IGNORECASE)
+
+
+def is_verdict_shaped(text: str) -> bool:
+    """Does `text` match the approve/reject command shape? Used to fall
+    through untouched during live answer-capture (never store it -- see
+    :func:`_handle_answer`) AND, offline, as the detection half of the
+    post-hoc scrub (:func:`scrub_quarantine_candidates`) for anything that
+    might have been captured under an EARLIER, buggy build before this
+    check existed."""
+    return bool(_VERDICT_COMMAND_PATTERN.match(text.strip()))
+
+
+def scrub_quarantine_candidates(recalled_answers: Mapping[str, str]) -> dict[str, str]:
+    """Post-hoc scrub (round-3-gate-2, Athena's addition): given
+    ``{question_id: previously-recalled answer text}`` -- this module never
+    holds raw answer text itself (write-through only, see the module
+    docstring), so an audit of what is ALREADY stored can only run against
+    text an operator has separately recalled (e.g. via ``squad_recall``
+    against the member's home squad) and handed in here -- returns the
+    subset whose text matches the approve/reject command shape. A caller
+    should quarantine each of these via
+    :meth:`FirstPersonRuntime.mark_quarantined` (flag, never delete) and
+    warn the member once."""
+    return {question_id: text for question_id, text in recalled_answers.items() if is_verdict_shaped(text)}
 
 
 # --------------------------------------------------------------------------
@@ -1132,13 +1483,19 @@ async def _handle_answer(
     settings: FirstPersonSettings,
     envelope: Mapping[str, Any],
     secret_owner: ProfileSecretOwner | None = None,
-) -> None:
+) -> bool:
+    """Returns True iff this message was actually consumed by first-person
+    (the caller's ``handle_first_contact`` should report ``True``/stop
+    propagation) and False iff it was a plain-text approve/reject command
+    that must fall through to the host's own decision path completely
+    untouched (round-3-gate-2 P2 :1455-1458) -- never captured, never
+    stored, never replied to from here."""
     raw_answer = getattr(message, "text", None)
     if not isinstance(raw_answer, str) or not raw_answer.strip():
         # Round-3 ruling (6): not a usable answer at all -- nudge, don't
         # capture, don't fall through.
         await message.reply_text(_UNRELATED_ANSWER_REPLY)
-        return
+        return True
 
     question_id, question_text = FIRST_PERSON_QUESTIONS[intake.index]
 
@@ -1151,14 +1508,26 @@ async def _handle_answer(
     # exactly that character and reassembled a valid token. See
     # tests/test_first_person.py's mutation-regression receipt for this.
     cleaned_answer = _sanitize_answer(raw_answer)
+
+    # Round-3-gate-2 P2 (:1455-1458): checked on the NORMALIZED text, same
+    # pipeline-order discipline as the credential check below -- an escape
+    # word PAUSES (engrams/index untouched; the very next non-escape message
+    # resumes the SAME still-current question), and a plain-text
+    # approve/reject command is NEVER captured as an answer at all.
+    if cleaned_answer.strip().lower().lstrip("/") in _ESCAPE_WORDS:
+        await message.reply_text(_PAUSED_REPLY)
+        return True
+    if is_verdict_shaped(cleaned_answer):
+        return False
+
     if _looks_like_credential(cleaned_answer):
         # Refused before the normalized text ever reaches storage/logging --
         # no trace of it (raw or cleaned) survives this branch.
         await message.reply_text(f"{_CREDENTIAL_REPLY} {question_text}")
-        return
+        return True
     if not cleaned_answer:
         await message.reply_text(_WRITE_FAILURE_REPLY)
-        return
+        return True
 
     if question_id == "project" and intake.project_id is None:
         def resolve_project() -> str | None:
@@ -1169,10 +1538,10 @@ async def _handle_answer(
         # right after -- nothing here writes it anywhere.
         if project_id is None:
             await message.reply_text(_project_not_found_reply(cleaned_answer))
-            return
+            return True
         updated = runtime.set_project_id(chat_key, project_id)
         if updated is None:
-            return  # race: pending vanished (TTL/abandon) mid-resolution
+            return True  # race: pending vanished (TTL/abandon) mid-resolution
         intake = updated
 
     def remember() -> dict[str, Any]:
@@ -1196,18 +1565,20 @@ async def _handle_answer(
         # No confirmed write: retry from memory next message, never spill to
         # disk. The pending intake is left exactly as it was.
         await message.reply_text(_WRITE_FAILURE_REPLY)
-        return
+        return True
 
     updated = runtime.record_answer(chat_key, question_id, engram_id)
     if updated is None:
-        return  # race: pending vanished (TTL/abandon) mid-write -- the
-        # engram write-through already succeeded and is safe (write-through
-        # only, never a transcript); nothing left here to advance.
+        # race: pending vanished (TTL/abandon) mid-write -- the engram
+        # write-through already succeeded and is safe (write-through only,
+        # never a transcript); nothing left here to advance.
+        return True
 
     if updated.index >= len(FIRST_PERSON_QUESTIONS):
         await _submit_proposal(message, chat_key, updated, client=client, runtime=runtime)
-        return
+        return True
     await message.reply_text(FIRST_PERSON_QUESTIONS[updated.index][1])
+    return True
 
 
 async def _submit_proposal(
@@ -1332,6 +1703,9 @@ async def handle_first_contact(
     secret_owner: ProfileSecretOwner | None = None,
     status_cache: _StatusCache | None = None,
     probe_limiter: "_ProbeLimiter | None" = None,
+    lag_warning_notifier: "_NotifyOncePerWindow | None" = None,
+    lag_reply_notifier: "_NotifyOncePerWindow | None" = None,
+    home_wait_notifier: "_NotifyOncePerWindow | None" = None,
 ) -> bool:
     """Handle one inbound Telegram update for the first-person flow.
 
@@ -1349,13 +1723,14 @@ async def handle_first_contact(
     given deployment all fail-safe for the intake here, every time -- never
     consumed, the host handler owns the turn.
 
-    Round-3 P0-B / ruling (1): ONE exception to "server says pending ->
-    proceed" -- if this module already holds a ``proposal_id`` for the
-    resolved member (see ``FirstPersonRuntime.held_proposal_id``), a
-    ``pending`` report is treated as server lag/bug, not license to
-    re-intake: the update IS consumed (``True``), but only to reply the fixed
-    "awaiting the humans" line -- no question, no mupot mutation, no second
-    proposal.
+    Round-3-gate-2 P1 (:1408-1426) revision of the P0-B lag guard: if this
+    module already holds a ``proposal_id`` for the resolved member (see
+    ``FirstPersonRuntime.held_proposal_id``) while the server still reports
+    ``pending``, this is server lag/bug -- still never a reason to re-intake
+    -- but the update is now returned ``False`` (host owns the turn; a
+    permanent ``True`` here was itself round-2's own DM-lockout bug) with a
+    rate-limited reassurance reply (see ``_lag_reply_notifier``) and a
+    separately rate-limited WARNING, rather than either on every message.
     """
 
     # Edited messages must never re-enter as the "next answer" -- the PTB
@@ -1374,6 +1749,10 @@ async def handle_first_contact(
         return False  # not a fenced private DM -- not first-person's concern
 
     chat_key = str(envelope["chat_id"])
+    # Round-3-gate-2 P2 (:1391-1399, :186): fetched BEFORE resolving status so
+    # the cache can be bypassed for a member with genuine local progress --
+    # see the `cache=` argument below.
+    pending = runtime.get_pending(chat_key)
 
     def resolve() -> StatusResolution:
         return resolve_member_status(
@@ -1381,19 +1760,32 @@ async def handle_first_contact(
             envelope["user_id"],
             envelope["chat_id"],
             secret_owner=secret_owner,
-            cache=status_cache,
+            # A member with a local pending record ALWAYS gets a fresh,
+            # uncached probe: the per-user_id cache (including its 15-minute
+            # "unknown" latch) exists to blunt a STRANGER hammering the bot,
+            # never to delay noticing that a genuinely in-progress member's
+            # status has changed. This also means a transient probe failure
+            # for a pending member is never cached, so the very next message
+            # re-probes live instead of replaying a stale "unknown" for the
+            # whole latch window.
+            cache=None if pending is not None else status_cache,
             probe_limiter=probe_limiter,
         )
 
     status = await asyncio.to_thread(resolve)
-    pending = runtime.get_pending(chat_key)
 
     if not status.is_pending:
-        # Unbound, never-started, already-onboarded, or the contract fields
-        # aren't live on this deployment yet (intake_state=="unknown") --
-        # every one of these is fail-safe for the intake: never consumed, the
-        # host handler owns the turn. Drop any stale local record; store
-        # nothing.
+        if pending is not None and status.intake_state == "unknown":
+            # Round-3-gate-2 P2 (:1391-1399): a TRANSIENT probe failure (or
+            # the contract fields simply not present this one time) must
+            # NEVER abandon genuine in-progress intake progress -- only a
+            # DEFINITIVE non-pending status (unbound, 'none', 'complete')
+            # does that. Hold the pending record exactly as it is; the next
+            # message re-probes (see the cache bypass above).
+            return False
+        # Unbound, or a DEFINITIVE 'none'/'complete' -- fail-safe for the
+        # intake: never consumed, the host handler owns the turn. Drop any
+        # stale local record; store nothing.
         if pending is not None:
             runtime.abandon(chat_key)
         return False
@@ -1407,28 +1799,35 @@ async def handle_first_contact(
     if pending is None:
         held_proposal_id = runtime.held_proposal_id(status.member_id)
         if held_proposal_id is not None:
-            # Round-3 P0-B / ruling (1) -- HARD RULE: this module already
-            # holds a proposal for this member (mupot PR#1488: the server
-            # derives intake_state=='complete' from the EXISTENCE of exactly
-            # this proposal). The server still reporting 'pending' here is
-            # server lag or a server-side bug -- never a reason to re-onboard.
-            # Consume nothing mutating: no home creation, no question, no
-            # second proposal. Exactly one WARNING (member_id + the held
-            # proposal_id only, no PII), and the fixed reassurance line.
-            logger.warning(
-                "mupot plugin: server reports intake_state='pending' for "
-                "member_id=%s while proposal_id=%s is already held -- "
-                "treating as complete-with-proposal, not re-intaking",
-                status.member_id,
-                held_proposal_id,
-            )
-            await message.reply_text(_AWAITING_HUMANS_REPLY)
-            return True
+            # Round-3-gate-2 P1 (:1408-1426): this module already holds a
+            # proposal for this member (mupot PR#1488: the server derives
+            # intake_state=='complete' from the EXISTENCE of exactly this
+            # proposal). The server still reporting 'pending' here is server
+            # lag or a server-side bug -- never a reason to re-onboard. But
+            # this is now a `return False`: the host still gets its own turn
+            # (e.g. a real approve/reject from this same member) every
+            # message -- only the WARNING and the reassurance reply are
+            # rate-limited (separately), never the turn itself.
+            if lag_warning_notifier is None or lag_warning_notifier.should_notify(status.member_id):
+                logger.warning(
+                    "mupot plugin: server reports intake_state='pending' for "
+                    "member_id=%s while proposal_id=%s is already held -- "
+                    "treating as complete-with-proposal, not re-intaking",
+                    status.member_id,
+                    held_proposal_id,
+                )
+            if lag_reply_notifier is None or lag_reply_notifier.should_notify(status.member_id):
+                await message.reply_text(_AWAITING_HUMANS_REPLY)
+            return False
 
         if runtime.is_complete_or_unknown(status.member_id):
             return False
 
-        if not status.home_squad_id:
+        # Round-3-gate-2 P3: a whitespace-only home_squad_id is treated as
+        # absent at THIS use site too, belt-and-suspenders alongside
+        # resolve_member_status's own parse-time rejection of one.
+        home_squad_id = status.home_squad_id
+        if not isinstance(home_squad_id, str) or not home_squad_id.strip():
             # Verified on mupot's kasra/fp01-slice2-proposal-chain, 2026-09-21:
             # createHomeForMember exists ONLY as an internal TypeScript
             # function (src/org/service.ts) -- grepping every call site in
@@ -1438,25 +1837,41 @@ async def handle_first_contact(
             # mupot_operator.py) precisely so nothing here can pretend
             # otherwise. Per brief 2f(a), home creation is gated by the
             # member's own first contact and is mupot's job alone -- this
-            # module never invents a call for it. Fail-safe for the intake:
-            # a bound, pending member with no home yet is left completely
-            # untouched (no reply, no state) until a later status probe
-            # reports a non-null home_squad_id.
+            # module never invents a home, never asks question 1 without a
+            # real home id behind it. Athena's addition: a rate-limited
+            # reassurance reply (once per hour per member) rather than pure
+            # silence -- still consumes nothing, stores nothing, and retries
+            # the status probe on the very next message.
+            if home_wait_notifier is None or home_wait_notifier.should_notify(status.member_id):
+                await message.reply_text(_HOME_NOT_READY_REPLY)
             return False
 
-        runtime.start(chat_key, member_id=status.member_id, home_squad_id=status.home_squad_id)
-        await message.reply_text(FIRST_PERSON_QUESTIONS[0][1])
+        started = runtime.start(chat_key, member_id=status.member_id, home_squad_id=home_squad_id)
+        # Round-3-gate-2 P0 / Athena's RESUME REBINDS: ask the FIRST
+        # UNANSWERED question -- `started.index` reflects any durable prior
+        # progress FirstPersonRuntime.start() just resumed (0 for a
+        # genuinely fresh start). This message itself is the trigger that
+        # opens/resumes the conversation, same convention as a fresh start's
+        # first message -- never treated as an answer in the same turn.
+        await message.reply_text(FIRST_PERSON_QUESTIONS[started.index][1])
         return True
 
     if pending.index >= len(FIRST_PERSON_QUESTIONS):
+        pending_text = getattr(message, "text", None)
+        if isinstance(pending_text, str) and is_verdict_shaped(pending_text):
+            # Round-3-gate-2 P2 (:1455-1458): never captured even in the
+            # proposal-retry-wait phase -- the host owns a genuine
+            # approve/reject regardless of where this member's OWN intake
+            # happens to be.
+            return False
         await _retry_proposal_if_due(message, chat_key, pending, client=client, runtime=runtime)
         return True
 
-    await _handle_answer(
+    handled = await _handle_answer(
         message, chat_key, pending, client=client, runtime=runtime,
         settings=settings, envelope=envelope, secret_owner=secret_owner,
     )
-    return True
+    return handled
 
 
 # --------------------------------------------------------------------------
@@ -1476,6 +1891,9 @@ def register_first_person(
     runtime: FirstPersonRuntime | None = None,
     status_cache: _StatusCache | None = None,
     probe_limiter: "_ProbeLimiter | None" = None,
+    lag_warning_notifier: "_NotifyOncePerWindow | None" = None,
+    lag_reply_notifier: "_NotifyOncePerWindow | None" = None,
+    home_wait_notifier: "_NotifyOncePerWindow | None" = None,
 ) -> None:
     settings.validate()
     if not settings.enabled:
@@ -1487,6 +1905,12 @@ def register_first_person(
         status_cache = _StatusCache()
     if probe_limiter is None:
         probe_limiter = _ProbeLimiter()
+    if lag_warning_notifier is None:
+        lag_warning_notifier = _NotifyOncePerWindow(_LAG_WARNING_WINDOW_SECONDS)
+    if lag_reply_notifier is None:
+        lag_reply_notifier = _NotifyOncePerWindow(_LAG_REPLY_WINDOW_SECONDS)
+    if home_wait_notifier is None:
+        home_wait_notifier = _NotifyOncePerWindow(_HOME_NOT_READY_WINDOW_SECONDS)
     wired_applications: list[tuple[Any, Any]] = []
 
     def factory(application: Any, adapter: Any) -> None:
@@ -1507,6 +1931,9 @@ def register_first_person(
                 secret_owner=secret_owner,
                 status_cache=status_cache,
                 probe_limiter=probe_limiter,
+                lag_warning_notifier=lag_warning_notifier,
+                lag_reply_notifier=lag_reply_notifier,
+                home_wait_notifier=home_wait_notifier,
             )
             if handled:
                 raise ApplicationHandlerStop

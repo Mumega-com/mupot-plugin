@@ -32,19 +32,31 @@ from plugin.first_person import (
     Intake,
     StatusResolution,
     _AWAITING_HUMANS_REPLY,
+    _ESCAPE_WORDS,
+    _HOME_NOT_READY_REPLY,
+    _HOME_NOT_READY_WINDOW_SECONDS,
+    _LAG_REPLY_WINDOW_SECONDS,
+    _LAG_WARNING_WINDOW_SECONDS,
+    _PAUSED_REPLY,
+    _PENDING_ABSOLUTE_TTL_SECONDS,
+    _PENDING_IDLE_TTL_SECONDS,
+    _NotifyOncePerWindow,
     _ProbeLimiter,
     _StatusCache,
     _UNRELATED_ANSWER_REPLY,
+    _VERDICT_COMMAND_PATTERN,
     _build_resolve_project_request,
     _classify_intake_state,
     _looks_like_credential,
     _resolve_member_project,
     _sanitize_answer,
     handle_first_contact,
+    is_verdict_shaped,
     register_first_person,
     register_first_person_skill,
     resolve_member_status,
     sanitized_first_contact_envelope,
+    scrub_quarantine_candidates,
 )
 from plugin.mupot_operator import FIRST_PERSON_ACTIONS, OPERATOR_TOOL_NAMES, MANAGER_TOOL_NAMES
 
@@ -197,7 +209,14 @@ def pending_status(member_id: str = "member-1", home_squad_id: str | None = "hom
     return StatusResolution(bound=True, member_id=member_id, home_squad_id=home_squad_id, intake_state="pending")
 
 
-UNBOUND_STATUS = StatusResolution(bound=False, member_id=None, home_squad_id=None, intake_state="unknown")
+# Round-3-gate-2 P2: UNBOUND_STATUS ("mupot confirmed you are not a member")
+# and UNKNOWN_STATUS ("the response itself was malformed/absent/timed out")
+# are now genuinely DIFFERENT values -- round-2 conflated both into
+# intake_state="unknown", which made a transient probe failure
+# indistinguishable from a confirmed non-member and meant either one
+# abandoned a genuinely in-progress local intake. See
+# resolve_member_status's "not bound" branch.
+UNBOUND_STATUS = StatusResolution(bound=False, member_id=None, home_squad_id=None, intake_state="none")
 NONE_STATUS = StatusResolution(bound=True, member_id="member-1", home_squad_id=None, intake_state="none")
 COMPLETE_STATUS = StatusResolution(bound=True, member_id="member-1", home_squad_id="home-squad-1", intake_state="complete")
 UNKNOWN_STATUS = StatusResolution(bound=False, member_id=None, home_squad_id=None, intake_state="unknown")
@@ -446,8 +465,8 @@ async def test_pending_status_with_no_home_yet_is_left_untouched(
     """Round 3: create_home_for_member has NO exposed MCP action or /im route
     (verified on mupot's kasra/fp01-slice2-proposal-chain branch) -- this
     module never invents a call for it. A bound, pending member with a null
-    home_squad_id is left completely untouched (no reply, no state) rather
-    than trying to provision one."""
+    home_squad_id consumes nothing and stores nothing (round-3-gate-2,
+    Athena's addition: a rate-limited reassurance reply, never silence)."""
     install_status_stub(monkeypatch, lambda *_: pending_status(home_squad_id=None))
     client = FakeClient()
     runtime = FirstPersonRuntime(tmp_path / "state.json")
@@ -456,9 +475,35 @@ async def test_pending_status_with_no_home_yet_is_left_untouched(
     handled = await handle_first_contact(update, settings=valid_settings(), client=client, runtime=runtime)
 
     assert handled is False
-    assert update.effective_message.replies == []
+    assert update.effective_message.replies == [_HOME_NOT_READY_REPLY]
     assert runtime.get_pending("123") is None
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_home_not_ready_reply_is_rate_limited_to_once_per_hour(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake_time = {"now": 0.0}
+    install_status_stub(monkeypatch, lambda *_: pending_status(home_squad_id=None))
+    client = FakeClient()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    settings = valid_settings()
+    notifier = _NotifyOncePerWindow(_HOME_NOT_READY_WINDOW_SECONDS, clock=lambda: fake_time["now"])
+
+    first = Update(message=Message(text="hello!"))
+    await handle_first_contact(first, settings=settings, client=client, runtime=runtime, home_wait_notifier=notifier)
+    assert first.effective_message.replies == [_HOME_NOT_READY_REPLY]
+
+    fake_time["now"] += 60.0  # 1 minute later -- well within the hour window
+    second = Update(message=Message(text="hello again"))
+    await handle_first_contact(second, settings=settings, client=client, runtime=runtime, home_wait_notifier=notifier)
+    assert second.effective_message.replies == []  # rate-limited, no repeat
+
+    fake_time["now"] += _HOME_NOT_READY_WINDOW_SECONDS + 1.0  # past the hour
+    third = Update(message=Message(text="still there?"))
+    await handle_first_contact(third, settings=settings, client=client, runtime=runtime, home_wait_notifier=notifier)
+    assert third.effective_message.replies == [_HOME_NOT_READY_REPLY]
 
 
 @pytest.mark.asyncio
@@ -859,8 +904,12 @@ async def test_proposal_failure_keeps_pending_and_replies_honestly_then_retries(
         update = Update(message=Message(text=answer))
         await handle_first_contact(update, settings=settings, client=client, runtime=runtime)
 
-    # First submission failed: no marker, honest reply, pending retained.
-    assert not state_path.exists()
+    # First submission failed: no COMPLETION marker, honest reply, pending
+    # retained. The state file itself now exists (round-3-gate-2 P0's
+    # durable in-progress engram record, written on every accepted answer
+    # for RESUME purposes) -- what must NOT exist is a "completed" entry.
+    data = json.loads(state_path.read_text())
+    assert "member-1" not in data.get("completed", {})
     assert update.effective_message.replies[-1] == "I couldn't send your request yet -- I'll try again."
     pending = runtime.get_pending("123")
     assert pending is not None
@@ -1511,7 +1560,10 @@ async def test_held_proposal_lag_logs_exactly_one_warning_no_pii(
     update = Update(message=Message(text="hello again"))
     handled = await handle_first_contact(update, settings=settings, client=client, runtime=runtime)
 
-    assert handled is True
+    # Round-3-gate-2 P1 (:1408-1426): False now -- the host still owns the
+    # turn (never a permanent DM lockout) -- but the reassurance reply is
+    # still sent (rate-limited separately, see the dedicated rate-limit test).
+    assert handled is False
     assert update.effective_message.replies == [_AWAITING_HUMANS_REPLY]
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
@@ -1522,15 +1574,18 @@ async def test_held_proposal_lag_logs_exactly_one_warning_no_pii(
 
 
 @pytest.mark.asyncio
-async def test_held_proposal_id_blocks_reintake_even_two_hours_past_completion(
+async def test_held_proposal_id_blocks_reintake_across_hours_with_rate_limited_notifications(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Round-3 P0-B HARD RULE, end to end: a server that keeps reporting
-    intake_state == 'pending' for 2 simulated hours after a successful
+    """Round-3-gate-2 P1 (:1408-1426), end to end: a server that keeps
+    reporting intake_state == 'pending' for hours after a successful
     proposal (well past the 3600s completion-cache TTL -- see
     test_condition_ii, a SEPARATE, softer mechanism this does not rely on)
     must produce zero re-asked questions, zero engram rewrites, and zero
-    second proposals."""
+    second proposals -- AND the host must get its turn every single message
+    (``handled is False``, never round-2's permanent DM lockout), with the
+    WARNING (1h window) and the reassurance reply (24h window) each
+    rate-limited on their OWN cadence, never once per message."""
     fake_wall_clock = {"now": 1_000_000.0}
     state_path = tmp_path / "state.json"
     runtime = FirstPersonRuntime(state_path, wall_clock=lambda: fake_wall_clock["now"])
@@ -1544,20 +1599,40 @@ async def test_held_proposal_id_blocks_reintake_even_two_hours_past_completion(
 
     install_status_stub(monkeypatch, lambda *_: pending_status(home_squad_id="home-squad-1"))
     settings = valid_settings()
+    warning_notifier = _NotifyOncePerWindow(_LAG_WARNING_WINDOW_SECONDS, clock=lambda: fake_wall_clock["now"])
+    reply_notifier = _NotifyOncePerWindow(_LAG_REPLY_WINDOW_SECONDS, clock=lambda: fake_wall_clock["now"])
     caplog.set_level("WARNING")
-    minutes = range(0, 121, 15)  # 0, 15, ..., 120 minutes -- 9 messages
-    for minute in minutes:
-        fake_wall_clock["now"] += 15 * 60.0
-        update = Update(message=Message(text=f"still there? (minute {minute})"))
-        handled = await handle_first_contact(update, settings=settings, client=client, runtime=runtime)
-        assert handled is True
-        assert update.effective_message.replies == [_AWAITING_HUMANS_REPLY]
+
+    replies_per_message: list[list[str]] = []
+    for _hour in range(3):  # 3 messages, exactly 1 simulated hour apart
+        fake_wall_clock["now"] += 3600.0
+        update = Update(message=Message(text="still there?"))
+        handled = await handle_first_contact(
+            update,
+            settings=settings,
+            client=client,
+            runtime=runtime,
+            lag_warning_notifier=warning_notifier,
+            lag_reply_notifier=reply_notifier,
+        )
+        assert handled is False  # host owns the turn -- every message, not just some
+        replies_per_message.append(list(update.effective_message.replies))
 
     assert len(client.calls) == calls_after_completion  # zero new mupot calls at all
     data = json.loads(state_path.read_text())
     assert data["completed"]["member-1"]["proposal_id"] == "proposal-1"  # unchanged, still the first
+
+    # Reply (24h window): only the FIRST message gets it -- 3 simulated
+    # hours never crosses the 24h window again.
+    assert replies_per_message[0] == [_AWAITING_HUMANS_REPLY]
+    assert replies_per_message[1] == []
+    assert replies_per_message[2] == []
+
+    # Warning (1h window): each message here IS exactly 1h apart, so all
+    # three cross the window -- one warning per message this time, driven by
+    # the SHORTER window, not the reply's cadence.
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-    assert len(warnings) == len(minutes)  # exactly one per message in this state
+    assert len(warnings) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1772,3 +1847,646 @@ async def test_home_squad_id_is_immutable_regardless_of_any_answer_text(
 def test_credential_reply_documents_the_rephrase_path() -> None:
     assert "Please don't share" in first_person._CREDENTIAL_REPLY
     assert "rephrasing" in first_person._CREDENTIAL_REPLY
+
+
+# ===========================================================================
+# Round 3, gate 2 (adversarial round 1 on #19 @ f17f9b31: RED, 1 P0 / 3 P1 /
+# 2 P2 / 2 P3; all eight #17 findings CONFIRMED-FIXED). Round 2 of 2 -- see
+# PR body's Round 2 table for the item -> test mapping. Athena's additions
+# (resolve-project envelope frozen contract, home-not-ready reply, resume
+# rebinds, sanitizer-by-invariant, sender-scoped store rewrite, 'unknown'
+# never abandons, post-hoc scrub) are folded in alongside the matching
+# review item.
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# P0 (:873): idle timeout (not absolute session length) + resume rebinds
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_three_minutes_per_question_completes_without_premature_drop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Total session time (900s across 5 answers) crosses where the round-2
+    bug's ABSOLUTE, created_at-measured 600s TTL would have dropped and
+    silently restarted mid-conversation. The IDLE timeout (reset on every
+    accepted answer) must never trip here."""
+    fake_clock = {"now": 0.0}
+    runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
+    client = _client_for_full_intake()
+    answers = ["Ada Example", "Engineer", "psychonom", "Ship it", "Nothing else"]
+
+    install_status_stub(monkeypatch, lambda *_: pending_status())
+    monkeypatch.setattr("plugin.first_person._resolve_member_project", _default_project_resolver)
+    settings = valid_settings()
+
+    update = Update(message=Message(text="hello!"))
+    await handle_first_contact(update, settings=settings, client=client, runtime=runtime)
+    last_update = update
+    for answer in answers:
+        fake_clock["now"] += 180.0  # 3 minutes per question
+        last_update = Update(message=Message(text=answer))
+        handled = await handle_first_contact(last_update, settings=settings, client=client, runtime=runtime)
+        assert handled is True
+
+    assert last_update.effective_message.replies[-1] == (
+        "Thanks -- I've sent your access request to the team for a decision."
+    )
+    remember_calls = [args for action, args in client.calls if action == "squad_remember"]
+    assert len(remember_calls) == 5
+    assert [args["concepts"] for args in remember_calls] == [
+        ["name"],
+        ["role"],
+        ["project"],
+        ["first_ask"],
+        ["notes"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_eleven_minutes_of_silence_drops_the_pending_record(tmp_path: Path) -> None:
+    fake_clock = {"now": 0.0}
+    runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    assert runtime.get_pending("123") is not None
+
+    fake_clock["now"] += 11 * 60.0
+    assert runtime.get_pending("123") is None
+
+
+@pytest.mark.asyncio
+async def test_resume_after_idle_drop_never_reasks_or_relabels_answered_questions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Athena's RESUME REBINDS: stored answers stay attached to their
+    ORIGINAL question ids; a resume asks the first UNANSWERED question;
+    nothing stored is re-asked or relabelled -- exactly five engrams total,
+    each correctly labelled, zero duplicates, across an idle-TTL drop mid-
+    conversation."""
+    fake_clock = {"now": 0.0}
+    state_path = tmp_path / "state.json"
+    runtime = FirstPersonRuntime(state_path, clock=lambda: fake_clock["now"])
+    client = _client_for_full_intake()
+
+    install_status_stub(monkeypatch, lambda *_: pending_status())
+    monkeypatch.setattr("plugin.first_person._resolve_member_project", _default_project_resolver)
+    settings = valid_settings()
+
+    start_update = Update(message=Message(text="hello!"))
+    await handle_first_contact(start_update, settings=settings, client=client, runtime=runtime)
+    assert start_update.effective_message.replies == [FIRST_PERSON_QUESTIONS[0][1]]
+
+    fake_clock["now"] += 60.0
+    q1_update = Update(message=Message(text="Ada Example"))
+    await handle_first_contact(q1_update, settings=settings, client=client, runtime=runtime)
+    assert q1_update.effective_message.replies == [FIRST_PERSON_QUESTIONS[1][1]]
+
+    fake_clock["now"] += 60.0
+    q2_update = Update(message=Message(text="Engineer"))
+    await handle_first_contact(q2_update, settings=settings, client=client, runtime=runtime)
+    assert q2_update.effective_message.replies == [FIRST_PERSON_QUESTIONS[2][1]]
+
+    # 11 minutes of silence -- idle timeout trips, local record dropped.
+    fake_clock["now"] += 11 * 60.0
+    assert runtime.get_pending("123") is None
+
+    # The very next message is the RESUME TRIGGER (same convention as a
+    # fresh start's first message -- never itself treated as an answer) --
+    # must ask the FIRST UNANSWERED question (Q3: "project"), never Q1.
+    resume_trigger = Update(message=Message(text="are you still there?"))
+    handled = await handle_first_contact(resume_trigger, settings=settings, client=client, runtime=runtime)
+    assert handled is True
+    pending = runtime.get_pending("123")
+    assert pending is not None
+    assert pending.index == 2  # Q1 ("name"), Q2 ("role") already answered
+    assert set(pending.engrams) == {"name", "role"}
+    assert resume_trigger.effective_message.replies == [FIRST_PERSON_QUESTIONS[2][1]]
+
+    # Now finish Q3, Q4, Q5.
+    for answer in ["psychonom", "Ship it", "Nothing else"]:
+        fake_clock["now"] += 60.0
+        update = Update(message=Message(text=answer))
+        await handle_first_contact(update, settings=settings, client=client, runtime=runtime)
+
+    remember_calls = [args for action, args in client.calls if action == "squad_remember"]
+    assert len(remember_calls) == 5  # never re-recorded Q1/Q2 after resume
+    labelled = {tuple(args["concepts"]): args["text"] for args in remember_calls}
+    assert labelled[("name",)] == "Ada Example"
+    assert labelled[("role",)] == "Engineer"
+    assert labelled[("project",)] == "psychonom"
+    assert labelled[("first_ask",)] == "Ship it"
+    assert labelled[("notes",)] == "Nothing else"
+    data = json.loads(state_path.read_text())
+    assert set(data["completed"]["member-1"]["engram_ids"]) == {
+        "name",
+        "role",
+        "project",
+        "first_ask",
+        "notes",
+    }
+    assert "member-1" not in data.get("in_progress", {})  # cleared on completion
+
+
+def test_runtime_start_resumes_at_the_first_contiguous_unanswered_question(tmp_path: Path) -> None:
+    """Unit-level check of FirstPersonRuntime.start's resume logic directly,
+    independent of the full message flow above."""
+    state_path = tmp_path / "state.json"
+    runtime = FirstPersonRuntime(state_path)
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    runtime.record_answer("123", "name", "engram-1")
+    runtime.record_answer("123", "role", "engram-2")
+    runtime.abandon("123")  # simulate a drop without hitting the real TTL
+
+    resumed = runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    assert resumed.index == 2
+    assert resumed.engrams == {"name": "engram-1", "role": "engram-2"}
+
+
+def test_runtime_start_is_a_fresh_intake_for_a_member_with_no_prior_progress(tmp_path: Path) -> None:
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    fresh = runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    assert fresh.index == 0
+    assert fresh.engrams == {}
+
+
+# ---------------------------------------------------------------------------
+# P1 (:1114) / Athena's "sanitizer class by invariant": Cc + Cf, one constant
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "hidden_char",
+    ["‍", "​", "‌", "­", "⁠", "﻿", "᠎"],
+    ids=["ZWJ-U+200D", "ZWSP-U+200B", "ZWNJ-U+200C", "soft-hyphen-U+00AD", "word-joiner-U+2060", "BOM-U+FEFF", "U+180E"],
+)
+def test_format_category_characters_are_stripped_not_only_explicit_bidi(hidden_char: str) -> None:
+    """Round-3-gate-2 P1 (:1114): the round-2 sanitizer stripped Cc + an
+    explicit bidi-only list -- it missed every OTHER Cf (format) character.
+    All seven of these ARE category Cf; the fix strips by category, so all
+    seven disappear regardless of whether any one of them was ever
+    individually named."""
+    exploit = "mupot_" + "A" * 4 + hidden_char + "A" * 28
+    assert _looks_like_credential(_sanitize_answer(exploit)) is True
+
+
+def test_stripped_categories_is_one_constant_not_a_growing_list() -> None:
+    assert first_person._STRIPPED_UNICODE_CATEGORIES == frozenset({"Cc", "Cf"})
+
+
+def test_order_revert_mutation_still_catches_every_explicit_evading_string() -> None:
+    """Mutation-regression receipt, extended: reverting the credential-check
+    order (raw text first, THEN sanitize) must still let every one of these
+    evading strings through uncaught -- proving the P0-A fix continues to be
+    load-bearing after the P1 sanitizer rewrite."""
+    hidden_chars = ["‮", "\x01", "⁦", "‭", "‍", "​", "‌", "­", "⁠", "﻿"]
+    for hidden_char in hidden_chars:
+        exploit = "mupot_" + "A" * 4 + hidden_char + "A" * 28
+        assert _looks_like_credential(_sanitize_answer(exploit)) is True  # the FIX catches it
+        assert _looks_like_credential(exploit) is False  # the OLD (broken) order would not have
+
+
+# ---------------------------------------------------------------------------
+# P1 (:1408-1426) / P3: lag guard returns False (host owns the turn), never
+# a permanent DM lockout; WARNING rate-limited separately from the reply
+# ---------------------------------------------------------------------------
+
+
+def test_notify_once_per_window_rate_limits_a_single_key() -> None:
+    fake_time = {"now": 0.0}
+    notifier = _NotifyOncePerWindow(100.0, clock=lambda: fake_time["now"])
+    assert notifier.should_notify("member-1") is True
+    assert notifier.should_notify("member-1") is False  # immediate repeat -- suppressed
+    fake_time["now"] += 50.0
+    assert notifier.should_notify("member-1") is False  # still within the window
+    fake_time["now"] += 50.0
+    assert notifier.should_notify("member-1") is True  # window elapsed
+
+
+def test_notify_once_per_window_is_bounded_across_many_distinct_keys() -> None:
+    notifier = _NotifyOncePerWindow(3600.0, max_entries=64)
+    for n in range(10_000):
+        notifier.should_notify(f"member-{n}")
+    assert len(notifier._last_at) <= 64
+
+
+@pytest.mark.asyncio
+async def test_held_proposal_lag_never_locks_the_member_out_of_the_host_permanently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round-3-gate-2 P1 (:1408-1426) P0-class regression: round-2's
+    unconditional `return True` here meant a member whose proposal is held
+    while the server still says 'pending' could NEVER reach the host again
+    -- not even their own genuine `approve <id>`. `handled` must be False
+    on every single message in this state, forever, not just sometimes."""
+    client = _client_for_full_intake()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    answers = ["Ada Example", "Engineer", "psychonom", "Ship it", "Nothing else"]
+    await _run_intake(monkeypatch, client, runtime, answers)
+
+    install_status_stub(monkeypatch, lambda *_: pending_status(home_squad_id="home-squad-1"))
+    settings = valid_settings()
+    for _ in range(5):
+        update = Update(message=Message(text="approve f9408956"))
+        handled = await handle_first_contact(update, settings=settings, client=client, runtime=runtime)
+        assert handled is False
+
+
+# ---------------------------------------------------------------------------
+# P1 (:931) / Athena's "store rewrite: sender-scoped and validity-gated"
+# ---------------------------------------------------------------------------
+
+
+def test_finish_never_rewrites_the_store_on_an_invalid_read(tmp_path: Path) -> None:
+    """The round-3-gate-1 bug: finish() discarded load_checked's validity
+    flag and rewrote the WHOLE store from a truncated read, silently
+    erasing every OTHER member's completed record. Fix: on an invalid read,
+    finish() must not touch the main file AT ALL -- it appends to a
+    separate, sender-scoped journal instead."""
+    state_path = tmp_path / "state.json"
+    corrupted_content = "{not valid json"
+    state_path.write_text(corrupted_content)
+    runtime = FirstPersonRuntime(state_path)
+
+    runtime.start("123", member_id="member-b", home_squad_id="home-squad-b")
+    runtime.finish("123", proposal_id="proposal-b")
+
+    # The main file is UNTOUCHED -- byte-identical to before finish() ran.
+    assert state_path.read_text() == corrupted_content
+    # But member-b's own completion is durably recorded via the journal,
+    # sender-scoped (never read or touched member-a's data, which never
+    # existed in this scenario, or anyone else's).
+    assert runtime.held_proposal_id("member-b") == "proposal-b"
+
+
+def test_finish_journal_fallback_never_affects_a_different_members_record(tmp_path: Path) -> None:
+    """End-to-end: member-a completes normally (valid store); the store is
+    THEN corrupted; member-b completes while it's corrupted. member-a's
+    proposal_id read is unaffected by member-b's journal fallback (they are
+    independent, sender-scoped facts)."""
+    state_path = tmp_path / "state.json"
+    runtime = FirstPersonRuntime(state_path)
+
+    runtime.start("chat-a", member_id="member-a", home_squad_id="home-squad-a")
+    runtime.finish("chat-a", proposal_id="proposal-a")
+    assert runtime.held_proposal_id("member-a") == "proposal-a"
+
+    # Simulate external corruption of the main store (e.g. a torn write).
+    state_path.write_text("{not valid json")
+
+    runtime.start("chat-b", member_id="member-b", home_squad_id="home-squad-b")
+    runtime.finish("chat-b", proposal_id="proposal-b")
+
+    assert runtime.held_proposal_id("member-b") == "proposal-b"  # via the journal
+    # member-a's fact is independent of member-b's journal entry -- neither
+    # write touches the other's data path.
+    journal_path = state_path.with_name(state_path.name + ".journal")
+    journal_content = journal_path.read_text()
+    assert "member-a" not in journal_content  # only member-b was journalled
+    assert "member-b" in journal_content
+
+
+@pytest.mark.asyncio
+async def test_double_proposal_prevented_even_when_store_was_corrupted_at_completion_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The actual double-propose scenario this fix prevents: member-b
+    completes while the store is corrupted (journal fallback), then keeps
+    messaging while the server still says 'pending' -- must never submit a
+    second proposal."""
+    state_path = tmp_path / "state.json"
+    runtime = FirstPersonRuntime(state_path)
+    state_path.write_text("{not valid json")
+
+    client = FakeClient({"routine_proposal_submit": {"ok": True, "result": {"proposal_id": "proposal-b"}}})
+    intake = runtime.start("123", member_id="member-b", home_squad_id="home-squad-b")
+    intake = replace(intake, project_id="proj-1")
+    runtime._pending["123"] = intake
+
+    from plugin.first_person import _submit_proposal
+
+    update = Update(message=Message(text="anything"))
+    await _submit_proposal(update.effective_message, "123", intake, client=client, runtime=runtime)
+    assert runtime.held_proposal_id("member-b") == "proposal-b"
+
+    proposal_calls_before = [a for a, _ in client.calls if a == "routine_proposal_submit"]
+    install_status_stub(monkeypatch, lambda *_: pending_status(member_id="member-b", home_squad_id="home-squad-b"))
+    settings = valid_settings()
+    handled = await handle_first_contact(update, settings=settings, client=client, runtime=runtime)
+    assert handled is False
+    proposal_calls_after = [a for a, _ in client.calls if a == "routine_proposal_submit"]
+    assert proposal_calls_after == proposal_calls_before  # no second submission
+
+
+# ---------------------------------------------------------------------------
+# P2 (:1391-1399, :186) / Athena: 'unknown' never abandons a pending intake
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_transient_unknown_status_holds_a_pending_intake_instead_of_abandoning_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    call_count = {"n": 0}
+
+    def resolver(_user_id: Any, _chat_id: Any) -> StatusResolution:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return pending_status()
+        return UNKNOWN_STATUS  # a transient probe failure, NOT a confirmed unbind
+
+    install_status_stub(monkeypatch, resolver)
+    client = FakeClient()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    await handle_first_contact(
+        Update(message=Message(text="hello!")), settings=valid_settings(), client=client, runtime=runtime
+    )
+    assert runtime.get_pending("123") is not None
+
+    transient_update = Update(message=Message(text="Ada Example"))
+    handled = await handle_first_contact(
+        transient_update, settings=valid_settings(), client=client, runtime=runtime
+    )
+
+    assert handled is False  # not consumed THIS turn -- the probe failed
+    assert runtime.get_pending("123") is not None  # but progress is NOT abandoned
+    assert transient_update.effective_message.replies == []
+    assert not any(action == "squad_remember" for action, _ in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_a_confirmed_unbind_still_abandons_a_pending_intake(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Contrast with the transient-unknown test above: a DEFINITIVE
+    confirmation that the sender is not (or no longer) a member must still
+    abandon progress -- only genuine transport noise holds it."""
+    call_count = {"n": 0}
+
+    def resolver(_user_id: Any, _chat_id: Any) -> StatusResolution:
+        call_count["n"] += 1
+        return pending_status() if call_count["n"] == 1 else UNBOUND_STATUS
+
+    install_status_stub(monkeypatch, resolver)
+    client = FakeClient()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    await handle_first_contact(
+        Update(message=Message(text="hello!")), settings=valid_settings(), client=client, runtime=runtime
+    )
+    assert runtime.get_pending("123") is not None
+
+    handled = await handle_first_contact(
+        Update(message=Message(text="Ada Example")), settings=valid_settings(), client=client, runtime=runtime
+    )
+    assert handled is False
+    assert runtime.get_pending("123") is None  # DOES abandon -- confirmed, not transient
+
+
+@pytest.mark.asyncio
+async def test_pending_member_bypasses_the_status_cache_entirely(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Round-3-gate-2 P2 (:186): the 15-minute 'unknown' latch must never
+    apply to a member with local pending progress -- verified here by
+    proving the cache is bypassed (never read, never written) whenever a
+    pending record exists, so a transient failure can never poison the next
+    message's probe."""
+    opener = install_probe(monkeypatch, response=status_response_bytes(home_squad_id="home-squad-1"))
+    cache = _StatusCache()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    settings = valid_settings()
+
+    # The very FIRST message has no local pending record yet -- the cache
+    # legitimately applies here (this is the ordinary "brand-new sender"
+    # path the cache exists to rate-limit).
+    await handle_first_contact(
+        Update(message=Message(text="hello!")), settings=settings, client=FakeClient(), runtime=runtime, status_cache=cache
+    )
+    assert len(cache) == 1
+    assert len(opener.calls) == 1
+
+    # From the SECOND message on, a local pending record exists -- the cache
+    # must be bypassed entirely (never read, never written) for as long as
+    # that's true, so a transient failure can never poison it for 15 minutes.
+    await handle_first_contact(
+        Update(message=Message(text="Ada Example")),
+        settings=settings,
+        client=_client_for_full_intake(),
+        runtime=runtime,
+        status_cache=cache,
+    )
+    assert len(cache) == 1  # unchanged -- this probe never touched the cache
+    assert len(opener.calls) == 2  # a FRESH probe every time, never served from cache
+
+
+# ---------------------------------------------------------------------------
+# P2 (:1455-1458): escape hatch (stop/cancel/later) + approve/reject pass-
+# through, never captured as an answer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("escape_word", sorted(_ESCAPE_WORDS) + ["STOP", "/stop", "Cancel"])
+@pytest.mark.asyncio
+async def test_escape_word_pauses_without_advancing_or_storing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, escape_word: str
+) -> None:
+    client = FakeClient()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    install_status_stub(monkeypatch, lambda *_: pending_status())
+    settings = valid_settings()
+    await handle_first_contact(
+        Update(message=Message(text="hello!")), settings=settings, client=client, runtime=runtime
+    )
+
+    escape_update = Update(message=Message(text=escape_word))
+    handled = await handle_first_contact(escape_update, settings=settings, client=client, runtime=runtime)
+
+    assert handled is True
+    assert escape_update.effective_message.replies == [_PAUSED_REPLY]
+    pending = runtime.get_pending("123")
+    assert pending is not None and pending.index == 0  # untouched
+    assert pending.engrams == {}
+    assert not any(action == "squad_remember" for action, _ in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_escape_then_non_escape_resumes_the_same_still_current_question(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = _client_for_full_intake()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    install_status_stub(monkeypatch, lambda *_: pending_status())
+    settings = valid_settings()
+    await handle_first_contact(
+        Update(message=Message(text="hello!")), settings=settings, client=client, runtime=runtime
+    )
+
+    await handle_first_contact(
+        Update(message=Message(text="stop")), settings=settings, client=client, runtime=runtime
+    )
+    resumed = Update(message=Message(text="Ada Example"))
+    await handle_first_contact(resumed, settings=settings, client=client, runtime=runtime)
+
+    remember_calls = [args for action, args in client.calls if action == "squad_remember"]
+    assert len(remember_calls) == 1
+    assert remember_calls[0]["concepts"] == ["name"]
+    assert remember_calls[0]["text"] == "Ada Example"
+
+
+@pytest.mark.parametrize(
+    "verdict_text",
+    ["approve f9408956", "reject f9408956 not yet", "/approve f9408956", "APPROVE F9408956"],
+)
+@pytest.mark.asyncio
+async def test_plain_text_verdict_mid_intake_falls_through_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, verdict_text: str
+) -> None:
+    """The literal round-3-gate-2 regression: a member mid-intake who sends
+    a genuine approve/reject command must reach the host's own decision
+    path -- never captured as an intake answer, never replied to from here."""
+    client = FakeClient()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    install_status_stub(monkeypatch, lambda *_: pending_status())
+    settings = valid_settings()
+    await handle_first_contact(
+        Update(message=Message(text="hello!")), settings=settings, client=client, runtime=runtime
+    )
+
+    verdict_update = Update(message=Message(text=verdict_text))
+    handled = await handle_first_contact(verdict_update, settings=settings, client=client, runtime=runtime)
+
+    assert handled is False  # host owns this turn
+    assert verdict_update.effective_message.replies == []
+    pending = runtime.get_pending("123")
+    assert pending is not None and pending.index == 0  # untouched
+    assert not any(action == "squad_remember" for action, _ in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_plain_text_verdict_during_proposal_retry_wait_also_falls_through(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Same fall-through guarantee, mid-retry-wait (index >= len(questions))
+    rather than mid-answer -- a member whose OWN proposal submission is
+    retrying must still reach the host's approve/reject path untouched."""
+
+    class _AlwaysFailsClient(FakeClient):
+        def call(self, action: str, args: dict[str, Any]) -> Any:
+            self.calls.append((action, dict(args)))
+            if action == "squad_remember":
+                return {"ok": True, "result": {"engram_id": f"engram-{len(self.calls)}"}}
+            if action == "routine_proposal_submit":
+                return {"ok": False, "error": "schema_validation_failed"}
+            return {"ok": False, "error": "action_not_allowed"}
+
+    client = _AlwaysFailsClient()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    install_status_stub(monkeypatch, lambda *_: pending_status())
+    monkeypatch.setattr("plugin.first_person._resolve_member_project", _default_project_resolver)
+    settings = valid_settings()
+
+    answers = ["Ada Example", "Engineer", "psychonom", "Ship it", "Nothing else"]
+    update = Update(message=Message(text="hello!"))
+    await handle_first_contact(update, settings=settings, client=client, runtime=runtime)
+    for answer in answers:
+        update = Update(message=Message(text=answer))
+        await handle_first_contact(update, settings=settings, client=client, runtime=runtime)
+    proposal_calls_before = len([a for a, _ in client.calls if a == "routine_proposal_submit"])
+
+    verdict_update = Update(message=Message(text="approve f9408956"))
+    handled = await handle_first_contact(verdict_update, settings=settings, client=client, runtime=runtime)
+    assert handled is False
+    assert verdict_update.effective_message.replies == []
+    proposal_calls_after = len([a for a, _ in client.calls if a == "routine_proposal_submit"])
+    assert proposal_calls_after == proposal_calls_before  # not treated as a retry trigger either
+
+
+def test_is_verdict_shaped_matches_the_servers_own_command_shape() -> None:
+    assert is_verdict_shaped("approve f9408956") is True
+    assert is_verdict_shaped("reject f9408956 not yet") is True
+    assert is_verdict_shaped("/approve f9408956") is True
+    assert is_verdict_shaped("APPROVE F9408956") is True
+    assert is_verdict_shaped("I approve of this plan") is False  # not the anchored shape
+    assert is_verdict_shaped("Ada Example") is False
+
+
+# ---------------------------------------------------------------------------
+# P3: whitespace home_squad_id treated as absent at the handle_first_contact
+# use site too (belt-and-suspenders alongside resolve_member_status's own
+# parse-time rejection)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_home_squad_id_is_treated_as_absent_at_the_use_site(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Belt-and-suspenders: even if a StatusResolution somehow carried a
+    whitespace-only home_squad_id (bypassing resolve_member_status's own
+    parse-time rejection -- e.g. constructed directly, as install_status_stub
+    does), handle_first_contact's own use site must not treat it as present."""
+    whitespace_status = StatusResolution(
+        bound=True, member_id="member-1", home_squad_id="   ", intake_state="pending"
+    )
+    install_status_stub(monkeypatch, lambda *_: whitespace_status)
+    client = FakeClient()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    update = Update(message=Message(text="hello!"))
+
+    handled = await handle_first_contact(update, settings=valid_settings(), client=client, runtime=runtime)
+
+    assert handled is False
+    assert update.effective_message.replies == [_HOME_NOT_READY_REPLY]
+    assert runtime.get_pending("123") is None
+
+
+# ---------------------------------------------------------------------------
+# Athena's addition: post-hoc scrub -- quarantine (never delete) an
+# already-stored answer that matches the approve/reject shape
+# ---------------------------------------------------------------------------
+
+
+def test_scrub_quarantine_candidates_finds_only_verdict_shaped_recalled_answers() -> None:
+    recalled = {
+        "name": "Ada Example",
+        "first_ask": "approve f9408956",
+        "notes": "reject f9408956 too soon",
+    }
+    candidates = scrub_quarantine_candidates(recalled)
+    assert set(candidates) == {"first_ask", "notes"}
+    assert candidates["first_ask"] == "approve f9408956"
+
+
+def test_mark_quarantined_flags_without_deleting_the_engram(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    runtime = FirstPersonRuntime(state_path)
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    runtime.record_answer("123", "name", "engram-1")
+    runtime.finish("123", proposal_id="proposal-1")
+
+    assert runtime.is_quarantined("member-1", "name") is False
+    marked = runtime.mark_quarantined("member-1", "name")
+    assert marked is True
+    assert runtime.is_quarantined("member-1", "name") is True
+
+    data = json.loads(state_path.read_text())
+    # Never deleted -- the engram_id is still right there.
+    assert data["completed"]["member-1"]["engram_ids"]["name"] == "engram-1"
+    assert data["completed"]["member-1"]["quarantined"] == ["name"]
+
+
+def test_mark_quarantined_refuses_on_an_invalid_store_never_rewrites_it(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    corrupted = "{not valid json"
+    state_path.write_text(corrupted)
+    runtime = FirstPersonRuntime(state_path)
+
+    marked = runtime.mark_quarantined("member-1", "name")
+
+    assert marked is False
+    assert state_path.read_text() == corrupted  # untouched, same validity-gated discipline as finish()
+
+
+def test_mark_quarantined_is_false_for_an_unknown_member(tmp_path: Path) -> None:
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    assert runtime.mark_quarantined("member-1", "name") is False
+    assert runtime.is_quarantined("member-1", "name") is False

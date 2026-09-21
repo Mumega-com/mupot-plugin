@@ -10,7 +10,7 @@ description: >
   registered tool for any capability-granting surface. Load this skill only to
   understand, document, or extend the flow -- it is reference material, not a
   script an LLM turn executes live.
-version: "0.4.0"
+version: "0.5.0"
 tools: []
 disallowed_tools:
   - project_squad_set
@@ -156,7 +156,52 @@ reporting `pending` -- not just within the local completion-cache's 3600s
 freshness window (that window governs a separate, softer question: how long a
 FRESH completion is trusted without even checking the held-proposal case
 first; see `FirstPersonRuntime.is_complete_or_unknown` vs. `held_proposal_id`
-in `first_person.py`).
+in `first_person.py`). **Round-3-gate-2 revision:** the lag guard no longer
+consumes the update (it `return`s `False` -- the host still gets its turn
+every message, e.g. a genuine `approve <id>` from the same member); only the
+WARNING (1h window) and the reassurance reply (24h window) are rate-limited,
+each on its own cadence, never per-message.
+
+## Resilience (round 3, gate 2)
+
+- **Idle timeout, not session-length timeout.** The 600s pending-record TTL
+  is measured from the LAST accepted answer, not from when the intake
+  started -- a member answering thoughtfully every few minutes never trips
+  it no matter how long the whole conversation takes. A separate, hard 24h
+  cap (measured from the start) bounds total session length regardless of
+  activity.
+- **Resume, never re-ask.** If a local record is ever dropped (idle timeout,
+  a process restart), the very next message resumes at the first
+  UNANSWERED question -- already-answered ones are never re-asked and their
+  engrams are never re-written or re-labelled. The resumed engram map is a
+  durable, write-through record of `{question_id: engram_id}` only (never
+  raw text), cleared the moment the intake actually completes.
+- **A confirmed non-member abandons progress; a transient probe failure does
+  not.** `intake_state` distinguishes "mupot confirmed you are not bound"
+  (`bound: false`) from "the status response itself was malformed, absent,
+  or timed out" (`"unknown"`) -- only the former drops a genuinely
+  in-progress local record. A member with local progress also bypasses the
+  status cache entirely, so a transient failure is re-probed live on the
+  very next message instead of being latched for 15 minutes.
+- **Escape hatch.** Sending `stop`, `cancel`, or `later` (case-insensitive,
+  optional leading `/`) pauses the intake -- nothing is captured as an
+  answer, engrams/progress are untouched, and the next non-escape message
+  resumes the SAME still-current question.
+- **Plain-text approve/reject always falls through.** A message matching
+  mupot's own `approve <id>`/`reject <id>` command shape is NEVER captured
+  as an intake answer, mid-question or mid-retry-wait -- the host's own
+  decision path (#1425) gets it untouched, every time.
+- **No home yet is not silence.** A bound, pending member whose
+  `home_squad_id` is still null gets a reassurance reply ("Opening your
+  space...") at most once per hour -- never a fabricated home, never a
+  question asked without one.
+- **Post-hoc scrub (quarantine, never delete).** `is_verdict_shaped` and
+  `scrub_quarantine_candidates` let an operator audit ALREADY-stored
+  answers (recalled separately, e.g. via `squad_recall` -- this module
+  never holds raw text itself) for the approve/reject shape and flag any
+  match via `FirstPersonRuntime.mark_quarantined`. The engram itself is
+  never deleted; only a `quarantined` flag is added to the local completion
+  record.
 
 ## Mupot-side contract this build depends on
 
@@ -204,6 +249,17 @@ Slice 2 chain PR lands these contracts.**
   `_build_resolve_project_request`, precisely so that verification is a
   one-function edit. Multiple candidates with no exact slug match are
   treated as ambiguous and refused (never guessed).
+
+  **Frozen contract (Athena's round-1 verdict on PR#19, do not change alone):**
+  ```json
+  {"update_id": 0, "message": {"from": {"id": 0}, "chat": {"id": 0, "type": "private"}, "text": ""}, "query": ""}
+  ```
+  `update_id`/`message.from.id`/`message.chat.id` are copied verbatim from
+  the CURRENT turn's own `sanitized_first_contact_envelope()` output;
+  `message.chat.type` is always the literal string `"private"`;
+  `message.text` is always the literal empty string; `query` carries the
+  human-typed project reference. Any change to this exact shape is a
+  cross-repo contract change, not a plugin-only edit.
 - **`routine_proposal_submit`**'s live schema (`version: "routine.proposal/v1"`,
   `action.kind` one of `create_task | dispatch_flight | request_review |
   ask_human | no_action`) has **no project-access kind**. This skill submits
@@ -241,7 +297,7 @@ skills:
 ```
 
 **G-FP3 assertion** (what to actually check on the live gateway, not what to
-assume): `hermes plugins show mupot` reports version `0.7.0` (bumped in this
+assume): `hermes plugins show mupot` reports version `0.8.0` (bumped in this
 PR) at the installed git rev, and `hermes skills list` shows `mupot:first-person`
 present. SKILL.md's own `version:` frontmatter field is documentation only --
 nothing in Hermes parses it; the plugin-level version + git rev is the only

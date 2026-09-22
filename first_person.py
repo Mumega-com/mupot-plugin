@@ -108,6 +108,28 @@ gate-checked) are pinned inline at each fix site; summarized here:
   told the fixed line "Your request is awaiting the humans." See
   :class:`FirstPersonRuntime`'s ``held_proposal_id`` and
   :func:`handle_first_contact`.
+
+=== mupot-plugin#28 round-2 gate (adversarial round 1 on PR#28 @ d8e4c4d, AMBER) ===
+
+F6 (P3, documentation only): the worst-case NETWORK cost of the paired
+local/server proposal guard (mupot-plugin#24 N1, :func:`_server_confirms_
+existing_proposal`) is bounded, and worth stating plainly rather than
+leaving implicit. Per DUE retry attempt (i.e. per call into
+:func:`_submit_proposal` that actually proceeds past ``try_begin_submit`` --
+never per message; a member checking in during backoff gets the plain
+wait/stalled reply with ZERO wire calls, see :func:`_retry_proposal_if_due`),
+there are at most TWO wire calls: (1) the server-derived probe inside
+``_server_confirms_existing_proposal`` (skipped entirely if
+``FirstPersonRuntime.last_server_reading`` already has a fresh, in-episode
+hit -- see mupot-plugin#28 round-2 F1/F3), and (2) the actual
+``routine_proposal_submit`` call, ONLY if (1) did not already resolve the
+episode as server-side complete. This pair repeats at most once per
+backoff step (5s / 15s / 60s / 300s, :data:`_PROPOSAL_RETRY_BACKOFF_SECONDS`),
+so the steady-state aggregate cost for one stalled member is bounded by
+that schedule -- and once a member's local record is itself abandoned or
+suspended by :func:`_reconcile_pending_with_server` (a confirmed non-
+pending/mismatch reading), this path stops running for them entirely: no
+retry loop survives its own record's abandonment.
 """
 
 from __future__ import annotations
@@ -256,6 +278,18 @@ _SENDER_PROBE_MIN_INTERVAL_SECONDS = _STATUS_POSITIVE_TTL_SECONDS
 # long, so confirmation must wait at least that long regardless of what any
 # limiter's interval happens to be configured to).
 _FLAP_TOLERANCE_SECONDS = _STATUS_NEGATIVE_TTL_SECONDS
+
+# mupot-plugin#28 round-2 F1 (P1): how long `FirstPersonRuntime.
+# last_server_reading`'s cache entry is trusted at all, independent of
+# which episode it was recorded for (see the `not_before` parameter on
+# that method for the OTHER half of the fix -- episode scoping). This
+# cache exists purely to skip a redundant probe moments apart from
+# reconcile's own; it must never stand in for a live probe indefinitely.
+# <= _STATUS_POSITIVE_TTL_SECONDS on purpose -- a 'pending' reading is
+# itself only ever trusted fresh for that long elsewhere in this module,
+# so a 'complete' reading (the ONLY kind this cache is ever consulted
+# for) gets no more slack.
+_LAST_SERVER_READING_TTL_SECONDS = _STATUS_POSITIVE_TTL_SECONDS
 
 # Round-3-gate-3 P1 / Athena's ruling (2): the shared cache's TTL selection
 # now splits on whether the server actually ANSWERED. A CONFIRMED result
@@ -1390,12 +1424,20 @@ class FirstPersonRuntime:
         # See try_begin_submit/end_submit.
         self._submitting: set[str] = set()
         # mupot-plugin#24 N1: the LAST server-derived StatusResolution seen
-        # for a member_id -- populated by _reconcile_pending_with_server
-        # after every genuinely server-answered probe, and consulted by
+        # for a member_id, paired with the monotonic timestamp it was
+        # recorded at -- populated by _reconcile_pending_with_server and
+        # _server_confirms_existing_proposal's own live probe after every
+        # genuinely server-answered probe, and consulted by
         # _submit_proposal's own server-derived guard before ever
         # submitting a second proposal. Bounded LRU, same discipline as
         # _terminal_sightings/_StatusCache above.
-        self._last_server_reading: "OrderedDict[str, StatusResolution]" = OrderedDict()
+        #
+        # mupot-plugin#28 round-2 F1: the timestamp is NOT optional -- see
+        # note_server_reading/last_server_reading below for why an
+        # untimed, un-scoped-to-episode cache entry let a reading from a
+        # PRIOR, already-abandoned episode masquerade as evidence for a
+        # brand-new one.
+        self._last_server_reading: "OrderedDict[str, tuple[float, StatusResolution]]" = OrderedDict()
 
     def _put_pending(self, chat_key: str, intake: Intake) -> None:
         """Caller must hold ``self._lock``. Bounded-LRU insert/update,
@@ -1464,27 +1506,74 @@ class FirstPersonRuntime:
 
     def note_server_reading(self, member_id: str, status: "StatusResolution") -> None:
         """mupot-plugin#24 N1: record the last server-derived
-        :class:`StatusResolution` seen for ``member_id`` -- the ONLY
-        source :func:`_submit_proposal`'s server-derived guard has for "did
+        :class:`StatusResolution` seen for ``member_id``, stamped with
+        THIS instant (:attr:`_clock`) -- the ONLY source
+        :func:`_submit_proposal`'s server-derived guard has for "did
         mupot answer something definite about this member recently" short
         of a fresh probe of its own. Never records an ``"unknown"``
         reading (a transport failure or denial is not information ABOUT
         the member -- see :func:`_reconcile_pending_with_server`, the
         primary caller); bounded LRU, same discipline as
-        ``_terminal_sightings``/``_StatusCache`` above."""
+        ``_terminal_sightings``/``_StatusCache`` above.
+
+        mupot-plugin#28 round-2 F1: the timestamp is what
+        :meth:`last_server_reading` uses to bound how long this entry is
+        trusted AND to scope it to the episode it was actually recorded
+        for -- see there."""
         with self._lock:
-            self._last_server_reading[member_id] = status
+            self._last_server_reading[member_id] = (self._clock(), status)
             self._last_server_reading.move_to_end(member_id)
             while len(self._last_server_reading) > 2048:
                 self._last_server_reading.popitem(last=False)
 
-    def last_server_reading(self, member_id: str) -> "StatusResolution | None":
+    def last_server_reading(self, member_id: str, *, not_before: float = float("-inf")) -> "StatusResolution | None":
         """Read-only lookup of the cache :meth:`note_server_reading`
         writes -- ``None`` iff nothing has been recorded for this member
         yet (a brand-new member, or one this process has never
-        reconciled)."""
+        reconciled), OR the recorded entry is not trustworthy for the
+        CALLER's own purposes right now.
+
+        mupot-plugin#28 round-2 F1 (P1): a raw, untimed, un-scoped cache
+        hit let a reading from a PRIOR, already-abandoned episode
+        masquerade as evidence for a brand-new one -- executed: episode 1
+        completes server-side (an operator-completed proposal this
+        module never itself recorded) while a stale local record is
+        mid-conversation; reconcile confirms and abandons it, but the
+        cached reading survived untouched; the server later reverts to
+        'pending' (a genuine re-intake); a FRESH local episode with 5 new
+        engrams reached `_submit_proposal` with nothing locally held, and
+        the stale cached 'complete' reading short-circuited its submit --
+        zero submits, a false "sent your access request" reply, and a
+        completion marker written naming the OLD episode's proposal_id
+        alongside the NEW episode's engrams, permanently blocking any
+        future re-intake for this member (see `held_proposal_id`, which
+        ignores the completion-cache TTL entirely by design).
+
+        Two independent conditions must BOTH hold for a cached entry to
+        be returned at all:
+        (a) fresh -- recorded within :data:`_LAST_SERVER_READING_TTL_SECONDS`
+            of now. This alone catches a reading that has simply gone
+            stale sitting in the cache, however it got there.
+        (b) not older than ``not_before`` -- the caller's own current
+            episode's ``created_at`` (monotonic-clock-based, the SAME
+            clock domain this cache's own timestamp uses). This alone
+            catches a reading that is STILL technically fresh by the raw
+            TTL but was recorded for a DIFFERENT, already-finished
+            episode -- e.g. abandon() firing (see there) and a brand-new
+            episode starting again within the same short TTL window.
+        Either condition failing means "not evidence for THIS episode" --
+        the caller must fall back to a live probe of its own, never treat
+        a rejected entry as if nothing had ever been recorded at all."""
         with self._lock:
-            return self._last_server_reading.get(member_id)
+            entry = self._last_server_reading.get(member_id)
+        if entry is None:
+            return None
+        seen_at, status = entry
+        if (self._clock() - seen_at) > _LAST_SERVER_READING_TTL_SECONDS:
+            return None
+        if seen_at < not_before:
+            return None
+        return status
 
     def is_complete_or_unknown(self, member_id: str) -> bool:
         """Round-2 P1-4 + Athena's round-2 condition (ii): fail CLOSED on an
@@ -2084,14 +2173,42 @@ class FirstPersonRuntime:
         cleared. This method does NOT swallow that ``OSError`` itself --
         its one caller, :func:`_reconcile_pending_with_server`, wraps this
         call in the same ``try``/``except`` guarding its own probe, so it
-        still can never reach the host handler; see there."""
+        still can never reach the host handler; see there.
+
+        mupot-plugin#28 round-2 F5: releasing the lock between the initial
+        read above and the final pop below (needed so the durable clear's
+        disk I/O never happens WHILE holding the lock -- see N6 above)
+        opens its own window: a genuinely concurrent ``resume()`` +
+        ``record_answer()`` (a real flap back to 'pending', landing in
+        that exact gap) replaces ``self._pending[chat_key]`` with a NEWER
+        record -- real new engrams, already re-saved to disk by that call
+        -- which this method would otherwise pop UNCONDITIONALLY: memory
+        gone, the durable in-progress row it just wrote very much still
+        present. Fixed by re-validating identity before popping: ``Intake``
+        is frozen, so any genuine update replaces it with a new object via
+        :func:`dataclasses.replace`, never mutates the one already read.
+        If the record changed underneath, THIS call's notion of "abandon
+        this" is stale relative to reality -- the newer record (and
+        whatever it already durably wrote) is left alone entirely.
+
+        mupot-plugin#28 round-2 F1: also clears any cached server reading
+        for this member (:meth:`note_server_reading`) -- a reading that
+        justified (or was merely concurrent with) abandoning THIS episode
+        must never be trusted as evidence for whatever episode comes
+        next; see :meth:`last_server_reading`'s own ``not_before``/TTL
+        guards for the belt-and-suspenders backstop when this clear
+        itself is skipped (the identity check above left a NEWER record
+        in place -- that newer record's own ``created_at`` still
+        post-dates this reading regardless)."""
         with self._lock:
             intake = self._pending.get(chat_key)
         if intake is None:
             return
         self._clear_in_progress(intake.member_id)
         with self._lock:
-            self._pending.pop(chat_key, None)
+            if self._pending.get(chat_key) is intake:
+                del self._pending[chat_key]
+            self._last_server_reading.pop(intake.member_id, None)
 
     def _clear_in_progress(self, member_id: str) -> None:
         """Sender-scoped, validity-gated (same discipline as
@@ -2624,20 +2741,28 @@ async def _server_confirms_existing_proposal(
     Consults the last server-derived reading for this member
     (:meth:`FirstPersonRuntime.last_server_reading`, populated by
     :func:`_reconcile_pending_with_server`) first; if that reading is not
-    already a confirmed 'complete' for this exact member, falls back to
-    ONE bounded live probe run HERE, on the submit path only -- never the
-    message path (see the ROOT SHAPE docstrings on `_handle_pending_message`/
-    `handle_first_contact`: this probe never gates whether a message is
-    consumed, only what happens to the OUTBOUND write once already
-    consumed). Deliberately passes ``sender_limiter=None`` -- this probe
-    must NEVER be subject to the sender limiter's "denied -> unknown" hold;
-    a denial there would silently reproduce the exact gap this closes
-    (reconcile's own probe already having run within the limiter's window,
-    denying this one too, right when the operator-completed-server-side
-    race is live). Returns ``None`` on any probe failure/exception/unknown
-    result -- exactly like every other probe failure in this module, never
-    fabricates a reading."""
-    cached = runtime.last_server_reading(intake.member_id)
+    already a confirmed 'complete' for this exact member -- or is missing,
+    stale, or scoped to a PRIOR episode (see the ``not_before`` argument
+    below, and :meth:`FirstPersonRuntime.last_server_reading`'s own
+    docstring for the exact scenario that closes, mupot-plugin#28 round-2
+    F1) -- falls back to ONE bounded live probe run HERE, on the submit
+    path only -- never the message path (see the ROOT SHAPE docstrings on
+    `_handle_pending_message`/`handle_first_contact`: this probe never
+    gates whether a message is consumed, only what happens to the
+    OUTBOUND write once already consumed). Deliberately passes
+    ``sender_limiter=None`` -- this probe must NEVER be subject to the
+    sender limiter's "denied -> unknown" hold; a denial there would
+    silently reproduce the exact gap this closes (reconcile's own probe
+    already having run within the limiter's window, denying this one too,
+    right when the operator-completed-server-side race is live). Returns
+    ``None`` on any probe failure/exception/unknown result -- exactly
+    like every other probe failure in this module, never fabricates a
+    reading."""
+    # mupot-plugin#28 round-2 F1: `not_before=intake.created_at` scopes the
+    # cache hit to THIS episode -- a reading recorded for an earlier,
+    # already-abandoned episode of the SAME member must never be reused
+    # here no matter how fresh it still looks by the raw TTL alone.
+    cached = runtime.last_server_reading(intake.member_id, not_before=intake.created_at)
     if cached is not None and cached.member_id == intake.member_id and cached.intake_state == "complete":
         return cached
     if settings is None:
@@ -3320,6 +3445,14 @@ async def handle_first_contact(
         )
 
     status = await asyncio.to_thread(resolve)
+    # mupot-plugin#28 round-2 F1: this probe result is itself a genuine
+    # server-answered reading -- seed FirstPersonRuntime's server-reading
+    # cache from it too, same as _reconcile_pending_with_server does, so a
+    # `_submit_proposal` call for a record that resumes without ANY
+    # reconcile round ever having run yet still has a recent reading to
+    # consult before falling back to its own live probe.
+    if status.member_id is not None:
+        runtime.note_server_reading(status.member_id, status)
 
     if not status.is_pending:
         # Unbound, unknown (probe failed/absent/malformed), or a

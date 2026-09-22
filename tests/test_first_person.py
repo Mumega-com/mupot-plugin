@@ -4882,3 +4882,439 @@ def test_register_first_person_threads_the_injected_clock_into_status_cache_and_
 
     assert captured["status_cache_clock"] is fake_clock
     assert captured["sender_limiter_clock"] is fake_clock
+
+
+# ---------------------------------------------------------------------------
+# mupot-plugin#28 round-2 gate (adversarial round 1 on PR#28 @ d8e4c4d, AMBER).
+#
+# F1 (P1) names the FOURTH instance of the SAME defect class already named
+# twice above (mupot-plugin#21/#22: "a cached/pended value must never outlive
+# the truth it cached") and once more in mupot-plugin#25 N2's flap-tolerance
+# fix: `FirstPersonRuntime.last_server_reading` had no timestamp/TTL, no
+# episode scoping, and `abandon()` never cleared it -- a reading from a DEAD
+# episode (an operator-completed intake this module never itself recorded,
+# later abandoned by reconcile) could short-circuit a brand-new episode's own
+# submit, writing a completion marker that named the OLD proposal_id
+# alongside the NEW episode's own engrams and permanently blocking re-intake.
+# F2/F3 pin two already-shipped guards (member_id equality, the cached-branch
+# skip) that mupot-plugin#24's own round had left unpinned. F4 pins the
+# proposal_id-only-trusted-when-complete parse rule. F5 fixes a SEPARATE race
+# `abandon()`'s own disk-first reorder (mupot-plugin#25 N6) introduced: a
+# concurrent resume()+record_answer() landing between the disk clear and the
+# final in-memory pop must never be silently dropped from memory while its
+# own freshly-resaved durable row survives -- and, per Athena's binding
+# round-2 condition, the disk record (never memory) is the ultimate source of
+# truth: the NEXT message must resume correctly from disk even if some
+# process's in-memory view were to lose the thread entirely.
+# ---------------------------------------------------------------------------
+
+
+def test_last_server_reading_is_bounded_by_a_ttl(tmp_path: Path) -> None:
+    """F1 (P1, #28 round-2): a server reading recorded for THIS SAME
+    episode (never a cross-episode concern -- see the `not_before` test
+    below, which this one deliberately keeps satisfied throughout) must
+    still expire once `_LAST_SERVER_READING_TTL_SECONDS` has elapsed --
+    the cache exists to skip a probe moments apart from reconcile's own,
+    never to stand in for a live probe indefinitely. Mutation-provable:
+    removing the TTL comparison in `last_server_reading` makes the final
+    assertion go red (the stale reading would still be returned)."""
+    fake_clock = {"now": 0.0}
+    runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
+    created_at = runtime.start("123", member_id="member-1", home_squad_id="home-squad-1").created_at
+
+    fake_clock["now"] = 1.0
+    runtime.note_server_reading(
+        "member-1",
+        StatusResolution(
+            bound=True, member_id="member-1", home_squad_id="home-squad-1",
+            intake_state="complete", proposal_id="STALE-PROP",
+        ),
+    )
+    # Fresh -- returned, and satisfies not_before throughout (recorded
+    # AFTER created_at every time this is checked below).
+    assert runtime.last_server_reading("member-1", not_before=created_at) is not None
+
+    fake_clock["now"] = 1.0 + first_person._LAST_SERVER_READING_TTL_SECONDS + 1.0
+    assert runtime.last_server_reading("member-1", not_before=created_at) is None
+
+
+def test_last_server_reading_rejects_a_reading_from_before_the_current_episode(tmp_path: Path) -> None:
+    """F1 (P1, #28 round-2): a reading recorded for a PRIOR episode must
+    never be trusted for a brand-new one, even when it is still well
+    within its own raw TTL. Mutation-provable: dropping the `not_before`
+    (created_at) comparison in `last_server_reading` makes the final
+    assertion go red (the still-fresh-by-TTL reading would be returned)."""
+    fake_clock = {"now": 0.0}
+    runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
+
+    runtime.note_server_reading(
+        "member-1",
+        StatusResolution(
+            bound=True, member_id="member-1", home_squad_id="home-squad-1",
+            intake_state="complete", proposal_id="OLD-PROP",
+        ),
+    )
+
+    # A brand-new episode starts a moment later -- well within the
+    # reading's own TTL -- but the reading predates it.
+    fake_clock["now"] = 1.0
+    new_created_at = runtime.start("123", member_id="member-1", home_squad_id="home-squad-1").created_at
+
+    assert runtime.last_server_reading("member-1", not_before=new_created_at) is None
+
+
+def test_abandon_clears_the_cached_server_reading_for_that_member(tmp_path: Path) -> None:
+    """F1 (P1, #28 round-2): `abandon()` must clear any cached server
+    reading for the member it just abandoned -- the reading that
+    justified (or was merely concurrent with) ending THIS episode must
+    never survive to be consulted for whatever episode comes next.
+    Mutation-provable: removing the `_last_server_reading.pop(...)` call
+    from `abandon()` makes the final assertion go red."""
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    runtime.note_server_reading(
+        "member-1",
+        StatusResolution(bound=True, member_id="member-1", home_squad_id="home-squad-1", intake_state="complete"),
+    )
+    assert runtime.last_server_reading("member-1") is not None
+
+    runtime.abandon("123")
+
+    assert runtime.last_server_reading("member-1") is None
+
+
+@pytest.mark.asyncio
+async def test_stale_same_episode_server_reading_expires_and_the_real_submit_fires(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Athena's binding round-2 condition (named test for the zero-submit
+    scenario) + F1: a 'complete'/OLD-PROP server reading cached mid-
+    conversation (a transient glitch reconcile happened to observe once,
+    long since reverted back to genuinely 'pending') must never survive
+    to short-circuit THIS SAME episode's own eventual, real submit once
+    enough real time has passed. All five questions are answered
+    normally; `_submit_proposal` must live-probe (truth: still pending)
+    and fire a REAL submission, recording the ACTUAL new proposal_id --
+    never reusing OLD-PROP. Mutation-provable: removing the TTL check in
+    `last_server_reading` makes this go red -- zero submits, and
+    `held_proposal_id` would come back `OLD-PROP` instead of the real
+    `proposal-1`."""
+    from plugin.first_person import _submit_proposal
+
+    fake_clock = {"now": 0.0}
+    runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+
+    # A stale 'complete'/OLD-PROP reading gets cached early in the SAME
+    # episode's own conversation -- e.g. a transient server glitch
+    # reconcile happened to observe once.
+    runtime.note_server_reading(
+        "member-1",
+        StatusResolution(
+            bound=True, member_id="member-1", home_squad_id="home-squad-1",
+            intake_state="complete", proposal_id="OLD-PROP",
+        ),
+    )
+
+    # A long time passes -- well past the cache's own TTL -- while the
+    # SAME local episode continues (never abandoned, never restarted).
+    fake_clock["now"] += first_person._LAST_SERVER_READING_TTL_SECONDS + 1.0
+
+    runtime.set_project_id("123", "proj-1")
+    intake = None
+    for question_id, _ in FIRST_PERSON_QUESTIONS:
+        intake = runtime.record_answer("123", question_id, f"engram-{question_id}")
+    assert intake is not None and intake.index == len(FIRST_PERSON_QUESTIONS)
+
+    client = _client_for_full_intake()
+    settings = valid_settings()
+    install_status_stub(monkeypatch, lambda *_: pending_status())  # live-probe truth: still pending
+
+    update = Update(message=Message(text="Nothing else"))
+    await _submit_proposal(
+        update.effective_message,
+        "123",
+        intake,
+        client=client,
+        runtime=runtime,
+        settings=settings,
+        secret_owner=None,
+        probe_limiter=None,
+    )
+
+    submit_calls = [action for action, _ in client.calls if action == "routine_proposal_submit"]
+    assert len(submit_calls) == 1  # the REAL submit fired
+    assert update.effective_message.replies[-1] == first_person._COMPLETE_REPLY
+    assert runtime.held_proposal_id("member-1") == "proposal-1"  # the NEW id, never OLD-PROP
+
+
+@pytest.mark.asyncio
+async def test_operator_completed_episode_abandoned_then_a_fresh_intake_can_resubmit_with_a_new_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The full cross-episode narrative F1 closes, end to end: episode 1
+    is a stale LOCAL pending record for member-1 that reconcile confirms
+    (via two separated readings) is actually 'complete' server-side (an
+    operator-completed proposal 'OLD-PROP' this module never itself
+    recorded) and abandons. The server later reverts to 'pending' (a
+    genuine re-intake); a FRESH local episode answers all 5 questions
+    again. The member MUST be able to re-intake, the submit MUST fire,
+    and the completion marker MUST carry the NEW proposal_id -- never
+    OLD-PROP, and never a false zero-submit 'sent your access request'
+    reply for work that was never actually (re-)submitted."""
+    from plugin.first_person import _reconcile_pending_with_server
+
+    fake_clock = {"now": 0.0}
+    runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
+    settings = valid_settings()
+
+    # Episode 1: a stale local pending record; reconcile confirms the
+    # server's own 'complete' (operator-completed, OLD-PROP) reading via
+    # two separated readings and abandons it.
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    pending_ep1 = runtime.get_pending("123")
+
+    def resolver_ep1_complete(_uid: Any, _cid: Any) -> StatusResolution:
+        return StatusResolution(
+            bound=True, member_id="member-1", home_squad_id="home-squad-1",
+            intake_state="complete", proposal_id="OLD-PROP",
+        )
+
+    install_status_stub(monkeypatch, resolver_ep1_complete)
+    await _reconcile_pending_with_server(
+        "123", 123, 123, pending_ep1,
+        settings=settings, secret_owner=None, runtime=runtime,
+        status_cache=None, probe_limiter=None, sender_probe_limiter=None,
+    )
+    assert runtime.get_pending("123") is not None  # first sighting -- suspended, unconfirmed
+
+    fake_clock["now"] += first_person._FLAP_TOLERANCE_SECONDS
+    await _reconcile_pending_with_server(
+        "123", 123, 123, runtime.get_pending("123"),
+        settings=settings, secret_owner=None, runtime=runtime,
+        status_cache=None, probe_limiter=None, sender_probe_limiter=None,
+    )
+    assert runtime.get_pending("123") is None  # confirmed and abandoned
+    assert runtime.held_proposal_id("member-1") is None  # never recorded via finish() -- operator-side only
+    assert runtime.last_server_reading("member-1") is None  # abandon() cleared it too (F1)
+
+    # The server reverts to 'pending' -- a genuine re-intake.
+    fake_clock["now"] += 5.0
+    client = _client_for_full_intake()
+    mode = {"phase": "pending"}
+
+    def resolver(_uid: Any, _cid: Any) -> StatusResolution:
+        if mode["phase"] == "pending":
+            return pending_status(member_id="member-1", home_squad_id="home-squad-1")
+        return resolver_ep1_complete(_uid, _cid)
+
+    install_status_stub(monkeypatch, resolver)
+    monkeypatch.setattr("plugin.first_person._resolve_member_project", _default_project_resolver)
+
+    await handle_first_contact(Update(message=Message(text="hello again!")), settings=settings, client=client, runtime=runtime)
+    started = runtime.get_pending("123")
+    assert started is not None and started.created_at > pending_ep1.created_at  # a genuinely NEW episode
+
+    for answer in ["Ada Example", "Engineer", "psychonom", "Ship it"]:
+        await handle_first_contact(Update(message=Message(text=answer)), settings=settings, client=client, runtime=runtime)
+
+    last_update = Update(message=Message(text="Nothing else"))
+    await handle_first_contact(last_update, settings=settings, client=client, runtime=runtime)
+
+    submit_calls = [action for action, _ in client.calls if action == "routine_proposal_submit"]
+    assert len(submit_calls) == 1  # the fresh episode's OWN real submit fired
+    assert last_update.effective_message.replies[-1] == first_person._COMPLETE_REPLY
+    assert runtime.held_proposal_id("member-1") == "proposal-1"  # the NEW id, never OLD-PROP
+
+
+@pytest.mark.asyncio
+async def test_server_reading_member_id_mismatch_never_suppresses_a_submit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F2 (P2, #28 round-2): the `server_reading.member_id == intake.member_id`
+    equality in `_submit_proposal` is the ONLY guard against a DIFFERENT
+    member's 'complete' reading suppressing THIS member's submit -- had no
+    dedicated test. A probe that resolves to 'complete' for member-OTHER
+    (a plausible shape: the sender's identity resolved differently between
+    this call and the cached/probed one, or a wildly stale/misrouted
+    reading) must never block member-1's own, perfectly legitimate submit.
+    Mutation-provable: removing the member_id equality check makes
+    `submit_calls` empty (falsely short-circuited) instead of firing."""
+    from plugin.first_person import _submit_proposal
+
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    intake = None
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    runtime.set_project_id("123", "proj-1")
+    for question_id, _ in FIRST_PERSON_QUESTIONS:
+        intake = runtime.record_answer("123", question_id, f"engram-{question_id}")
+    assert intake is not None and intake.member_id == "member-1"
+
+    client = _client_for_full_intake()
+    settings = valid_settings()
+    install_status_stub(
+        monkeypatch,
+        lambda *_: StatusResolution(
+            bound=True, member_id="member-OTHER", home_squad_id="home-other",
+            intake_state="complete", proposal_id="OTHER-PROP",
+        ),
+    )
+
+    update = Update(message=Message(text="anything"))
+    await _submit_proposal(
+        update.effective_message, "123", intake,
+        client=client, runtime=runtime, settings=settings, secret_owner=None, probe_limiter=None,
+    )
+
+    submit_calls = [action for action, _ in client.calls if action == "routine_proposal_submit"]
+    assert len(submit_calls) == 1  # member-1's own submit proceeds, unaffected
+    assert runtime.held_proposal_id("member-1") == "proposal-1"
+    assert runtime.held_proposal_id("member-OTHER") is None  # never touched
+
+
+@pytest.mark.asyncio
+async def test_submit_proposal_cached_complete_reading_skips_a_second_live_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F3 (P2, #28 round-2): `_server_confirms_existing_proposal`'s cached
+    branch was unpinned -- a mutation that always skipped straight to the
+    live probe (effectively `cached=None` unconditionally) stayed green
+    against the whole suite. Pin it by COUNTING wire calls: two
+    consecutive submit-path checks for the SAME member within the cache's
+    TTL must make exactly ONE real probe, not two. Mutation-provable:
+    short-circuiting the cached-branch check to always fall through to a
+    live probe makes `probe_calls` come back `2` instead of `1`."""
+    from plugin.first_person import _server_confirms_existing_proposal
+
+    fake_clock = {"now": 0.0}
+    runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    intake = runtime.get_pending("123")
+    assert intake is not None
+
+    probe_calls: list[int] = []
+
+    def resolver(_uid: Any, _cid: Any) -> StatusResolution:
+        probe_calls.append(1)
+        return StatusResolution(
+            bound=True, member_id="member-1", home_squad_id="home-squad-1",
+            intake_state="complete", proposal_id="proposal-1",
+        )
+
+    install_status_stub(monkeypatch, resolver)
+    settings = valid_settings()
+
+    first = await _server_confirms_existing_proposal(
+        "123", intake, runtime=runtime, settings=settings, secret_owner=None, probe_limiter=None
+    )
+    assert first is not None and first.proposal_id == "proposal-1"
+    assert len(probe_calls) == 1  # the first check has nothing cached -- one real probe
+
+    fake_clock["now"] += 1.0  # well within the TTL
+    second = await _server_confirms_existing_proposal(
+        "123", intake, runtime=runtime, settings=settings, secret_owner=None, probe_limiter=None
+    )
+    assert second is not None and second.proposal_id == "proposal-1"
+    assert len(probe_calls) == 1  # the SECOND check is served from cache -- zero new probes
+
+
+def test_resolve_member_status_never_trusts_a_proposal_id_on_a_non_complete_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F4 (P3/P2, #28 round-2): a stray `proposal_id` field on a wire
+    response whose `intake_state` is NOT 'complete' must never be
+    trusted -- `StatusResolution.proposal_id` is only ever populated for a
+    genuinely 'complete' reading. Mutation-provable: dropping the
+    `intake_state == "complete"` guard in `resolve_member_status`'s parse
+    makes this go red (proposal_id would leak through on a 'pending'
+    reading)."""
+    payload = json.dumps(
+        {
+            "ok": True,
+            "bound": True,
+            "member_id": "member-1",
+            "home_squad_id": "home-squad-1",
+            "intake_state": "pending",
+            "proposal_id": "SHOULD-NEVER-BE-TRUSTED",
+        }
+    ).encode("utf-8")
+    install_probe(monkeypatch, response=payload)
+
+    status = resolve_member_status(valid_settings(), 123, 123)
+
+    assert status.intake_state == "pending"
+    assert status.proposal_id is None
+
+
+def test_abandon_never_drops_a_record_that_changed_during_its_own_disk_clear(tmp_path: Path) -> None:
+    """F5 (P2/P3, #28 round-2): `abandon()`'s own disk-first reorder
+    (mupot-plugin#25 N6) releases the lock between its initial read and
+    its final pop -- a genuinely concurrent `resume()` + `record_answer()`
+    (a real flap back to 'pending') landing in that exact window replaces
+    `_pending[chat_key]` with a NEWER record (real new engrams, already
+    re-saved to disk) that the OLD code popped unconditionally: memory
+    gone, the durable row it just wrote very much present. Controlled,
+    deterministic interleave (no real threading needed -- this module is
+    single-threaded per event loop; the race is about ORDER, not OS
+    scheduling): `_clear_in_progress` is wrapped so the concurrent
+    resume+answer runs immediately after abandon()'s own disk write,
+    strictly before its final pop. Mutation-provable: reverting to an
+    unconditional pop makes the final assertion go red (`survivor` would
+    be `None`)."""
+    state_path = tmp_path / "state.json"
+    runtime = FirstPersonRuntime(state_path)
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    runtime.record_answer("123", "name", "engram-1")
+
+    original_clear = runtime._clear_in_progress
+
+    def interleaved_clear(member_id: str) -> None:
+        original_clear(member_id)
+        # Simulates a genuine flap-back-to-pending message arriving and
+        # being fully handled WHILE this abandon() call is between its
+        # disk clear and its own final in-memory pop.
+        runtime.resume("123")
+        runtime.record_answer("123", "role", "engram-2")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(runtime, "_clear_in_progress", interleaved_clear)
+        runtime.abandon("123")
+
+    survivor = runtime.get_pending("123")
+    assert survivor is not None
+    assert survivor.engrams == {"name": "engram-1", "role": "engram-2"}
+
+
+def test_abandon_interleave_resolves_to_the_disk_record_on_the_next_message(tmp_path: Path) -> None:
+    """Athena's binding round-2 condition (3): memory is the CACHE, disk
+    is the RECORD. Independent of the in-memory identity-check fix above
+    (F5) -- which keeps THIS process's own view correct -- the DURABLE
+    record `record_answer` wrote during the interleave must, on its own,
+    be enough for "the next message" to resume with every engram intact,
+    even reaching a completely FRESH `FirstPersonRuntime` (the sharpest
+    version of "memory lost the thread entirely," e.g. a process
+    restart): resume must come from disk, never depend on any one
+    process's in-memory state having survived."""
+    state_path = tmp_path / "state.json"
+    runtime = FirstPersonRuntime(state_path)
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    runtime.record_answer("123", "name", "engram-1")
+
+    original_clear = runtime._clear_in_progress
+
+    def interleaved_clear(member_id: str) -> None:
+        original_clear(member_id)
+        runtime.resume("123")
+        runtime.record_answer("123", "role", "engram-2")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(runtime, "_clear_in_progress", interleaved_clear)
+        runtime.abandon("123")
+
+    # A completely fresh runtime instance over the SAME durable state --
+    # memory in the old instance is irrelevant; disk is what "the next
+    # message" resumes from.
+    fresh_runtime = FirstPersonRuntime(state_path)
+    resumed = fresh_runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    assert resumed.engrams == {"name": "engram-1", "role": "engram-2"}
+    assert resumed.index == 2

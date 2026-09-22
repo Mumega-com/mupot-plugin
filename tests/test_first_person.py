@@ -561,10 +561,13 @@ async def test_unbind_mid_intake_still_serves_the_message_but_reconciliation_dro
     this message is handled and can only affect the record used for the
     NEXT one.
 
-    Round-3-gate-4 P1-b (still true, just relocated to reconciliation): a
-    SINGLE unbind reading is never enough. mupot-plugin#21 P2: the second
-    confirming reading must also be separated from the first by at least
-    the status-cache TTL, so a controllable clock is used here."""
+    Round-2-gate (#23) P2-a: a definitive non-pending reading now suspends
+    capture on the very FIRST (unconfirmed) reading -- see
+    FirstPersonRuntime.suspend -- so the SECOND message here (arriving
+    while suspended) falls through untouched too, even before the second
+    reading confirms the drop. mupot-plugin#21 P2: the second confirming
+    reading must also be separated from the first by at least the
+    status-cache TTL, so a controllable clock is used here."""
     fake_clock = {"now": 0.0}
     call_count = {"n": 0}
 
@@ -582,26 +585,29 @@ async def test_unbind_mid_intake_still_serves_the_message_but_reconciliation_dro
     )
     assert runtime.get_pending("123") is not None
 
-    # First reconciliation reading of 'unbound' -- unconfirmed: the record
-    # survives, but THIS message's own answer is still fully processed
-    # (sanitized, stored, replied) regardless.
+    # First reconciliation reading of 'unbound' -- unconfirmed: THIS
+    # message's own answer is still fully processed (sanitized, stored,
+    # replied), since it was not yet suspended when it arrived.
     first_unbind = Update(message=Message(text="Ada Example"))
     handled = await handle_first_contact(first_unbind, settings=valid_settings(), client=client, runtime=runtime)
     assert handled is True
     assert first_unbind.effective_message.replies == [FIRST_PERSON_QUESTIONS[1][1]]
     remember_calls = [args for action, args in client.calls if action == "squad_remember"]
     assert len(remember_calls) == 1 and remember_calls[0]["text"] == "Ada Example"
-    assert runtime.get_pending("123") is not None  # NOT dropped on a single reading
+    suspended_pending = runtime.get_pending("123")
+    assert suspended_pending is not None and suspended_pending.suspended is True  # NOW suspended
 
     # Second consecutive 'unbound' reading, separated by the status-cache
-    # TTL -- NOW confirmed, but the drop only ever affects the NEXT message.
+    # TTL -- this message arrives ALREADY suspended, so it falls straight
+    # through (never sanitized/stored/replied here), and reconciliation
+    # confirms and drops the record for the message after THIS one.
     fake_clock["now"] += first_person._STATUS_NEGATIVE_TTL_SECONDS
     second_unbind = Update(message=Message(text="Engineer"))
     handled = await handle_first_contact(second_unbind, settings=valid_settings(), client=client, runtime=runtime)
-    assert handled is True  # this message is STILL served from the record that was live at entry
-    assert second_unbind.effective_message.replies == [FIRST_PERSON_QUESTIONS[2][1]]
+    assert handled is False
+    assert second_unbind.effective_message.replies == []
     remember_calls = [args for action, args in client.calls if action == "squad_remember"]
-    assert len(remember_calls) == 2 and remember_calls[1]["text"] == "Engineer"
+    assert len(remember_calls) == 1  # unchanged -- never captured as an answer
     assert runtime.get_pending("123") is None  # confirmed -- dropped for the NEXT message
 
     # And the NEXT message, with no local record left, falls through to the
@@ -619,13 +625,15 @@ async def test_member_mismatch_mid_chat_abandons_stale_progress(
     """ROOT SHAPE: a mid-chat rebind (the same Telegram sender now
     resolving to a DIFFERENT mupot member) is likewise never consulted on
     the message path -- the message in flight when the rebind is first
-    observed is still served from member-1's own (about-to-be-abandoned)
-    record, and `_reconcile_pending_with_server` abandons that record
-    immediately (a mismatch while still confirmed 'pending' needs no
-    second reading -- the SAME probe result that reveals the mismatch also
-    tells us it isn't a flap). member-2's own, genuinely fresh intake only
-    starts on the message AFTER that -- the first one with no local record
-    left, so it takes the "outside view" resolve path."""
+    observed is still served from member-1's own record.
+
+    Round-2-gate (#23) P2-c: a mismatch is no longer confirmed on a
+    SINGLE reading -- it goes through the SAME suspend-then-confirm
+    discipline as a definitive non-pending reading (P2-a), separated by at
+    least the status-cache TTL. member-2's own, genuinely fresh intake
+    only starts once member-1's record is actually dropped (confirmed),
+    on the first message with no local record left."""
+    fake_clock = {"now": 0.0}
     call_count = {"n": 0}
 
     def resolver(_user_id: Any, _chat_id: Any) -> StatusResolution:
@@ -636,27 +644,42 @@ async def test_member_mismatch_mid_chat_abandons_stale_progress(
 
     install_status_stub(monkeypatch, resolver)
     client = _client_for_full_intake()
-    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
     await handle_first_contact(
         Update(message=Message(text="hello!")), settings=valid_settings(), client=client, runtime=runtime
     )
     first_pending = runtime.get_pending("123")
     assert first_pending is not None and first_pending.member_id == "member-1"
 
+    # First mismatch reading -- unconfirmed: this message is still
+    # answered from member-1's own record (ROOT SHAPE), which then
+    # suspends via reconciliation.
     handled = await handle_first_contact(
         Update(message=Message(text="hello again!")), settings=valid_settings(), client=client, runtime=runtime
     )
-    assert handled is True  # still served from member-1's own record (ROOT SHAPE)
-    assert runtime.get_pending("123") is None  # abandoned by reconciliation -- never carried forward
+    assert handled is True
+    suspended = runtime.get_pending("123")
+    assert suspended is not None and suspended.member_id == "member-1" and suspended.suspended is True
 
+    # Second consecutive mismatch reading, separated by the status-cache
+    # TTL -- this message arrives already suspended (falls through), and
+    # reconciliation NOW confirms and abandons member-1's stale record.
+    fake_clock["now"] += first_person._STATUS_NEGATIVE_TTL_SECONDS
     handled = await handle_first_contact(
         Update(message=Message(text="hello a third time!")), settings=valid_settings(), client=client, runtime=runtime
     )
+    assert handled is False
+    assert runtime.get_pending("123") is None  # abandoned by reconciliation -- never carried forward
+
+    # member-2's own, genuinely fresh intake starts on the NEXT message.
+    handled = await handle_first_contact(
+        Update(message=Message(text="hello a fourth time!")), settings=valid_settings(), client=client, runtime=runtime
+    )
     assert handled is True
-    third_pending = runtime.get_pending("123")
-    assert third_pending is not None
-    assert third_pending.member_id == "member-2"
-    assert third_pending is not first_pending
+    fourth_pending = runtime.get_pending("123")
+    assert fourth_pending is not None
+    assert fourth_pending.member_id == "member-2"
+    assert fourth_pending is not first_pending
 
 
 @pytest.mark.asyncio
@@ -668,6 +691,46 @@ async def test_stale_pending_record_expires_after_ttl(monkeypatch: pytest.Monkey
 
     fake_time["now"] = 601.0  # past the 600s TTL
     assert runtime.get_pending("123") is None
+
+
+def test_pending_absolute_ttl_expires_even_with_continuous_activity(tmp_path: Path) -> None:
+    """Round-2-gate (#23) P3: pins ``_PENDING_ABSOLUTE_TTL_SECONDS``
+    SPECIFICALLY, as distinct from the IDLE ttl above -- a record that is
+    repeatedly touched (so it never goes idle) must still be dropped once
+    its TOTAL age exceeds the absolute cap. Mutation-provable (M11):
+    deleting the ``now - intake.created_at > _PENDING_ABSOLUTE_TTL_SECONDS``
+    check in ``get_pending`` makes this go red -- the record would survive
+    forever as long as it keeps being touched, which is exactly what the
+    absolute cap exists to forbid."""
+    fake_clock = {"now": 0.0}
+    runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+
+    step = _PENDING_IDLE_TTL_SECONDS / 2  # well within the idle TTL each time
+    while fake_clock["now"] < _PENDING_ABSOLUTE_TTL_SECONDS - step:
+        fake_clock["now"] += step
+        assert runtime.touch("123") is not None  # never idle-dropped
+
+    fake_clock["now"] = _PENDING_ABSOLUTE_TTL_SECONDS + 1.0
+    assert runtime.get_pending("123") is None  # absolute cap -- dropped regardless of activity
+
+
+def test_pending_registry_is_bounded_lru(tmp_path: Path) -> None:
+    """Round-2-gate (#23) P3: ``FirstPersonRuntime._pending`` is capped
+    like ``_terminal_sightings``/``_StatusCache`` -- a burst of distinct
+    brand-new chats faster than any TTL sweep must never grow it without
+    limit. Mutation-provable: removing the eviction loop in
+    ``_put_pending`` makes ``len(runtime._pending)`` exceed the cap."""
+    runtime = FirstPersonRuntime(tmp_path / "state.json", max_pending=5)
+    for i in range(10):
+        runtime.start(f"chat-{i}", member_id=f"member-{i}", home_squad_id="home-squad-1")
+
+    assert len(runtime._pending) == 5
+    # The most-recently-started chats survive; the oldest were evicted.
+    for i in range(5):
+        assert runtime.get_pending(f"chat-{i}") is None
+    for i in range(5, 10):
+        assert runtime.get_pending(f"chat-{i}") is not None
 
 
 def test_is_complete_or_unknown_fails_closed_on_invalid_store(tmp_path: Path) -> None:
@@ -1233,12 +1296,18 @@ async def test_stall_escalation_retries_on_failure_without_spending_the_24h_succ
     assert pending is not None and pending.proposal_retry_count == 1  # 1st failed submission
 
     # Drive retry_count up to (but not past) the stall threshold -- plain
-    # failed-attempt replies, task_create never attempted yet.
-    while runtime.get_pending("123").proposal_retry_count < _PROPOSAL_STALLED_AFTER_ATTEMPTS - 1:
+    # failed-attempt replies, task_create never attempted yet. Bounded
+    # (round-2-gate #23): a regression that stops retry_count from ever
+    # advancing must fail this test, never hang the suite.
+    for _ in range(_PROPOSAL_STALLED_AFTER_ATTEMPTS + 5):
         pending = runtime.get_pending("123")
+        if pending.proposal_retry_count >= _PROPOSAL_STALLED_AFTER_ATTEMPTS - 1:
+            break
         runtime.schedule_proposal_retry("123", next_retry_at=fake_clock["now"], retry_count=pending.proposal_retry_count)
         reply = await handle("checking in")
         assert reply == _PROPOSAL_FAILED_REPLY
+    else:
+        pytest.fail("proposal_retry_count never reached the stall threshold within the iteration bound")
     assert client.task_create_attempts == 0
 
     # 1st stalled check-in: task_create is attempted and FAILS (attempt 1).
@@ -1326,12 +1395,18 @@ async def test_stall_marker_is_cleared_once_the_proposal_actually_succeeds(
     for answer in answers:
         await handle_first_contact(Update(message=Message(text=answer)), settings=settings, client=client, runtime=runtime)
 
-    while runtime.get_pending("123").proposal_retry_count < _PROPOSAL_STALLED_AFTER_ATTEMPTS:
+    # Bounded (round-2-gate #23): a regression that stops retry_count from
+    # ever advancing must fail this test, never hang the suite.
+    for _ in range(_PROPOSAL_STALLED_AFTER_ATTEMPTS + 5):
         pending = runtime.get_pending("123")
+        if pending is None or pending.proposal_retry_count >= _PROPOSAL_STALLED_AFTER_ATTEMPTS:
+            break
         runtime.schedule_proposal_retry("123", next_retry_at=fake_clock["now"], retry_count=pending.proposal_retry_count)
         await handle_first_contact(
             Update(message=Message(text="checking in")), settings=settings, client=client, runtime=runtime
         )
+    else:
+        pytest.fail("proposal_retry_count never reached the stall threshold within the iteration bound")
     assert "member-1" in runtime.store.stall_entries()  # stalled and flagged
 
     # Now let the SAME retry succeed -- the durable stall marker must be
@@ -1699,10 +1774,10 @@ async def test_condition_v_stale_bound_cache_unbind_mid_intake_aborts_cleanly(
     P1-b, a single reading is never enough; mupot-plugin#21 P2, the second
     reading must also be separated by at least the status-cache TTL -- see
     test_unbind_mid_intake_still_serves_the_message_but_reconciliation_
-    drops_it for the full walkthrough). ROOT SHAPE: the abort can only ever
-    take effect starting with the FIRST message that finds no local
-    pending record left -- it never claims (or un-claims) progress on a
-    message already served from the record that was live when it arrived."""
+    drops_it for the full walkthrough). Round-2-gate (#23) P2-a: the FIRST
+    (unconfirmed) reading already suspends capture, so the message that
+    arrives during the confirming window falls through untouched too, not
+    just the one after confirmation."""
     fake_clock = {"now": 0.0}
     call_count = {"n": 0}
 
@@ -1721,12 +1796,13 @@ async def test_condition_v_stale_bound_cache_unbind_mid_intake_aborts_cleanly(
 
     first_unbind = Update(message=Message(text="Ada Example"))
     await handle_first_contact(first_unbind, settings=valid_settings(), client=client, runtime=runtime)
-    assert runtime.get_pending("123") is not None  # unconfirmed, first reading
+    suspended = runtime.get_pending("123")
+    assert suspended is not None and suspended.suspended is True  # unconfirmed, first reading -- suspended
 
     fake_clock["now"] += first_person._STATUS_NEGATIVE_TTL_SECONDS
     second_unbind = Update(message=Message(text="Engineer"))
     handled = await handle_first_contact(second_unbind, settings=valid_settings(), client=client, runtime=runtime)
-    assert handled is True  # still served from the record live at entry
+    assert handled is False  # suspended at entry -- falls straight through
     assert runtime.get_pending("123") is None  # CONFIRMED -- dropped for the NEXT message
 
     abort_update = Update(message=Message(text="anything"))
@@ -2840,10 +2916,14 @@ async def test_trigger_c_a_single_status_flap_never_prunes_the_durable_record(
     confirming reading may (see note_non_pending). The check-in message
     itself uses an escape word so it is fully handled (paused, not
     dropped) WITHOUT itself advancing progress, isolating the
-    reconciliation effect from ordinary answer-handling. A flap back to
-    'pending' before that second reading must resume with every engram
-    intact, index unchanged, never re-asking an already-answered
-    question."""
+    reconciliation effect from ordinary answer-handling.
+
+    Round-2-gate (#23) P2-a: the FIRST (unconfirmed) reading already
+    suspends capture, so the message that triggers the flap back to
+    'pending' is ITSELF still suspended at entry (falls through untouched)
+    -- only the message AFTER that, once reconciliation has cleared the
+    suspension, resumes with every engram intact, index unchanged, never
+    re-asking an already-answered question."""
     runtime = FirstPersonRuntime(tmp_path / "state.json")
     client = _client_for_full_intake()
     monkeypatch.setattr("plugin.first_person._resolve_member_project", _default_project_resolver)
@@ -2858,23 +2938,37 @@ async def test_trigger_c_a_single_status_flap_never_prunes_the_durable_record(
     assert pending is not None and pending.index == 4
 
     # ONE 'complete' reconciliation reading -- unconfirmed, must leave
-    # everything intact (in-memory AND durable). An escape word keeps this
-    # check-in message itself from being captured as the 5th answer.
+    # everything intact (in-memory AND durable), but DOES suspend capture.
+    # An escape word keeps this check-in message itself from being
+    # captured as the 5th answer.
     install_status_stub(monkeypatch, lambda *_: COMPLETE_STATUS)
     handled = await handle_first_contact(
         Update(message=Message(text="stop")), settings=settings, client=client, runtime=runtime
     )
-    assert handled is True  # a pause -- always fully handled, from the pending record
+    assert handled is True  # NOT suspended yet at entry -- this pause is still fully handled
     still_pending = runtime.get_pending("123")
     assert still_pending is not None
+    assert still_pending.suspended is True  # suspended now, from reconciliation's first reading
     assert still_pending.index == 4
     assert set(still_pending.engrams) == {"name", "role", "project", "first_ask"}
     data = json.loads((tmp_path / "state.json").read_text())
     assert "member-1" in data.get("in_progress", {})  # NOT pruned on one reading
 
-    # Flap BACK to 'pending' -- resumes the SAME record, no reset, no
-    # re-asked/re-recorded question.
+    # Flap BACK to 'pending' -- this FIRST message is itself still
+    # suspended at entry (suspension only clears via reconciliation, which
+    # runs AFTER a message, never during it), so it falls through
+    # untouched; reconciliation then resumes the record for the NEXT one.
     install_status_stub(monkeypatch, lambda *_: pending_status())
+    resume_trigger = Update(message=Message(text="you there?"))
+    handled = await handle_first_contact(resume_trigger, settings=settings, client=client, runtime=runtime)
+    assert handled is False
+    assert resume_trigger.effective_message.replies == []
+    resumed = runtime.get_pending("123")
+    assert resumed is not None and resumed.suspended is False  # reconciliation cleared it
+    assert resumed.index == 4  # untouched
+
+    # NOW captured normally again -- resumes the SAME record, no reset, no
+    # re-asked/re-recorded question.
     await handle_first_contact(Update(message=Message(text="Nothing else")), settings=settings, client=client, runtime=runtime)
     remember_calls = [args for action, args in client.calls if action == "squad_remember"]
     assert len(remember_calls) == 5  # never re-recorded name/role/project/first_ask
@@ -2891,8 +2985,10 @@ async def test_trigger_c_two_consecutive_complete_readings_confirm_and_prune(
     prune the durable record -- closing the original round-3-gate-2
     trigger (c) landmine (a status flap resurrecting a stale, never-
     produced-by-this-episode record) while still requiring genuine
-    confirmation. Escape words keep both check-in messages from being
-    captured as real answers, isolating the reconciliation effect."""
+    confirmation. Escape words keep the first check-in message from being
+    captured as a real answer, isolating the reconciliation effect; the
+    second one is suspended (P2-a) before it would even reach that check.
+    """
     fake_clock = {"now": 0.0}
     runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
     client = _client_for_full_intake()
@@ -2909,13 +3005,14 @@ async def test_trigger_c_two_consecutive_complete_readings_confirm_and_prune(
     await handle_first_contact(
         Update(message=Message(text="stop")), settings=settings, client=client, runtime=runtime
     )
-    assert runtime.get_pending("123") is not None  # first reading -- unconfirmed
+    first_reading = runtime.get_pending("123")
+    assert first_reading is not None and first_reading.suspended is True  # first reading -- unconfirmed, suspended
 
     fake_clock["now"] += first_person._STATUS_NEGATIVE_TTL_SECONDS
     handled = await handle_first_contact(
         Update(message=Message(text="cancel")), settings=settings, client=client, runtime=runtime
     )
-    assert handled is True  # still served (paused) from the record live at entry
+    assert handled is False  # suspended at entry -- falls straight through
     assert runtime.get_pending("123") is None
     data = json.loads((tmp_path / "state.json").read_text())
     assert "member-1" not in data.get("in_progress", {})  # pruned, not immortal
@@ -2997,6 +3094,245 @@ def test_abandon_prunes_the_durable_in_progress_record(tmp_path: Path) -> None:
     assert runtime.get_pending("123") is None
     data = json.loads(state_path.read_text())
     assert "member-1" not in data.get("in_progress", {})
+
+
+# ---------------------------------------------------------------------------
+# Round-2-gate (#23) P1: SHARED-STORE INTEGRITY (the same defect class as
+# #19 -- a second write to a completion marker a concurrent/later write
+# should never be allowed to touch). ROOT SHAPE removed the ONLY thing that
+# used to check "does this member already hold a proposal" on EVERY message
+# (resolve_member_status -> held_proposal_id, see #20) from the pending-
+# member message path -- a fully-answered pending record could reach
+# _submit_proposal with NOTHING upstream having checked that first. TWO
+# independent layers close this, each pinned by its own test/mutation:
+#   (reader) _submit_proposal itself checks held_proposal_id and refuses/
+#            reuses rather than ever calling routine_proposal_submit again.
+#   (writer) finish() never overwrites an already-recorded proposal_id with
+#            a different one -- the FIRST one always wins, loudly.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_submit_proposal_refuses_when_a_proposal_is_already_held(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """READER-SIDE layer. A LIVE local pending record (established through
+    the normal flow -- 4 of 5 questions answered, no completion marker
+    yet) plus a completion marker that appears BEFORE the 5th answer (a
+    proposal submitted via the journal fallback, by a sibling process
+    entirely, or a seeded marker) must mean ZERO
+    `routine_proposal_submit` calls when the local record independently
+    reaches completion -- reuse the held proposal_id, never submit a
+    second one. (Seeding the marker before ANY local record exists would
+    instead be caught by the OLDER, outer held-proposal lag-guard in
+    `handle_first_contact` itself -- this scenario specifically exercises
+    `_submit_proposal`'s OWN check, reachable only once a local pending
+    record already exists and is answered all the way to completion.)
+    Mutation-provable: removing the
+    `runtime.held_proposal_id(intake.member_id)` check at the top of
+    `_submit_proposal` makes `submit_calls` non-empty."""
+    state_path = tmp_path / "state.json"
+    runtime = FirstPersonRuntime(state_path)
+    client = _client_for_full_intake()
+    install_status_stub(monkeypatch, lambda *_: pending_status())
+    monkeypatch.setattr("plugin.first_person._resolve_member_project", _default_project_resolver)
+    settings = valid_settings()
+
+    await handle_first_contact(Update(message=Message(text="hello!")), settings=settings, client=client, runtime=runtime)
+    for answer in ["Ada Example", "Engineer", "psychonom", "Ship it"]:  # 4 of 5 -- not yet submitted
+        await handle_first_contact(Update(message=Message(text=answer)), settings=settings, client=client, runtime=runtime)
+    assert runtime.get_pending("123") is not None and runtime.get_pending("123").index == 4
+
+    # A proposal for this member appears from elsewhere BEFORE the 5th
+    # answer -- e.g. a concurrent sibling call, or a journal-recovered
+    # completion this process's own main store doesn't yet reflect.
+    data = json.loads(state_path.read_text())
+    data["completed"] = {"member-1": {"engram_ids": {}, "proposal_id": "proposal-SEEDED", "completed_at": 0.0}}
+    state_path.write_text(json.dumps(data))
+
+    last_update = Update(message=Message(text="Nothing else"))
+    await handle_first_contact(last_update, settings=settings, client=client, runtime=runtime)
+
+    submit_calls = [action for action, _ in client.calls if action == "routine_proposal_submit"]
+    assert submit_calls == []  # NEVER attempted a second submission
+    assert last_update.effective_message.replies[-1] == first_person._COMPLETE_REPLY
+    data = json.loads(state_path.read_text())
+    assert data["completed"]["member-1"]["proposal_id"] == "proposal-SEEDED"  # unchanged
+    assert runtime.get_pending("123") is None
+
+
+def test_finish_never_overwrites_an_existing_proposal_id(tmp_path: Path) -> None:
+    """WRITER-SIDE layer -- the independent backstop for whatever narrow
+    race still reaches `finish()` with a second proposal_id (the reader-
+    side check above is the primary defense; this is what keeps a torn
+    read, a journal-recovered marker, or a future caller from silently
+    destroying the FIRST recorded proposal_id). Mutation-provable:
+    removing the `existing_proposal_id is not None and existing_proposal_id
+    != new_proposal_id` guard in `finish()` makes the final assertion
+    below go red (`proposal-SECOND` would overwrite `proposal-FIRST`)."""
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {"completed": {"member-1": {"engram_ids": {}, "proposal_id": "proposal-FIRST", "completed_at": 0.0}}}
+        )
+    )
+    runtime = FirstPersonRuntime(state_path)
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    runtime.record_answer("123", "name", "engram-1")
+
+    runtime.finish("123", proposal_id="proposal-SECOND")
+
+    data = json.loads(state_path.read_text())
+    assert data["completed"]["member-1"]["proposal_id"] == "proposal-FIRST"  # never overwritten
+    assert "member-1" not in data.get("in_progress", {})  # in-progress record still cleared
+    assert runtime.get_pending("123") is None
+
+
+@pytest.mark.asyncio
+async def test_submit_proposal_concurrent_calls_submit_exactly_once(tmp_path: Path) -> None:
+    """The genuinely-concurrent race case: three overlapping
+    `_submit_proposal` calls for the SAME chat_key (e.g. two or more
+    overlapping `handle_first_contact` invocations each reaching
+    `index == len(FIRST_PERSON_QUESTIONS)` before any of them finishes)
+    must only ever let ONE of them actually call `routine_proposal_submit`
+    -- `try_begin_submit`/`end_submit` is the guard. The first call's
+    submission is deliberately blocked (a real `threading.Event`, since
+    `client.call` runs inside `asyncio.to_thread`) until the other two
+    have already run their own (non-blocking) `try_begin_submit` checks,
+    so this is a genuine overlap, not an artifact of asyncio scheduling
+    order. Mutation-provable: removing the `try_begin_submit`/`end_submit`
+    guard from `_submit_proposal` makes `submit_calls` exceed 1."""
+    import threading
+
+    from plugin.first_person import _submit_proposal
+
+    release = threading.Event()
+
+    class _BlockingClient(FakeClient):
+        def call(self, action: str, args: dict[str, Any]) -> Any:
+            self.calls.append((action, dict(args)))
+            if action == "routine_proposal_submit":
+                assert release.wait(timeout=5.0), "test setup did not release in time"
+                return {"ok": True, "result": {"proposal_id": "proposal-1"}}
+            return {"ok": True, "result": {}}
+
+    client = _BlockingClient()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    runtime.set_project_id("123", "proj-1")
+    intake = None
+    for question_id, _ in FIRST_PERSON_QUESTIONS:
+        intake = runtime.record_answer("123", question_id, f"engram-{question_id}")
+    assert intake is not None and intake.index == len(FIRST_PERSON_QUESTIONS)
+
+    async def call_submit() -> Update:
+        update = Update(message=Message(text="anything"))
+        await _submit_proposal(update.effective_message, "123", intake, client=client, runtime=runtime)
+        return update
+
+    task1 = asyncio.create_task(call_submit())
+    await asyncio.sleep(0.05)  # let task1 reach the blocked submit() call
+    task2 = asyncio.create_task(call_submit())
+    task3 = asyncio.create_task(call_submit())
+    await asyncio.sleep(0.05)  # let task2/task3 run their try_begin_submit checks
+    release.set()
+    update1, update2, update3 = await asyncio.gather(task1, task2, task3)
+
+    submit_calls = [action for action, _ in client.calls if action == "routine_proposal_submit"]
+    assert len(submit_calls) == 1  # only ONE real submission, ever
+    assert update1.effective_message.replies[-1] == first_person._COMPLETE_REPLY
+    assert update2.effective_message.replies[-1] == _PROPOSAL_RETRY_WAIT_REPLY
+    assert update3.effective_message.replies[-1] == _PROPOSAL_RETRY_WAIT_REPLY
+
+
+@pytest.mark.asyncio
+async def test_reconcile_denied_probe_never_confirms_or_resumes_from_a_fabricated_reading(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round-2-gate (#23) P2-b: pins against mutation M5 -- re-adding a
+    locally-derived "assume pending" fallback to
+    `_reconcile_pending_with_server`'s `resolve()` call would make a
+    LIMITER DENIAL masquerade as a genuine server reading. Two ways that
+    would corrupt state, neither of which any OTHER test in this file
+    catches (this mutation stayed green at 187/187 without this test):
+    (1) it would call `note_pending()`/`resume()` from a denial, erasing
+    an already-accumulated unconfirmed non-pending sighting; (2) it would
+    never let the ORIGINAL sighting's timestamp survive a long run of
+    denials, so a later genuine confirming reading would incorrectly
+    restart the confirmation window instead of confirming against the
+    original one.
+
+    First accumulate ONE real, definitive non-pending reading (suspending
+    the record), then deny every subsequent reconcile probe for a while
+    (via `_SenderProbeLimiter`) while re-invoking reconciliation directly,
+    and confirm the record stays suspended and unconfirmed THROUGHOUT --
+    never resumed, never reset -- until a real reading is allowed through
+    again, at which point it confirms against the ORIGINAL sighting."""
+    from plugin.first_person import _reconcile_pending_with_server
+
+    fake_clock = {"now": 0.0}
+    runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    pending = runtime.get_pending("123")
+    settings = valid_settings()
+
+    # One real, definitive non-pending reading -- suspends, unconfirmed.
+    # Uses install_probe (the transport layer only), NOT install_status_stub
+    # -- that stub replaces resolve_member_status wholesale and would
+    # silently skip the REAL sender_limiter/fallback logic this test exists
+    # to exercise.
+    install_probe(monkeypatch, response=status_response_bytes(intake_state="complete", home_squad_id="home-squad-1"))
+    await _reconcile_pending_with_server(
+        "123",
+        123,
+        123,
+        pending,
+        settings=settings,
+        secret_owner=None,
+        runtime=runtime,
+        status_cache=None,
+        probe_limiter=None,
+        sender_probe_limiter=None,
+    )
+    suspended = runtime.get_pending("123")
+    assert suspended is not None and suspended.suspended is True  # unconfirmed -- suspended, not abandoned
+
+    # Every subsequent reconcile probe is denied.
+    denying_limiter = _SenderProbeLimiter(min_interval=999999.0)
+    assert denying_limiter.should_probe("123") is True  # consume the only slot up front
+    for _ in range(5):
+        fake_clock["now"] += 1.0
+        await _reconcile_pending_with_server(
+            "123",
+            123,
+            123,
+            suspended,
+            settings=settings,
+            secret_owner=None,
+            runtime=runtime,
+            status_cache=None,
+            probe_limiter=None,
+            sender_probe_limiter=denying_limiter,
+        )
+        still = runtime.get_pending("123")
+        assert still is not None and still.suspended is True  # STILL suspended -- never resumed by a denial
+
+    # Once a real probe is allowed through again, confirmation fires
+    # against the ORIGINAL sighting -- not reset by any of the denials.
+    fake_clock["now"] = first_person._STATUS_NEGATIVE_TTL_SECONDS
+    await _reconcile_pending_with_server(
+        "123",
+        123,
+        123,
+        still,
+        settings=settings,
+        secret_owner=None,
+        runtime=runtime,
+        status_cache=None,
+        probe_limiter=None,
+        sender_probe_limiter=None,
+    )
+    assert runtime.get_pending("123") is None  # confirmed against the ORIGINAL reading
 
 
 @pytest.mark.asyncio
@@ -3514,15 +3850,15 @@ async def test_a_confirmed_unbind_still_abandons_a_pending_intake(
     """Contrast with the transient-unknown test above: a DEFINITIVE
     confirmation that the sender is not (or no longer) a member must still
     eventually abandon progress via reconciliation -- only genuine
-    transport/limiter noise holds it unconditionally, and even then only
-    with respect to whether IT can hold the message; it never affects an
-    already-confirmed abandonment. Round-3-gate-4 P1-b: even a definitive
-    'none' needs a SECOND consecutive confirming reading, separated by at
-    least the status-cache TTL (mupot-plugin#21 P2), before the durable
-    record is pruned (never a single reading -- see the trigger-c tests).
-    ROOT SHAPE: both messages here are still fully answered from the
-    pending record that was live when each arrived -- the abandonment only
-    ever takes effect starting with the message AFTER confirmation."""
+    transport/limiter noise holds it unconditionally. Round-3-gate-4 P1-b:
+    even a definitive 'none' needs a SECOND consecutive confirming
+    reading, separated by at least the status-cache TTL (mupot-plugin#21
+    P2), before the durable record is pruned (never a single reading --
+    see the trigger-c tests). Round-2-gate (#23) P2-a: the FIRST message
+    is still answered from the pending record that was live when it
+    arrived, but the reading it produces suspends capture immediately, so
+    the SECOND message (arriving already suspended) falls through
+    untouched rather than being answered too."""
     fake_clock = {"now": 0.0}
     call_count = {"n": 0}
 
@@ -3542,13 +3878,14 @@ async def test_a_confirmed_unbind_still_abandons_a_pending_intake(
         Update(message=Message(text="Ada Example")), settings=valid_settings(), client=client, runtime=runtime
     )
     assert handled is True  # answered regardless -- ROOT SHAPE
-    assert runtime.get_pending("123") is not None  # 1st reconciliation reading -- unconfirmed
+    suspended = runtime.get_pending("123")
+    assert suspended is not None and suspended.suspended is True  # 1st reconciliation reading -- unconfirmed, suspended
 
     fake_clock["now"] += first_person._STATUS_NEGATIVE_TTL_SECONDS
     handled = await handle_first_contact(
         Update(message=Message(text="Engineer")), settings=valid_settings(), client=client, runtime=runtime
     )
-    assert handled is True  # still served from the record live at entry
+    assert handled is False  # suspended at entry -- falls straight through
     assert runtime.get_pending("123") is None  # 2nd reading -- CONFIRMED, dropped for the NEXT message
 
 
@@ -3646,7 +3983,17 @@ async def test_pending_member_bypasses_the_status_cache_entirely(monkeypatch: py
     apply to a member with local pending progress -- verified here by
     proving the cache is bypassed (never read, never written) whenever a
     pending record exists, so a transient failure can never poison the next
-    message's probe."""
+    message's probe.
+
+    NOT LOAD-BEARING as of round-2-gate #23's ROOT SHAPE reshape: a pending
+    member's message no longer calls `resolve_member_status` at all (see
+    `_handle_pending_message`), and `_reconcile_pending_with_server`
+    (which runs afterward) always passes `cache=None` unconditionally --
+    so this cache is now trivially bypassed for a pending member by
+    construction, not by the specific behavior this test exercises. Left
+    in place as a still-true regression guard, documented here per the
+    round-2 adversarial gate so a future reader doesn't mistake "passes"
+    for "load-bearing"."""
     opener = install_probe(monkeypatch, response=status_response_bytes(home_squad_id="home-squad-1"))
     cache = _StatusCache()
     runtime = FirstPersonRuntime(tmp_path / "state.json")

@@ -175,6 +175,12 @@ _FIRST_PERSON_HANDLER_GROUP = -5
 _PENDING_IDLE_TTL_SECONDS = 600.0
 _PENDING_ABSOLUTE_TTL_SECONDS = 86400.0
 
+# Round-2-gate (#23) P3: TTL is the normal turnover for FirstPersonRuntime's
+# in-memory `_pending` registry, but a burst of distinct brand-new chats
+# faster than any TTL sweep must still never grow it without limit -- same
+# bounded-LRU discipline as `_StatusCache`/`_terminal_sightings`.
+_PENDING_MAX_ENTRIES = 2048
+
 # How long the LOCAL completion marker is trusted as a dedupe cache before this
 # module defers entirely back to the server's own intake_state (Athena's
 # round-2 condition (ii): the marker is a cached view, never the record).
@@ -703,6 +709,16 @@ class _SenderProbeLimiter:
         self._clock = clock
         self._last_at: "OrderedDict[str, float]" = OrderedDict()
         self._lock = threading.Lock()
+
+    @property
+    def min_interval(self) -> float:
+        """Round-2-gate (#23) P2-a: the ACTUAL interval governing how often
+        a fresh real probe can happen through this limiter -- exposed so a
+        caller (``_reconcile_pending_with_server``) can derive its own
+        confirmation-separation requirement from the limiter genuinely in
+        force at that call site, instead of a constant picked for a
+        different cache entirely."""
+        return self._min_interval
 
     def should_probe(self, user_id: str) -> bool:
         with self._lock:
@@ -1284,6 +1300,14 @@ class Intake:
     last_activity_at: float = field(default_factory=time.monotonic)
     proposal_retry_count: int = 0
     next_proposal_retry_at: float = 0.0
+    # Round-2-gate (#23) P2-a/P2-c: a UNCONFIRMED definitive non-pending (or
+    # member-mismatch) reading suspends capture immediately -- see
+    # FirstPersonRuntime.suspend/resume and _reconcile_pending_with_server.
+    # A suspended record is never consumed by _handle_pending_message (the
+    # message falls through to the host, nothing stored) but every engram
+    # stays intact so a flap back to a genuine 'pending' reading resumes
+    # exactly where it left off, never abandoned on a single reading.
+    suspended: bool = False
 
 
 class FirstPersonRuntime:
@@ -1301,9 +1325,16 @@ class FirstPersonRuntime:
         *,
         clock: Any = time.monotonic,
         wall_clock: Any = time.time,
+        max_pending: int = _PENDING_MAX_ENTRIES,
     ) -> None:
         self._lock = threading.Lock()
-        self._pending: dict[str, Intake] = {}
+        # Round-2-gate (#23) P3: bounded LRU, same discipline as
+        # _StatusCache/_terminal_sightings -- a burst of distinct brand-new
+        # chats must never grow this dict without limit. TTL (idle/
+        # absolute, see get_pending) is the normal turnover mechanism; this
+        # is the hard backstop for a burst faster than any TTL sweep.
+        self._pending: "OrderedDict[str, Intake]" = OrderedDict()
+        self._max_pending = max(1, max_pending)
         self.store = FirstPersonStateStore(state_path)
         self._clock = clock
         self._wall_clock = wall_clock
@@ -1311,6 +1342,17 @@ class FirstPersonRuntime:
         # reading is never enough to durably prune a member's in-progress
         # record -- see note_non_pending/note_pending below.
         self._terminal_sightings: "OrderedDict[str, float]" = OrderedDict()
+        # Round-2-gate (#23) P1: chat_keys with a real submission attempt
+        # currently in flight -- see try_begin_submit/end_submit.
+        self._submitting: set[str] = set()
+
+    def _put_pending(self, chat_key: str, intake: Intake) -> None:
+        """Caller must hold ``self._lock``. Bounded-LRU insert/update,
+        mirroring ``_StatusCache.put``."""
+        self._pending[chat_key] = intake
+        self._pending.move_to_end(chat_key)
+        while len(self._pending) > self._max_pending:
+            self._pending.popitem(last=False)  # evict least-recently-used
 
     def wall_now(self) -> float:
         return self._wall_clock()
@@ -1583,6 +1625,7 @@ class FirstPersonRuntime:
             if now - intake.created_at > _PENDING_ABSOLUTE_TTL_SECONDS:
                 del self._pending[chat_key]
                 return None
+            self._pending.move_to_end(chat_key)
             return intake
 
     def touch(self, chat_key: str) -> Intake | None:
@@ -1596,7 +1639,7 @@ class FirstPersonRuntime:
             if intake is None:
                 return None
             updated = replace(intake, last_activity_at=self._clock())
-            self._pending[chat_key] = updated
+            self._put_pending(chat_key, updated)
             return updated
 
     def start(self, chat_key: str, *, member_id: str, home_squad_id: str) -> Intake:
@@ -1722,7 +1765,7 @@ class FirstPersonRuntime:
             next_proposal_retry_at=next_retry_at,
         )
         with self._lock:
-            self._pending[chat_key] = intake
+            self._put_pending(chat_key, intake)
         return intake
 
     def record_answer(self, chat_key: str, question_id: str, engram_id: str) -> Intake | None:
@@ -1747,7 +1790,7 @@ class FirstPersonRuntime:
                 index=intake.index + 1,
                 last_activity_at=self._clock(),
             )
-            self._pending[chat_key] = updated
+            self._put_pending(chat_key, updated)
         self._save_in_progress(updated.member_id, updated.engrams, updated.project_id, updated.proposal_retry_count)
         return updated
 
@@ -1767,7 +1810,7 @@ class FirstPersonRuntime:
             if intake is None:
                 return None
             updated = replace(intake, project_id=project_id)
-            self._pending[chat_key] = updated
+            self._put_pending(chat_key, updated)
         self._save_in_progress(updated.member_id, updated.engrams, updated.project_id, updated.proposal_retry_count)
         return updated
 
@@ -1784,7 +1827,7 @@ class FirstPersonRuntime:
             if intake is None:
                 return None
             updated = replace(intake, next_proposal_retry_at=next_retry_at, proposal_retry_count=retry_count)
-            self._pending[chat_key] = updated
+            self._put_pending(chat_key, updated)
         self._save_in_progress(updated.member_id, updated.engrams, updated.project_id, updated.proposal_retry_count)
         return updated
 
@@ -1815,6 +1858,39 @@ class FirstPersonRuntime:
         completed = data.get("completed")
         if not isinstance(completed, dict):
             completed = {}
+        existing_entry = completed.get(intake.member_id)
+        existing_proposal_id = (
+            existing_entry.get("proposal_id") if isinstance(existing_entry, dict) else None
+        )
+        existing_proposal_id = (
+            existing_proposal_id.strip()
+            if isinstance(existing_proposal_id, str) and existing_proposal_id.strip()
+            else None
+        )
+        new_proposal_id = proposal_id.strip() if isinstance(proposal_id, str) and proposal_id.strip() else None
+        if existing_proposal_id is not None and existing_proposal_id != new_proposal_id:
+            # Round-2-gate (#23) P1: NEVER overwrite an already-recorded
+            # proposal_id with a different one -- _submit_proposal's own
+            # held_proposal_id check (see there) is the primary defense
+            # against a second submission ever happening at all; this is
+            # the belt-and-suspenders backstop for whatever narrow race
+            # still reaches here (e.g. a marker seeded by a journal entry
+            # or a different process). The FIRST proposal_id always wins,
+            # loudly, never silently -- still clears the in-progress
+            # record, since this intake episode is over either way.
+            logger.warning(
+                "mupot plugin: finish() called for member_id=%s with proposal_id=%s but "
+                "an existing proposal_id=%s is already recorded -- KEEPING the existing one",
+                intake.member_id,
+                proposal_id,
+                existing_proposal_id,
+            )
+            in_progress = data.get("in_progress")
+            if isinstance(in_progress, dict) and intake.member_id in in_progress:
+                del in_progress[intake.member_id]
+                data["in_progress"] = in_progress
+            self.store.save(data)
+            return
         completed[intake.member_id] = {
             "engram_ids": dict(intake.engrams),
             "proposal_id": proposal_id,
@@ -1826,6 +1902,61 @@ class FirstPersonRuntime:
             del in_progress[intake.member_id]
             data["in_progress"] = in_progress
         self.store.save(data)
+
+    def try_begin_submit(self, chat_key: str) -> bool:
+        """Round-2-gate (#23) P1: ``True`` iff this call may proceed with a
+        REAL ``routine_proposal_submit`` attempt for ``chat_key`` -- ``False``
+        means another call (a genuinely concurrent sibling, e.g. two
+        overlapping ``handle_first_contact`` invocations for the same chat
+        both reaching ``index == len(FIRST_PERSON_QUESTIONS)``) is already
+        submitting for this exact chat, and this call must never submit a
+        second one. The caller is responsible for eventually calling
+        :meth:`end_submit`, normally in a ``finally`` block."""
+        with self._lock:
+            if chat_key in self._submitting:
+                return False
+            self._submitting.add(chat_key)
+            return True
+
+    def end_submit(self, chat_key: str) -> None:
+        with self._lock:
+            self._submitting.discard(chat_key)
+
+    def suspend(self, chat_key: str) -> Intake | None:
+        """Round-2-gate (#23) P2-a/P2-c: mark a pending record 'suspended
+        pending confirmation' -- the FIRST (unconfirmed) definitive non-
+        pending or member-mismatch reading from
+        :func:`_reconcile_pending_with_server`. A suspended record is
+        never consumed by ``_handle_pending_message`` (the message falls
+        through to the host untouched -- nothing sanitized, stored, or
+        replied here) but every engram and the index stay exactly as they
+        are, so a flap back to a genuine matching 'pending' reading (see
+        :meth:`resume`) picks up exactly where it left off. Confirmation
+        (a SECOND separated reading) is what actually calls
+        :meth:`abandon` -- this method alone never deletes anything."""
+        with self._lock:
+            intake = self._pending.get(chat_key)
+            if intake is None:
+                return None
+            if intake.suspended:
+                return intake
+            updated = replace(intake, suspended=True)
+            self._put_pending(chat_key, updated)
+            return updated
+
+    def resume(self, chat_key: str) -> Intake | None:
+        """The companion to :meth:`suspend`: a genuine, member-matched
+        'pending' reading clears the suspension so the record is served
+        normally again from the very next message."""
+        with self._lock:
+            intake = self._pending.get(chat_key)
+            if intake is None:
+                return None
+            if not intake.suspended:
+                return intake
+            updated = replace(intake, suspended=False)
+            self._put_pending(chat_key, updated)
+            return updated
 
     def abandon(self, chat_key: str) -> None:
         """Drop the in-memory record AND prune the durable in-progress resume
@@ -2362,121 +2493,160 @@ async def _submit_proposal(
     stalled_notifier: "_NotifyOncePerWindow | None" = None,
     stall_retry_notifier: "_NotifyOncePerWindow | None" = None,
 ) -> None:
-    project_id = intake.project_id
-    if not project_id:
-        # Round-3 P2-E / ruling (5): kill the false-success branch. No
-        # project ever resolved (should not normally happen -- question 3
-        # gates on it), but this is a genuine failure, never a completion --
-        # no marker without a real proposal_id, ever. Route it through the
-        # exact same honest-failure-with-retry shape as a failed submission
-        # below: honest reply, WARNING (member_id only, no PII), backoff.
-        logger.warning(
-            "mupot plugin: first-person proposal has no project_id member_id=%s "
-            "-- treating as a failed submission, not completing",
-            intake.member_id,
-        )
-        retry_count = intake.proposal_retry_count + 1
-        runtime.schedule_proposal_retry(
-            chat_key,
-            next_retry_at=clock() + _next_backoff(intake.proposal_retry_count),
-            retry_count=retry_count,
-        )
-        await message.reply_text(
-            await _stall_reply(
-                retry_count=retry_count,
-                member_id=intake.member_id,
-                project_id=project_id,
-                client=client,
-                runtime=runtime,
-                stalled_notifier=stalled_notifier,
-                stall_retry_notifier=stall_retry_notifier,
-            )
-        )
+    """Round-2-gate (#23) P1: this is now the SOLE gate against a second
+    submission for a member this module already holds a proposal for, and
+    against two genuinely concurrent calls each submitting their own.
+    Round-2's design relied entirely on `resolve_member_status` ->
+    `held_proposal_id` running on EVERY message (see #20); ROOT SHAPE (this
+    branch) removed that probe from the pending-member message path
+    entirely, so a fully-answered pending record could reach here with
+    NOTHING upstream having ever checked whether a proposal already
+    exists -- a seeded/duplicated completion marker plus a live pending
+    record submitted a SECOND `routine_proposal_submit`, and `finish()`
+    would then overwrite the first proposal_id. Two independent guards:
+    (1) `held_proposal_id` (checks the main store AND the journal) refuses
+    outright if a proposal is already held -- reuses it via `finish()`
+    rather than ever calling `submit()`. (2) `try_begin_submit`/
+    `end_submit` (a per-chat_key in-flight marker on the runtime) ensures
+    that even two genuinely concurrent calls for the SAME chat_key (e.g.
+    two overlapping `handle_first_contact` invocations both reaching
+    `index == len(FIRST_PERSON_QUESTIONS)` before either finishes) only
+    ever let ONE of them actually call `submit()`."""
+    existing_proposal_id = runtime.held_proposal_id(intake.member_id)
+    if existing_proposal_id is not None:
+        # Already submitted (by an earlier call, a different process via
+        # the journal, or a seeded marker) -- reuse it, never submit again.
+        runtime.finish(chat_key, proposal_id=existing_proposal_id)
+        await message.reply_text(_COMPLETE_REPLY)
         return
 
-    def submit() -> dict[str, Any]:
-        digest = hashlib.sha256(
-            f"first-person:{intake.member_id}:{project_id}".encode("utf-8")
-        ).hexdigest()
-        return client.call(
-            "routine_proposal_submit",
-            {
-                "version": "routine.proposal/v1",
-                "run_id": f"first-person-{intake.member_id}",
-                "project_id": project_id,
-                "situation_digest": digest,
-                "summary": "First-person intake: propose write access for a new member.",
-                "action": {
-                    "key": "first-person-project-access",
-                    # "project_access" is a mupot-side contract dependency --
-                    # see PR body. The live routine_proposal_submit schema
-                    # checked during this build only accepts
-                    # create_task/dispatch_flight/request_review/ask_human/
-                    # no_action; it has no project-access kind yet.
-                    "kind": "project_access",
-                    "input": {
-                        "member_id": intake.member_id,
-                        "project_id": project_id,
-                        "access_level": "write",
-                        "reason": "first-person intake",
-                    },
-                },
-            },
-        )
+    if not runtime.try_begin_submit(chat_key):
+        # A genuinely concurrent sibling call for this exact chat is
+        # already submitting -- never a second submission. The record is
+        # still pending; whichever outcome the in-flight call produces,
+        # the NEXT check-in (or this same reply, from the member's point
+        # of view) will see it via held_proposal_id/finish above.
+        await message.reply_text(_PROPOSAL_RETRY_WAIT_REPLY)
+        return
 
     try:
-        response = await asyncio.to_thread(submit)
-    except Exception as exc:
-        response = {"ok": False, "error": type(exc).__name__}
-
-    result = response.get("result") if isinstance(response, dict) else None
-    proposal_id = None
-    ok = isinstance(response, dict) and response.get("ok") is True
-    if ok and isinstance(result, dict):
-        candidate = result.get("proposal_id") or result.get("id")
-        if isinstance(candidate, str) and candidate.strip():
-            proposal_id = candidate.strip()
-
-    if not ok or proposal_id is None:
-        # Round-2 P0-3: success-shaped no-op forbidden. Never write the
-        # completion marker on a failed (or unidentifiable) submission -- keep
-        # the pending intake exactly as it is, tell the member the truth, log
-        # at WARNING with no answer text and no PII (member/project ids only,
-        # which the operator already holds), and back off before retrying.
-        logger.warning(
-            "mupot plugin: first-person proposal submission failed member_id=%s "
-            "project_id=%s error=%s",
-            intake.member_id,
-            project_id,
-            response.get("error") if isinstance(response, dict) else "unknown",
-        )
-        retry_count = intake.proposal_retry_count + 1
-        runtime.schedule_proposal_retry(
-            chat_key,
-            next_retry_at=clock() + _next_backoff(intake.proposal_retry_count),
-            retry_count=retry_count,
-        )
-        await message.reply_text(
-            await _stall_reply(
-                retry_count=retry_count,
-                member_id=intake.member_id,
-                project_id=project_id,
-                client=client,
-                runtime=runtime,
-                stalled_notifier=stalled_notifier,
-                stall_retry_notifier=stall_retry_notifier,
+        project_id = intake.project_id
+        if not project_id:
+            # Round-3 P2-E / ruling (5): kill the false-success branch. No
+            # project ever resolved (should not normally happen -- question 3
+            # gates on it), but this is a genuine failure, never a completion --
+            # no marker without a real proposal_id, ever. Route it through the
+            # exact same honest-failure-with-retry shape as a failed submission
+            # below: honest reply, WARNING (member_id only, no PII), backoff.
+            logger.warning(
+                "mupot plugin: first-person proposal has no project_id member_id=%s "
+                "-- treating as a failed submission, not completing",
+                intake.member_id,
             )
-        )
-        return
+            retry_count = intake.proposal_retry_count + 1
+            runtime.schedule_proposal_retry(
+                chat_key,
+                next_retry_at=clock() + _next_backoff(intake.proposal_retry_count),
+                retry_count=retry_count,
+            )
+            await message.reply_text(
+                await _stall_reply(
+                    retry_count=retry_count,
+                    member_id=intake.member_id,
+                    project_id=project_id,
+                    client=client,
+                    runtime=runtime,
+                    stalled_notifier=stalled_notifier,
+                    stall_retry_notifier=stall_retry_notifier,
+                )
+            )
+            return
 
-    # mupot-plugin#22 P3 leftover: a stall marker recorded while this
-    # proposal kept failing must not survive its own success -- nothing
-    # previously cleared it, so `stall_entries()` (an audit surface) would
-    # keep showing a member as stalled forever after the fact resolved
-    # itself.
-    runtime.store.clear_stall(intake.member_id)
-    runtime.finish(chat_key, proposal_id=proposal_id)
-    await message.reply_text(_COMPLETE_REPLY)
+        def submit() -> dict[str, Any]:
+            digest = hashlib.sha256(
+                f"first-person:{intake.member_id}:{project_id}".encode("utf-8")
+            ).hexdigest()
+            return client.call(
+                "routine_proposal_submit",
+                {
+                    "version": "routine.proposal/v1",
+                    "run_id": f"first-person-{intake.member_id}",
+                    "project_id": project_id,
+                    "situation_digest": digest,
+                    "summary": "First-person intake: propose write access for a new member.",
+                    "action": {
+                        "key": "first-person-project-access",
+                        # "project_access" is a mupot-side contract dependency --
+                        # see PR body. The live routine_proposal_submit schema
+                        # checked during this build only accepts
+                        # create_task/dispatch_flight/request_review/ask_human/
+                        # no_action; it has no project-access kind yet.
+                        "kind": "project_access",
+                        "input": {
+                            "member_id": intake.member_id,
+                            "project_id": project_id,
+                            "access_level": "write",
+                            "reason": "first-person intake",
+                        },
+                    },
+                },
+            )
+
+        try:
+            response = await asyncio.to_thread(submit)
+        except Exception as exc:
+            response = {"ok": False, "error": type(exc).__name__}
+
+        result = response.get("result") if isinstance(response, dict) else None
+        proposal_id = None
+        ok = isinstance(response, dict) and response.get("ok") is True
+        if ok and isinstance(result, dict):
+            candidate = result.get("proposal_id") or result.get("id")
+            if isinstance(candidate, str) and candidate.strip():
+                proposal_id = candidate.strip()
+
+        if not ok or proposal_id is None:
+            # Round-2 P0-3: success-shaped no-op forbidden. Never write the
+            # completion marker on a failed (or unidentifiable) submission -- keep
+            # the pending intake exactly as it is, tell the member the truth, log
+            # at WARNING with no answer text and no PII (member/project ids only,
+            # which the operator already holds), and back off before retrying.
+            logger.warning(
+                "mupot plugin: first-person proposal submission failed member_id=%s "
+                "project_id=%s error=%s",
+                intake.member_id,
+                project_id,
+                response.get("error") if isinstance(response, dict) else "unknown",
+            )
+            retry_count = intake.proposal_retry_count + 1
+            runtime.schedule_proposal_retry(
+                chat_key,
+                next_retry_at=clock() + _next_backoff(intake.proposal_retry_count),
+                retry_count=retry_count,
+            )
+            await message.reply_text(
+                await _stall_reply(
+                    retry_count=retry_count,
+                    member_id=intake.member_id,
+                    project_id=project_id,
+                    client=client,
+                    runtime=runtime,
+                    stalled_notifier=stalled_notifier,
+                    stall_retry_notifier=stall_retry_notifier,
+                )
+            )
+            return
+
+        # mupot-plugin#22 P3 leftover: a stall marker recorded while this
+        # proposal kept failing must not survive its own success -- nothing
+        # previously cleared it, so `stall_entries()` (an audit surface) would
+        # keep showing a member as stalled forever after the fact resolved
+        # itself.
+        runtime.store.clear_stall(intake.member_id)
+        runtime.finish(chat_key, proposal_id=proposal_id)
+        await message.reply_text(_COMPLETE_REPLY)
+    finally:
+        runtime.end_submit(chat_key)
 
 
 async def _retry_proposal_if_due(
@@ -2630,6 +2800,26 @@ async def _reconcile_pending_with_server(
     exception), this does NOTHING -- it never fabricates a reading,
     positive or negative, the way the old "assume still pending" fallback
     did. Only a reading the server actually gave moves state forward.
+    Pinned by test_reconcile_denied_probe_never_confirms_or_resumes_from_a_
+    fabricated_reading -- reintroducing a locally-derived "assume pending"
+    fallback into the ``resolve()`` call below (mutation M5, round-2 gate
+    #23) would make a denial masquerade as a genuine reading and call
+    ``note_pending()``/``resume()`` from it, which that test catches.
+
+    Round-2-gate (#23) P2-a: a definitive 'complete'/'none' reading (or a
+    member-mismatch, P2-c) suspends capture IMMEDIATELY on the FIRST
+    reading (see :meth:`FirstPersonRuntime.suspend`) -- a member the
+    server has already told us is done/unbound must stop having their
+    ordinary post-completion DMs captured into squad memory the instant
+    reconciliation next runs, not up to ``min_separation`` seconds later.
+    Only the SECOND, separated, confirming reading actually deletes the
+    record (:meth:`FirstPersonRuntime.abandon`). ``min_separation`` is
+    derived from the ACTUAL interval governing how often a fresh reading
+    can happen at this call site -- ``sender_probe_limiter.min_interval``
+    when one is given (reconcile always probes with ``cache=None``, so the
+    limiter is the only thing bounding repeat real probes here), falling
+    back to ``_STATUS_NEGATIVE_TTL_SECONDS`` only when no limiter is
+    configured at all.
     """
 
     def resolve() -> StatusResolution:
@@ -2661,27 +2851,32 @@ async def _reconcile_pending_with_server(
         # NEXT message's reconciliation try again.
         return
 
-    if status.is_pending:
-        if status.member_id != pending.member_id:
-            # A different member now resolves for this chat (e.g. a
-            # rebind) while STILL pending -- never carry progress across
-            # identities. This IS itself the confirming signal (the SAME
-            # probe that just gave us status.member_id also tells us it
-            # isn't pending.member_id) -- no second reading needed.
-            runtime.abandon(chat_key)
-        else:
-            # A genuine, member-matched 'pending' reading -- reset any
-            # partial non-pending sighting from a prior flap.
-            runtime.note_pending(pending.member_id)
+    if status.is_pending and status.member_id == pending.member_id:
+        # A genuine, member-matched 'pending' reading -- reset any partial
+        # non-pending sighting from a prior flap AND clear any suspension
+        # (P2-a/P2-c): a flap back to 'pending' resumes normal capture
+        # immediately, with every engram intact.
+        runtime.note_pending(pending.member_id)
+        runtime.resume(chat_key)
         return
 
-    # Unbound, or a DEFINITIVE 'none'/'complete' -- prune the local AND
-    # durable record only once CONFIRMED (a second non-pending reading,
-    # separated by at least the status-cache TTL -- mupot-plugin#21 P2)
-    # so a flap back to 'pending' before confirmation resumes with every
-    # engram intact.
-    if runtime.note_non_pending(pending.member_id):
+    # Either a DEFINITIVE non-pending reading ('none'/'complete') for the
+    # SAME member, or a different member now resolving here (a rebind) --
+    # both are "member_id is no longer confirmed pending for this chat",
+    # so both go through the SAME confirm-then-act discipline (round-2-
+    # gate #23 P2-c: a mismatch is no longer immediate -- it needs its own
+    # second confirming reading too, and abandon() must never fire off a
+    # single one).
+    separation = (
+        sender_probe_limiter.min_interval if sender_probe_limiter is not None else _STATUS_NEGATIVE_TTL_SECONDS
+    )
+    if runtime.note_non_pending(pending.member_id, min_separation=separation):
         runtime.abandon(chat_key)
+    else:
+        # Unconfirmed -- suspend capture NOW rather than waiting for the
+        # second reading (P2-a): nothing sanitized/stored/replied by
+        # first-person for this chat until confirmed or flapped back.
+        runtime.suspend(chat_key)
 
 
 async def handle_first_contact(
@@ -2727,6 +2922,19 @@ async def handle_first_contact(
     pending member's message has already been handled, so its result can
     only ever change what happens to the NEXT message.
 
+    Round-2-gate (#23) P2-a/P2-c ADDS ONE narrow, deliberate exception to
+    "served from the pending record, always": a record reconciliation has
+    already marked ``suspended`` (a definitive, server-ANSWERED 'complete'/
+    'none'/mismatch reading -- never a probe FAILURE, which is the thing
+    the pipeline invariant above actually guards against) is not served by
+    ``_handle_pending_message`` for THIS message either -- it falls
+    through to the host, same as a genuinely unbound sender, with every
+    engram kept intact in case of a flap back. This is real information,
+    not a failure mode, so it is not a pipeline-invariant violation; it is
+    the fix for a DIFFERENT defect (mupot-plugin#21: a stale local record
+    must not keep capturing a member's ordinary post-completion DMs into
+    squad memory for however long it takes reconciliation to confirm).
+
     Round-2 gate (unaffected by the above -- this is the "no local record"
     path): consumes an update ONLY when the mupot-declared ``intake_state``
     for this sender is ``"pending"`` -- never invented locally. An unbind, a
@@ -2766,19 +2974,31 @@ async def handle_first_contact(
     pending = runtime.get_pending(chat_key)
 
     if pending is not None:
-        handled = await _handle_pending_message(
-            message,
-            chat_key,
-            pending,
-            client=client,
-            runtime=runtime,
-            settings=settings,
-            envelope=envelope,
-            secret_owner=secret_owner,
-            clock=clock,
-            stalled_notifier=stalled_notifier,
-            stall_retry_notifier=stall_retry_notifier,
-        )
+        if pending.suspended:
+            # Round-2-gate (#23) P2-a/P2-c: an UNCONFIRMED definitive
+            # non-pending or member-mismatch reading already suspended
+            # this record (see _reconcile_pending_with_server) -- this
+            # message falls through to the host untouched (nothing
+            # sanitized, credential-checked, stored, or replied here)
+            # exactly like a genuinely unbound/complete sender would.
+            # Reconciliation below still runs -- it may confirm-and-
+            # abandon, or flap back to 'pending' and resume, for the NEXT
+            # message; it can never change what happens to THIS one.
+            handled = False
+        else:
+            handled = await _handle_pending_message(
+                message,
+                chat_key,
+                pending,
+                client=client,
+                runtime=runtime,
+                settings=settings,
+                envelope=envelope,
+                secret_owner=secret_owner,
+                clock=clock,
+                stalled_notifier=stalled_notifier,
+                stall_retry_notifier=stall_retry_notifier,
+            )
         # mupot-plugin#21 P1/P2: reconcile AFTER the fact, never before or
         # during -- see _reconcile_pending_with_server's docstring for why
         # this cannot violate the pipeline invariant no matter what it
@@ -2938,13 +3158,29 @@ def register_first_person(
     stalled_notifier: "_NotifyOncePerWindow | None" = None,
     stall_retry_notifier: "_NotifyOncePerWindow | None" = None,
     clock: Any = time.monotonic,
+    wall_clock: Any = time.time,
 ) -> None:
+    """Round-2-gate (#23) P3: ``clock`` (monotonic) and ``wall_clock``
+    (wall-time) are each threaded to EVERY piece of state this function
+    constructs that keeps its own notion of "now" -- one clock of each
+    kind, never a mix of an injected one here and a silently-defaulted
+    real one there. Previously, a caller injecting a custom ``clock`` only
+    affected the ``handle_first_contact``/``_retry_proposal_if_due``
+    backoff comparisons; the auto-constructed ``FirstPersonRuntime`` still
+    used the REAL ``time.monotonic()`` for its own ``next_proposal_retry_at``
+    recomputation in :meth:`FirstPersonRuntime.start` -- two clocks being
+    compared against each other, silently inconsistent the moment either
+    one wasn't real time. Same reasoning for ``wall_clock`` across
+    ``FirstPersonRuntime`` (completion/journal/stall timestamps) and every
+    ``_NotifyOncePerWindow`` this function constructs (all wall-time-based
+    by design -- their whole point is "not more than once per real-world
+    hour/day", surviving a process restart)."""
     settings.validate()
     if not settings.enabled:
         return
 
     if runtime is None:
-        runtime = FirstPersonRuntime(state_path or default_state_path())
+        runtime = FirstPersonRuntime(state_path or default_state_path(), clock=clock, wall_clock=wall_clock)
     if status_cache is None:
         status_cache = _StatusCache()
     if probe_limiter is None:
@@ -2952,15 +3188,15 @@ def register_first_person(
     if sender_probe_limiter is None:
         sender_probe_limiter = _SenderProbeLimiter()
     if lag_warning_notifier is None:
-        lag_warning_notifier = _NotifyOncePerWindow(_LAG_WARNING_WINDOW_SECONDS)
+        lag_warning_notifier = _NotifyOncePerWindow(_LAG_WARNING_WINDOW_SECONDS, clock=wall_clock)
     if lag_reply_notifier is None:
-        lag_reply_notifier = _NotifyOncePerWindow(_LAG_REPLY_WINDOW_SECONDS)
+        lag_reply_notifier = _NotifyOncePerWindow(_LAG_REPLY_WINDOW_SECONDS, clock=wall_clock)
     if home_wait_notifier is None:
-        home_wait_notifier = _NotifyOncePerWindow(_HOME_NOT_READY_WINDOW_SECONDS)
+        home_wait_notifier = _NotifyOncePerWindow(_HOME_NOT_READY_WINDOW_SECONDS, clock=wall_clock)
     if stalled_notifier is None:
-        stalled_notifier = _NotifyOncePerWindow(_PROPOSAL_STALLED_REPLY_WINDOW_SECONDS)
+        stalled_notifier = _NotifyOncePerWindow(_PROPOSAL_STALLED_REPLY_WINDOW_SECONDS, clock=wall_clock)
     if stall_retry_notifier is None:
-        stall_retry_notifier = _NotifyOncePerWindow(_STALL_ESCALATION_RETRY_WINDOW_SECONDS)
+        stall_retry_notifier = _NotifyOncePerWindow(_STALL_ESCALATION_RETRY_WINDOW_SECONDS, clock=wall_clock)
     wired_applications: list[tuple[Any, Any]] = []
 
     def factory(application: Any, adapter: Any) -> None:

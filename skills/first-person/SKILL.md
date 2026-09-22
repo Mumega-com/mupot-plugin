@@ -10,7 +10,7 @@ description: >
   registered tool for any capability-granting surface. Load this skill only to
   understand, document, or extend the flow -- it is reference material, not a
   script an LLM turn executes live.
-version: "0.9.0"
+version: "0.10.0"
 tools: []
 disallowed_tools:
   - project_squad_set

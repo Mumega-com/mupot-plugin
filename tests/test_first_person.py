@@ -4323,3 +4323,562 @@ def test_mark_quarantined_is_false_for_an_unknown_member(tmp_path: Path) -> None
     runtime = FirstPersonRuntime(tmp_path / "state.json")
     assert runtime.mark_quarantined("member-1", "name") is False
     assert runtime.is_quarantined("member-1", "name") is False
+
+
+# ---------------------------------------------------------------------------
+# mupot-plugin#24 (P1, PR#23 round-2 gate): N1 -- the SERVER-derived
+# "proposal already exists" guard, re-homed into `_submit_proposal` and
+# paired with the existing LOCAL `held_proposal_id` check. Also N4 (finish()
+# early-return must clear_stall), N5 (finish() guards the RECORD, not just
+# the proposal_id field), N11 (lock/held keys aligned on member_id).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_operator_completed_intake_answered_within_the_limiter_window_never_double_submits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """mupot-plugin#24 N1 (P1, severity-corrected: the live schema now
+    ACCEPTS the project_access kind, so this is a real double-proposal, not
+    schema-mitigated). An operator manually completes a stalled intake
+    SERVER-SIDE (the stall task this module's own `_stall_reply` creates
+    prescribes exactly that action) while a local, fully-answered pending
+    record has NOTHING locally recorded yet (`held_proposal_id` is None --
+    this module never itself submitted). The member answers their last
+    question inside the sender limiter's own window. `_submit_proposal`'s
+    OWN local check alone would see nothing and submit a SECOND,
+    independent proposal. The server-derived guard
+    (`_server_confirms_existing_proposal`) must catch this: zero submits,
+    and an honest reply -- never a fabricated `_COMPLETE_REPLY` (this
+    module never learned the server's own proposal_id, so it must never
+    write a completion marker naming one nobody confirmed either).
+    Mutation-provable: removing the `_server_confirms_existing_proposal`
+    call (or its guard) from `_submit_proposal` makes `submit_calls`
+    non-empty and the reply wrong."""
+    client = _client_for_full_intake()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    settings = valid_settings()
+    monkeypatch.setattr("plugin.first_person._resolve_member_project", _default_project_resolver)
+
+    mode = {"phase": "pending"}
+
+    def resolver(_user_id: Any, _chat_id: Any) -> StatusResolution:
+        if mode["phase"] == "pending":
+            return pending_status()
+        # The operator completed the intake server-side -- mupot now
+        # derives intake_state=='complete' from the existence of a
+        # project_access proposal THIS module never itself recorded, and
+        # (as of today) the wire response does not hand the id back.
+        return StatusResolution(
+            bound=True, member_id="member-1", home_squad_id="home-squad-1", intake_state="complete"
+        )
+
+    install_status_stub(monkeypatch, resolver)
+
+    await handle_first_contact(Update(message=Message(text="hello!")), settings=settings, client=client, runtime=runtime)
+    for answer in ["Ada Example", "Engineer", "psychonom", "Ship it"]:  # 4 of 5
+        await handle_first_contact(Update(message=Message(text=answer)), settings=settings, client=client, runtime=runtime)
+    assert runtime.get_pending("123") is not None and runtime.get_pending("123").index == 4
+    assert runtime.held_proposal_id("member-1") is None  # nothing recorded locally, by design
+
+    # The operator's server-side completion becomes visible right as the
+    # member answers the final question -- well within the 15s sender
+    # limiter window, the exact race this closes.
+    mode["phase"] = "complete"
+    last_update = Update(message=Message(text="Nothing else"))
+    await handle_first_contact(last_update, settings=settings, client=client, runtime=runtime)
+
+    submit_calls = [action for action, _ in client.calls if action == "routine_proposal_submit"]
+    assert submit_calls == []  # NEVER a second, independent submission
+    assert last_update.effective_message.replies[-1] == first_person._AWAITING_HUMANS_REPLY  # honest
+    assert last_update.effective_message.replies[-1] != first_person._COMPLETE_REPLY  # never fabricated
+    assert runtime.held_proposal_id("member-1") is None  # no marker without a real id, ever
+
+
+@pytest.mark.asyncio
+async def test_server_derived_guard_removed_lets_the_operator_completed_intake_double_submit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Mutation-regression receipt for the test above: with
+    `_server_confirms_existing_proposal` short-circuited to always return
+    ``None`` (mirroring "the server-derived check was never re-homed"),
+    the exact same scenario DOES double-submit -- this is the RED half of
+    the mutation-provable claim, kept as a standing regression test rather
+    than a one-off manual check."""
+    monkeypatch.setattr("plugin.first_person._server_confirms_existing_proposal", _always_none_server_confirmation)
+    client = _client_for_full_intake()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    settings = valid_settings()
+    monkeypatch.setattr("plugin.first_person._resolve_member_project", _default_project_resolver)
+
+    mode = {"phase": "pending"}
+
+    def resolver(_user_id: Any, _chat_id: Any) -> StatusResolution:
+        if mode["phase"] == "pending":
+            return pending_status()
+        return StatusResolution(
+            bound=True, member_id="member-1", home_squad_id="home-squad-1", intake_state="complete"
+        )
+
+    install_status_stub(monkeypatch, resolver)
+
+    await handle_first_contact(Update(message=Message(text="hello!")), settings=settings, client=client, runtime=runtime)
+    for answer in ["Ada Example", "Engineer", "psychonom", "Ship it"]:
+        await handle_first_contact(Update(message=Message(text=answer)), settings=settings, client=client, runtime=runtime)
+
+    mode["phase"] = "complete"
+    last_update = Update(message=Message(text="Nothing else"))
+    await handle_first_contact(last_update, settings=settings, client=client, runtime=runtime)
+
+    submit_calls = [action for action, _ in client.calls if action == "routine_proposal_submit"]
+    assert len(submit_calls) == 1  # WITHOUT the guard: a real second submission goes out
+    assert last_update.effective_message.replies[-1] == first_person._COMPLETE_REPLY  # falsely "complete"
+
+
+async def _always_none_server_confirmation(*_args: Any, **_kwargs: Any) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_submit_proposal_reuses_the_servers_own_proposal_id_when_the_probe_returns_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The companion happy-path to the two tests above: once mupot's wire
+    contract DOES hand back a proposal_id alongside intake_state=='complete'
+    (StatusResolution.proposal_id), `_submit_proposal`'s server-derived
+    guard reuses it via `finish()` exactly like the local held-proposal
+    path does -- never submits, and the reply is the normal complete one,
+    not the honest-but-incomplete `_AWAITING_HUMANS_REPLY`."""
+    client = _client_for_full_intake()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    settings = valid_settings()
+    monkeypatch.setattr("plugin.first_person._resolve_member_project", _default_project_resolver)
+
+    mode = {"phase": "pending"}
+
+    def resolver(_user_id: Any, _chat_id: Any) -> StatusResolution:
+        if mode["phase"] == "pending":
+            return pending_status()
+        return StatusResolution(
+            bound=True,
+            member_id="member-1",
+            home_squad_id="home-squad-1",
+            intake_state="complete",
+            proposal_id="proposal-FROM-SERVER",
+        )
+
+    install_status_stub(monkeypatch, resolver)
+
+    await handle_first_contact(Update(message=Message(text="hello!")), settings=settings, client=client, runtime=runtime)
+    for answer in ["Ada Example", "Engineer", "psychonom", "Ship it"]:
+        await handle_first_contact(Update(message=Message(text=answer)), settings=settings, client=client, runtime=runtime)
+
+    mode["phase"] = "complete"
+    last_update = Update(message=Message(text="Nothing else"))
+    await handle_first_contact(last_update, settings=settings, client=client, runtime=runtime)
+
+    submit_calls = [action for action, _ in client.calls if action == "routine_proposal_submit"]
+    assert submit_calls == []  # reused the server's own id, never submitted
+    assert last_update.effective_message.replies[-1] == first_person._COMPLETE_REPLY
+    assert runtime.held_proposal_id("member-1") == "proposal-FROM-SERVER"
+
+
+@pytest.mark.asyncio
+async def test_submit_proposal_local_held_proposal_reuse_clears_a_stale_stall_marker(tmp_path: Path) -> None:
+    """mupot-plugin#24 N4: the LOCAL held-proposal early-return in
+    `_submit_proposal` (a proposal this module already recorded, reused
+    via `finish()`) must ALSO clear any stall marker raised while the SAME
+    proposal was still failing -- mupot-plugin#22 only fixed this on the
+    fresh-success path; the held-proposal early-return is a COMPLETELY
+    different branch and never called `clear_stall()`, so the stall marker
+    (and the audit surface reading it) kept claiming this member was
+    stalled even after "I've sent your access request" had already gone
+    out via this exact reuse path. Mutation-provable: removing the
+    `runtime.store.clear_stall(intake.member_id)` call from THIS branch
+    (not the fresh-success one, which mupot-plugin#22 already pins
+    separately) makes the final assertion go red."""
+    from plugin.first_person import _submit_proposal
+
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps({"completed": {"member-1": {"engram_ids": {}, "proposal_id": "proposal-1", "completed_at": 0.0}}})
+    )
+    runtime = FirstPersonRuntime(state_path)
+    runtime.store.record_stall("member-1", 4, 0.0)
+    assert "member-1" in runtime.store.stall_entries()
+
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    intake = runtime.record_answer("123", "name", "engram-x")
+    assert intake is not None
+    client = FakeClient()
+    update = Update(message=Message(text="anything"))
+
+    await _submit_proposal(update.effective_message, "123", intake, client=client, runtime=runtime)
+
+    assert update.effective_message.replies[-1] == first_person._COMPLETE_REPLY
+    assert client.calls == []  # never attempted a submit -- reused the held id
+    assert "member-1" not in runtime.store.stall_entries()  # N4: cleared here too
+
+
+def test_finish_never_overwrites_the_record_on_a_matching_proposal_id(tmp_path: Path) -> None:
+    """mupot-plugin#24 N5 (correcting a round-2-gate-(#23) P1 bug):
+    `finish()`'s never-overwrite guard previously fired ONLY when the
+    incoming ``proposal_id`` DIFFERED from the one already recorded -- on
+    a MATCHING id (exactly the shape `_submit_proposal`'s own reuse path
+    produces on every normal re-check-in for an already-complete member:
+    `held_proposal_id(...)` -> `finish(chat_key, proposal_id=that_same_id)`)
+    it fell through and overwrote `completed[member_id]` WHOLESALE --
+    replacing the original ``completed_at`` and any ``quarantined`` flags
+    with a fresh, empty-looking record. Guard the RECORD, not the field.
+    Mutation-provable: reverting to the old ``existing_proposal_id !=
+    new_proposal_id`` gate makes the equality assertion below go red (the
+    record would come back with a NEW completed_at and no quarantined
+    list)."""
+    state_path = tmp_path / "state.json"
+    original_record = {
+        "engram_ids": {"name": "engram-orig"},
+        "proposal_id": "proposal-1",
+        "completed_at": 111.0,
+        "quarantined": ["notes"],
+    }
+    state_path.write_text(json.dumps({"completed": {"member-1": dict(original_record)}}))
+    runtime = FirstPersonRuntime(state_path, wall_clock=lambda: 999.0)
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    runtime.record_answer("123", "name", "engram-NEW")  # a fresh episode's own (different) engram
+
+    runtime.finish("123", proposal_id="proposal-1")  # matching id -- the normal reuse shape
+
+    data = json.loads(state_path.read_text())
+    assert data["completed"]["member-1"] == original_record  # UNTOUCHED, byte for byte
+    assert "member-1" not in data.get("in_progress", {})  # in-progress record still cleared
+    assert runtime.get_pending("123") is None
+
+
+def test_submit_proposal_in_flight_lock_and_held_proposal_check_share_the_member_id_key(tmp_path: Path) -> None:
+    """mupot-plugin#24 N11: `try_begin_submit`/`end_submit` (the in-flight
+    submission lock) and `held_proposal_id` (the durable-proposal check)
+    must be mutually exclusive on the SAME axis -- member_id -- not one on
+    member_id and the other on chat_key. Direct check: begin a submit
+    "in flight" keyed by member_id, then confirm a DIFFERENT chat_key
+    resolving to the SAME member_id is correctly seen as already
+    in-flight (the alignment this closes), while a genuinely different
+    member_id is not blocked at all."""
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    assert runtime.try_begin_submit("member-1") is True
+    # A second chat_key for the SAME member must see the in-flight lock.
+    assert runtime.try_begin_submit("member-1") is False
+    # A different member entirely is never blocked by member-1's lock.
+    assert runtime.try_begin_submit("member-2") is True
+    runtime.end_submit("member-1")
+    assert runtime.try_begin_submit("member-1") is True
+
+
+@pytest.mark.asyncio
+async def test_submit_proposal_from_two_different_chat_keys_for_the_same_member_submits_once(
+    tmp_path: Path,
+) -> None:
+    """mupot-plugin#24 N11, exercised through `_submit_proposal` itself
+    (not only the primitive lock methods above): two genuinely concurrent
+    `_submit_proposal` calls for the SAME member but DIFFERENT chat_keys
+    (a rebind, or any future multi-surface path resolving the same
+    member) must still only ever let ONE of them actually call
+    `routine_proposal_submit` -- the in-flight lock is keyed by
+    `intake.member_id`, not `chat_key`. Mutation-provable: reverting
+    `try_begin_submit`/`end_submit`'s call sites in `_submit_proposal`
+    back to `chat_key` makes `submit_calls` reach 2 (one per chat_key)."""
+    import threading
+
+    from plugin.first_person import _submit_proposal
+
+    release = threading.Event()
+
+    class _BlockingClient(FakeClient):
+        def call(self, action: str, args: dict[str, Any]) -> Any:
+            self.calls.append((action, dict(args)))
+            if action == "routine_proposal_submit":
+                assert release.wait(timeout=5.0), "test setup did not release in time"
+                return {"ok": True, "result": {"proposal_id": "proposal-1"}}
+            return {"ok": True, "result": {}}
+
+    client = _BlockingClient()
+    runtime = FirstPersonRuntime(tmp_path / "state.json")
+    # Two DIFFERENT chat_keys, the SAME member -- e.g. a rebind mid-flight.
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    runtime.set_project_id("123", "proj-1")
+    intake_a = None
+    for question_id, _ in FIRST_PERSON_QUESTIONS:
+        intake_a = runtime.record_answer("123", question_id, f"engram-{question_id}")
+    runtime.start("456", member_id="member-1", home_squad_id="home-squad-1")
+    runtime.set_project_id("456", "proj-1")
+    intake_b = None
+    for question_id, _ in FIRST_PERSON_QUESTIONS:
+        intake_b = runtime.record_answer("456", question_id, f"engram-{question_id}")
+    assert intake_a is not None and intake_b is not None
+    assert intake_a.member_id == intake_b.member_id == "member-1"
+
+    async def call_submit(chat_key: str, intake: Intake) -> Update:
+        update = Update(message=Message(text="anything"))
+        await _submit_proposal(update.effective_message, chat_key, intake, client=client, runtime=runtime)
+        return update
+
+    task1 = asyncio.create_task(call_submit("123", intake_a))
+    await asyncio.sleep(0.05)  # let task1 reach the blocked submit() call
+    task2 = asyncio.create_task(call_submit("456", intake_b))
+    await asyncio.sleep(0.05)  # let task2 run its own (non-blocking) try_begin_submit check
+    release.set()
+    update1, update2 = await asyncio.gather(task1, task2)
+
+    submit_calls = [action for action, _ in client.calls if action == "routine_proposal_submit"]
+    assert len(submit_calls) == 1  # only ONE real submission, ever, for this member
+    assert update1.effective_message.replies[-1] == first_person._COMPLETE_REPLY
+    assert update2.effective_message.replies[-1] == _PROPOSAL_RETRY_WAIT_REPLY
+
+
+# ---------------------------------------------------------------------------
+# mupot-plugin#25 (P2, PR#23 round-2 gate): N2 (flap tolerance is its own
+# constant, never the sender limiter's interval), N6 (abandon() is
+# disk-first, and every reconcile mutation shares the probe's try/except).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reconcile_flap_tolerance_is_its_own_constant_not_the_sender_limiter_interval(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """mupot-plugin#25 N2 (P2, regression vs a649c196): `_reconcile_pending_
+    with_server`'s confirm-then-abandon separation must be the dedicated
+    `_FLAP_TOLERANCE_SECONDS` constant (>= the status-cache negative TTL,
+    300s), NEVER derived from `sender_probe_limiter.min_interval`
+    (anti-replay, 15s -- a completely different duty). A 20-second
+    transient server flap to 'complete' must resume with every engram
+    intact -- the SECOND reading, 20s after the first, must NOT confirm
+    and abandon the record. Mutation-provable (mutation MJ): reverting the
+    separation back to `sender_probe_limiter.min_interval` makes the
+    `still_suspended` assertions below go red -- the record (and its
+    engram) would already be gone by the third call."""
+    from plugin.first_person import _reconcile_pending_with_server
+
+    fake_clock = {"now": 0.0}
+    runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    pending = runtime.record_answer("123", "name", "engram-name")
+    assert pending is not None and pending.index == 1
+
+    settings = valid_settings()
+    # A REAL sender limiter at its actual production interval (15s) -- if
+    # reconcile's flap-tolerance separation were still (incorrectly)
+    # derived from THIS, 20 elapsed seconds would already be enough to
+    # confirm-and-abandon at the second reading.
+    sender_probe_limiter = _SenderProbeLimiter(min_interval=first_person._SENDER_PROBE_MIN_INTERVAL_SECONDS)
+
+    mode = {"phase": "complete"}
+
+    def resolver(_user_id: Any, _chat_id: Any) -> StatusResolution:
+        if mode["phase"] == "complete":
+            return COMPLETE_STATUS
+        return pending_status()
+
+    install_status_stub(monkeypatch, resolver)
+
+    # First reading: complete -- unconfirmed, suspends.
+    await _reconcile_pending_with_server(
+        "123",
+        123,
+        123,
+        pending,
+        settings=settings,
+        secret_owner=None,
+        runtime=runtime,
+        status_cache=None,
+        probe_limiter=None,
+        sender_probe_limiter=sender_probe_limiter,
+    )
+    suspended = runtime.get_pending("123")
+    assert suspended is not None and suspended.suspended is True
+
+    # 20 seconds later -- past the OLD (buggy) 15s separation, well short
+    # of the fixed 300s one. Second reading: still complete.
+    fake_clock["now"] += 20.0
+    await _reconcile_pending_with_server(
+        "123",
+        123,
+        123,
+        suspended,
+        settings=settings,
+        secret_owner=None,
+        runtime=runtime,
+        status_cache=None,
+        probe_limiter=None,
+        sender_probe_limiter=sender_probe_limiter,
+    )
+    still_suspended = runtime.get_pending("123")
+    assert still_suspended is not None and still_suspended.suspended is True  # NOT confirmed at 20s
+    assert still_suspended.engrams == {"name": "engram-name"}  # nothing lost
+
+    # Flaps back to pending -- resumes with every engram intact.
+    mode["phase"] = "pending"
+    fake_clock["now"] += 1.0
+    await _reconcile_pending_with_server(
+        "123",
+        123,
+        123,
+        still_suspended,
+        settings=settings,
+        secret_owner=None,
+        runtime=runtime,
+        status_cache=None,
+        probe_limiter=None,
+        sender_probe_limiter=sender_probe_limiter,
+    )
+    resumed = runtime.get_pending("123")
+    assert resumed is not None and resumed.suspended is False
+    assert resumed.engrams == {"name": "engram-name"}  # survived the whole flap
+
+
+def test_abandon_is_disk_first_keeps_the_in_memory_record_when_the_disk_write_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mupot-plugin#25 N6: `abandon()` must clear the durable record BEFORE
+    dropping the in-memory one. The previous order popped the in-memory
+    record FIRST and only then attempted the durable clear; an ``OSError``
+    from that disk write (a full disk, a permissions change, any
+    transient I/O failure) then left memory gone while the durable record
+    it never actually cleared survived -- the exact split this method's
+    own docstring says it exists to prevent, just relocated one call
+    earlier. Mutation-provable: reverting to pop-then-clear makes the
+    final assertion go red (the in-memory record would already be gone by
+    the time the ``OSError`` propagates)."""
+    from plugin.first_person import FirstPersonStateStore
+
+    state_path = tmp_path / "state.json"
+    runtime = FirstPersonRuntime(state_path)
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    runtime.record_answer("123", "name", "engram-1")
+    assert runtime.get_pending("123") is not None
+
+    def raise_oserror(self: Any, value: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(FirstPersonStateStore, "save", raise_oserror)
+
+    with pytest.raises(OSError):
+        runtime.abandon("123")
+
+    # The failed disk write must leave the in-memory record fully intact.
+    assert runtime.get_pending("123") is not None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_wraps_an_abandon_disk_failure_never_reaching_the_host_handler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mupot-plugin#25 N6: `_reconcile_pending_with_server` wraps EVERY
+    mutation it makes (`note_pending`/`resume`/`note_non_pending`/
+    `suspend`/`abandon`) in the SAME try/except guarding its own probe --
+    not only the probe itself. `FirstPersonRuntime.abandon()` performs
+    durable disk I/O and can raise ``OSError``; letting that escape this
+    function would violate reconcile's own stated invariant ("cannot
+    violate the pipeline invariant no matter ... how it fails") by
+    propagating past `handle_first_contact` into the host's own
+    update-dispatch loop. Mutation-provable: narrowing the try/except back
+    to only the `resolve()` call makes this test raise ``OSError``
+    instead of completing normally."""
+    from plugin.first_person import FirstPersonStateStore, _reconcile_pending_with_server
+
+    fake_clock = {"now": 0.0}
+    runtime = FirstPersonRuntime(tmp_path / "state.json", clock=lambda: fake_clock["now"])
+    runtime.start("123", member_id="member-1", home_squad_id="home-squad-1")
+    # A real durable in-progress record must exist for _clear_in_progress
+    # to actually attempt (and fail) a disk write inside abandon().
+    pending = runtime.record_answer("123", "name", "engram-1")
+    assert pending is not None
+    settings = valid_settings()
+
+    install_status_stub(monkeypatch, lambda *_: UNBOUND_STATUS)
+
+    # First (unconfirmed) reading -- suspend() is in-memory only, so this
+    # call succeeds normally, before the disk write is ever made to fail.
+    await _reconcile_pending_with_server(
+        "123",
+        123,
+        123,
+        pending,
+        settings=settings,
+        secret_owner=None,
+        runtime=runtime,
+        status_cache=None,
+        probe_limiter=None,
+        sender_probe_limiter=None,
+    )
+    suspended = runtime.get_pending("123")
+    assert suspended is not None and suspended.suspended is True
+
+    # NOW make the durable clear fail -- the second, confirming reading
+    # below will call abandon(), whose disk write raises OSError.
+    def raise_oserror(self: Any, value: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(FirstPersonStateStore, "save", raise_oserror)
+
+    fake_clock["now"] += first_person._FLAP_TOLERANCE_SECONDS
+    await _reconcile_pending_with_server(  # must complete normally -- never raise
+        "123",
+        123,
+        123,
+        suspended,
+        settings=settings,
+        secret_owner=None,
+        runtime=runtime,
+        status_cache=None,
+        probe_limiter=None,
+        sender_probe_limiter=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# mupot-plugin#25 N7/N8: register_first_person's ONE-CLOCK wiring extended
+# to `_StatusCache`/`_SenderProbeLimiter` (already pinned for
+# FirstPersonRuntime/the five notifiers by
+# test_register_first_person_threads_clock_through_to_handle_first_contact).
+# ---------------------------------------------------------------------------
+
+
+def test_register_first_person_threads_the_injected_clock_into_status_cache_and_sender_limiter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """mupot-plugin#25 N7/N8: `_StatusCache` and `_SenderProbeLimiter` are
+    ALSO monotonic-clock-based (TTL sweeps / the sender min-interval) but
+    were left on their own default ``time.monotonic`` inside
+    `register_first_person` -- an injected ``clock`` reached
+    `FirstPersonRuntime` and every backoff comparison, but NOT these two,
+    so the runtime's own gate decisions and the cache/limiter calibrating
+    those SAME decisions ran on two different clocks the moment the
+    injected one diverged from real time at all. Mutation-provable:
+    dropping either `clock=clock` kwarg inside `register_first_person`
+    makes the corresponding assertion below go red (the captured `clock`
+    would be the real ``time.monotonic`` instead of the fake sentinel)."""
+    captured: dict[str, Any] = {}
+    fake_clock: Callable[[], float] = lambda: 42.0
+
+    class _RecordingStatusCache(_StatusCache):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            captured["status_cache_clock"] = kwargs.get("clock")
+            super().__init__(*args, **kwargs)
+
+    class _RecordingSenderProbeLimiter(_SenderProbeLimiter):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            captured["sender_limiter_clock"] = kwargs.get("clock")
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr("plugin.first_person._StatusCache", _RecordingStatusCache)
+    monkeypatch.setattr("plugin.first_person._SenderProbeLimiter", _RecordingSenderProbeLimiter)
+
+    ctx = types.SimpleNamespace(
+        register_telegram_handler=lambda factory: None, on_unload=lambda fn: None, _manager=None
+    )
+    register_first_person(
+        ctx, valid_settings(), client=FakeClient(), state_path=tmp_path / "state.json", clock=fake_clock
+    )
+
+    assert captured["status_cache_clock"] is fake_clock
+    assert captured["sender_limiter_clock"] is fake_clock

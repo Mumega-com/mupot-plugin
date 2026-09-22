@@ -49,6 +49,52 @@ OPERATOR_ACTIONS = frozenset(
 # tracking follow-up issue for a presser-scoped replacement.)
 VERDICT_ACTIONS = frozenset({"task_verdict"})
 
+# first_person.py's deterministic intake handler calls these directly through
+# MupotOperatorClient.call() -- same "own frozenset, never a registered LLM tool"
+# shape as VERDICT_ACTIONS above, for the same reason: Mubot (the model) must
+# never be ABLE to reach these, not merely instructed not to. register_operator_tools
+# below never maps any of these to a tool name, so there is no registered
+# surface for a model to call even if it tried. Deliberately excludes
+# project_squad_set / grant_agent_capability / grant_gate_capability / any other
+# manage_access surface -- first_person.py proposes access via
+# routine_proposal_submit, it never grants it. Pinned by
+# tests/test_first_person.py::test_first_person_actions_exclude_every_manage_access_surface
+# and ::test_first_person_actions_are_never_registered_as_llm_tools.
+#
+# Round 3 (kasra/first-person-skill-v2, 2026-09-21): "create_home_for_member"
+# and "resolve_member_project" were REMOVED from this set. Both were verified
+# by reading mupot's kasra/fp01-slice2-proposal-chain branch directly to have
+# no exposed MCP action of that name at all -- create_home_for_member is an
+# internal TypeScript function (src/org/service.ts) called only by that
+# repo's own unit tests, and project resolution instead lives on the
+# authenticated `/im/resolve-project` surface (same shared secret as
+# `/im/webhook`, envelope-derived identity per Athena's ruling on that
+# route's fence) that first_person.py's `_resolve_member_project` calls
+# directly via urllib -- never through this operator-actions allowlist.
+# Calling either of these two names through MupotOperatorClient.call() would
+# just get `action_not_allowed`; keeping dead names in this set would be
+# actively misleading about what this module can reach.
+#
+# Round-3-gate-4 P1-a (2026-09-21, adversarial round 1 on PR#20): "task_create"
+# was ADDED here specifically so the module's _PROPOSAL_STALLED_REPLY claim
+# ("I've flagged it so a human can look") is TRUE -- a prior build sent that
+# exact sentence with no receiver anywhere, which is fabricating a receipt on
+# a human-decision channel. This is still not a grant/manage_access surface
+# (it creates a plain task item in THIS OPERATOR's own squad -- see
+# first_person.py's _stall_reply -- never in the member's home_squad_id,
+# never anything squad_remember/routine_proposal_submit couldn't already
+# tell an operator watching the board); it is the SAME action
+# OPERATOR_ACTIONS already exposes to an LLM-driven agent turn elsewhere in
+# this plugin, scoped here to one fixed, deterministic call shape this
+# module's own code controls end to end, never model-composed.
+FIRST_PERSON_ACTIONS = frozenset(
+    {
+        "squad_remember",
+        "routine_proposal_submit",
+        "task_create",
+    }
+)
+
 MANAGER_LIFECYCLE_ACTIONS = frozenset(
     {
         "agent_manager_status",
@@ -282,6 +328,7 @@ class MupotOperatorClient:
             action not in OPERATOR_ACTIONS
             and action not in MANAGER_ACTIONS
             and action not in VERDICT_ACTIONS
+            and action not in FIRST_PERSON_ACTIONS
         ):
             return {"ok": False, "error": "action_not_allowed", "action": action}
         if action in MANAGER_ACTIONS and not self.settings.agent_manager_enabled:

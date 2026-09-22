@@ -1,3 +1,8 @@
 # Keep these exact pins aligned with the Hermes runtime used by native CI.
 pytest==9.1.1
 pytest-asyncio==1.3.0
+# tests/test_first_person.py parses skills/first-person/SKILL.md's YAML
+# frontmatter (questions/tools/disallowed_tools parity checks) -- pin matches
+# hermes-agent's own pyproject.toml pin (pyyaml==6.0.3) for the same reason
+# the pytest pins above are kept aligned with native CI.
+pyyaml==6.0.3

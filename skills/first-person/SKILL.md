@@ -297,8 +297,8 @@ skills:
 ```
 
 **G-FP3 assertion** (what to actually check on the live gateway, not what to
-assume): `hermes plugins show mupot` reports version `0.8.0` (bumped in this
-PR) at the installed git rev, and `hermes skills list` shows `mupot:first-person`
+assume): `hermes plugins show mupot` reports the version pinned in `plugin.yaml`
+(`0.12.0` at the merge of #23 -- bump this line with every release) at the installed git rev, and `hermes skills list` shows `mupot:first-person`
 present. SKILL.md's own `version:` frontmatter field is documentation only --
 nothing in Hermes parses it; the plugin-level version + git rev is the only
 queryable pin.

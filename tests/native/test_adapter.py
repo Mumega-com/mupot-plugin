@@ -2072,6 +2072,7 @@ def test_gateway_status_survives_real_hermes_registry_dispatch(tmp_path: Path) -
             "lease_reconciliation": {"required": False, "attempt_id": None},
             "invalid_reply_receipts": [],
             "reply_reconciliation_required": False,
+            "sse_wake": {"enabled": False},
         }
     finally:
         registry.deregister(tool_name)

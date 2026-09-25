@@ -12,7 +12,7 @@ import re
 import secrets
 import time
 from collections import deque
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -37,6 +37,12 @@ from ..profile_scope import (
     require_supported_profile_runtime,
 )
 from . import human_origin as _human_origin
+from .sse_wake import (
+    InboxStreamWaker,
+    SSEHTTPError,
+    capped_lines,
+    stream_url_from_mcp_url,
+)
 from .human_origin import register as register_human_origin_hooks
 from .lease_ownership import (
     ATTEMPT_ID_RE as _LEASE_ATTEMPT_ID_RE,
@@ -251,6 +257,12 @@ class _DeliveryDeferred(_EstopDeferred):
 # class for its original, narrower scope (lease expiry only). Same class --
 # `isinstance`/`pytest.raises(_LeaseExpiredDeferred)` still work unchanged.
 _LeaseExpiredDeferred = _DeliveryDeferred
+
+
+# The only lease-cycle failure points proven to precede any turn for the
+# attempt (see `_poll_loop_body`). The in-process self-heal is allowed ONLY
+# for these; every other failure keeps the durable quarantine.
+_PRE_TURN_HEAL_POINTS = frozenset({"inbox_lease", "lease_validation"})
 
 
 def _protocol_error() -> MupotProtocolError:
@@ -1246,6 +1258,34 @@ class MupotAdapter(BasePlatformAdapter):
         if not isinstance(routine_events_enabled, bool):
             raise ValueError("routine_events_enabled must be a boolean")
         self.routine_events_enabled = routine_events_enabled
+        # Event-based wake (off by default). See mupot_gateway/sse_wake.py: the
+        # stream only ever wakes the lease loop below; it never consumes.
+        sse_wake_enabled = extra.get("sse_wake_enabled", False)
+        if not isinstance(sse_wake_enabled, bool):
+            raise ValueError("sse_wake_enabled must be a boolean")
+        self.sse_wake_enabled = sse_wake_enabled
+        # While the stream is healthy the timed poll is only a safety net.
+        self.sse_safety_poll_interval = max(
+            self.poll_interval,
+            float(extra.get("sse_safety_poll_interval") or 60.0),
+        )
+        self.sse_idle_timeout = max(5.0, float(extra.get("sse_idle_timeout") or 45.0))
+        self.sse_backoff_cap = max(1.0, float(extra.get("sse_backoff_cap") or 60.0))
+        sse_poll_ms = extra.get("sse_poll_ms")
+        self.sse_poll_ms = int(sse_poll_ms) if sse_poll_ms else None
+        sse_url = extra.get("sse_url")
+        # Validated up front so a bad override fails loudly at construction,
+        # not silently inside a background reconnect loop.
+        self.sse_url = stream_url_from_mcp_url(str(sse_url)) if sse_url else None
+        # Automatic in-process retry of the bounded lease self-heal after a
+        # quarantine (same call connect() makes at startup, execute_leased=False).
+        self.lease_self_heal_interval = max(
+            0.01, float(extra.get("lease_self_heal_interval") or 60.0)
+        )
+        self.lease_self_heal_cap = max(
+            self.lease_self_heal_interval,
+            float(extra.get("lease_self_heal_cap") or 900.0),
+        )
         self.message_injector = message_injector
         # self._secret_owner was already set above, before the lease_seconds
         # resolution -- see the P1-5 comment there.
@@ -1298,6 +1338,11 @@ class MupotAdapter(BasePlatformAdapter):
         self._client = client_factory(self.server_name)
         self._send_client = client_factory(self.server_name)
         self._poll_task: Optional[asyncio.Task] = None
+        # SSE wake: the waker sets this; the poll loop's idle wait awaits it.
+        self._wake_event = asyncio.Event()
+        self._sse_waker: Optional[InboxStreamWaker] = None
+        self._sse_task: Optional[asyncio.Task] = None
+        self._lease_self_heal_task: Optional[asyncio.Task] = None
         self._delivery_generation = 0
         self._live_generations: dict[int, _LiveDelivery] = {}
         self._consumer_fence: Optional[dict[str, Any]] = None
@@ -2130,10 +2175,12 @@ class MupotAdapter(BasePlatformAdapter):
             self._poll_task = asyncio.create_task(
                 self._poll_loop(), name="hermes-mupot-inbox-poller"
             )
+            self._start_sse_wake()
             logger.info(
-                "[mupot] connected consumer_mode=%s allowed=%s",
+                "[mupot] connected consumer_mode=%s allowed=%s sse_wake=%s",
                 fence.get("mode"),
                 sorted(self.allowed_agents),
+                self.sse_wake_enabled,
             )
             return True
         except Exception as exc:
@@ -2151,6 +2198,11 @@ class MupotAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._running = False
+        heal, self._lease_self_heal_task = self._lease_self_heal_task, None
+        if heal is not None and heal is not asyncio.current_task():
+            heal.cancel()
+            await asyncio.gather(heal, return_exceptions=True)
+        await self._stop_sse_wake()
         live = list(self._live_generations.values())
         for runtime in live:
             self._invalidate_delivery(runtime)
@@ -2457,7 +2509,228 @@ class MupotAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         return True
 
+    # -- event-based wake (SSE) ---------------------------------------------
+    #
+    # The stream is a HINT, never custody. `_signal_wake` only sets an
+    # asyncio.Event that `_idle_wait` awaits between lease attempts; every
+    # consume/ack/turn still happens on the unchanged lease path in
+    # `_poll_loop`, so the durable lease fence, reply outbox, e-stop gates and
+    # sender fence all hold exactly as before. A forged or duplicated wake
+    # costs one extra `inbox_lease` that comes back empty.
+
+    def _signal_wake(self) -> None:
+        self._wake_event.set()
+
+    def _resolve_stream_url(self) -> str:
+        if self.sse_url:
+            return self.sse_url
+        from hermes_cli.config import load_config
+        from hermes_cli.mcp_config import _resolve_mcp_server_config
+
+        raw_cfg = (load_config().get("mcp_servers") or {}).get(self.server_name)
+        if not isinstance(raw_cfg, dict):
+            raise RuntimeError(f"MCP server {self.server_name!r} is not configured")
+        url = _resolve_mcp_server_config(raw_cfg).get("url")
+        if not url:
+            raise RuntimeError(f"MCP server {self.server_name!r} missing url")
+        return stream_url_from_mcp_url(str(url))
+
+    @asynccontextmanager
+    async def _open_inbox_stream(self, since: Optional[int]):
+        """GET /api/inbox/stream with the agent bearer; yields decoded lines.
+
+        URL and token are resolved inside this adapter's profile scope on every
+        (re)connect -- rotation is observed and `.env` never leaks into the
+        ambient process (same rule as HermesMCPClient). The token is never
+        logged; failures are logged by exception class only.
+        """
+        with self._profile_scope():
+            require_supported_profile_runtime({})
+            url = self._resolve_stream_url()
+            token = read_profile_secret("MUPOT_AGENT_TOKEN")
+        params: dict[str, str] = {}
+        if since is not None:
+            params["since"] = str(since)
+        if self.sse_poll_ms:
+            params["poll_ms"] = str(self.sse_poll_ms)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Accept-Encoding": "identity",
+        }
+        del token
+        timeout = httpx.Timeout(self.rpc_timeout, read=None)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("GET", url, params=params, headers=headers) as response:
+                if response.status_code != 200:
+                    raise SSEHTTPError(response.status_code)
+                yield capped_lines(response.aiter_bytes())
+
+    def _start_sse_wake(self) -> None:
+        if not self.sse_wake_enabled:
+            return
+        self._halt_sse_wake()
+        waker = InboxStreamWaker(
+            opener=self._open_inbox_stream,
+            on_wake=self._signal_wake,
+            idle_timeout=self.sse_idle_timeout,
+            backoff_cap=self.sse_backoff_cap,
+        )
+        self._sse_waker = waker
+        self._sse_task = asyncio.create_task(
+            waker.run(), name="hermes-mupot-inbox-sse-wake"
+        )
+
+    def _halt_sse_wake(self) -> Optional[asyncio.Task]:
+        waker, self._sse_waker = self._sse_waker, None
+        task, self._sse_task = self._sse_task, None
+        if waker is not None:
+            waker.stop()
+        if task is not None and not task.done():
+            task.cancel()
+        return task
+
+    async def _stop_sse_wake(self) -> None:
+        task = self._halt_sse_wake()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+
+    def sse_wake_status(self) -> dict[str, Any]:
+        waker = self._sse_waker
+        if not self.sse_wake_enabled:
+            return {"enabled": False}
+        if waker is None:
+            return {"enabled": True, "running": False}
+        return {
+            "enabled": True,
+            "running": True,
+            "healthy": waker.healthy(),
+            "last_seq": waker.last_seq,
+            "wakes": waker.wakes,
+            "consecutive_failures": waker.failures,
+        }
+
+    async def _idle_wait(self, found_work: bool) -> None:
+        """Sleep between lease attempts; an SSE wake cuts it short.
+
+        Without SSE this is exactly the historical `asyncio.sleep(poll_interval)`.
+        With a healthy stream the timed poll is a slow safety net
+        (`sse_safety_poll_interval`); right after a lease that found work, or
+        while the stream is down, the configured `poll_interval` applies, so a
+        backlog drains at the old pace and a dead stream degrades to polling.
+        """
+        waker = self._sse_waker
+        if waker is None:
+            await asyncio.sleep(self.poll_interval)
+            return
+        timeout = (
+            self.poll_interval
+            if found_work or not waker.healthy()
+            else self.sse_safety_poll_interval
+        )
+        try:
+            await asyncio.wait_for(self._wake_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        # Cleared BEFORE the next lease: a wake that lands while that lease is
+        # being processed stays set and makes the following wait return at once.
+        self._wake_event.clear()
+
+    # -- automatic lease self-heal ------------------------------------------
+
+    def _schedule_lease_self_heal(self) -> None:
+        """Retry connect()'s bounded self-heal in-process after a quarantine.
+
+        Before this, a single failed `inbox_lease` (e.g. an rpc_timeout on the
+        lease call, 2026-09-17 10:05Z) quarantined the poll loop and receive
+        stayed dead until the next gateway restart ran the SAME self-heal in
+        connect(). This runs that identical call -- `execute_leased=False`, so
+        it never re-executes a turn; a still-leased attempt stays fenced and is
+        simply retried after its server lease expires -- with capped backoff.
+        Only for the attempt-scoped marker it can actually reconcile.
+        """
+        marker = _lease_reconciliation_proof(self._state.get("lease_reconciliation"))
+        if (
+            marker is None
+            or marker.get("version") != _LEASE_ATTEMPT_MARKER_VERSION
+            or (self._lease_self_heal_task is not None and not self._lease_self_heal_task.done())
+        ):
+            return
+        self._lease_self_heal_task = asyncio.create_task(
+            self._lease_self_heal_loop(), name="hermes-mupot-lease-self-heal"
+        )
+
+    async def _lease_self_heal_loop(self) -> None:
+        """Heal, then reconnect; never exit deaf.
+
+        Phase 1 (quarantined): bounded reconcile with capped backoff. If the
+        quarantine is lifted by someone else (an operator's own
+        `reconcile_inbox_polling()`), return -- that caller owns reconnect.
+        Phase 2 (healed HERE): reconnect until connect() succeeds. A failed
+        reconnect is never a silent exit (PR #33 round 2, P1-B): it surfaces
+        `mupot_inbox_heal_reconnect_failed` in status and retries with the
+        same capped backoff, so the adapter can never end not-running with no
+        fatal code and no task left to recover it.
+        """
+        delay = self.lease_self_heal_interval
+        healed = False
+        while True:
+            await asyncio.sleep(delay)
+            delay = min(self.lease_self_heal_cap, delay * 2)
+            if not healed:
+                if not self._lease_quarantined:
+                    return
+                if _estop_engaged():
+                    continue
+                try:
+                    if self._secret_owner is not None:
+                        with self._secret_owner.activate():
+                            healed = await self._reconcile_inbox_polling_with_active_scope(
+                                execute_leased=False
+                            )
+                    else:
+                        healed = await self._reconcile_inbox_polling_with_active_scope(
+                            execute_leased=False
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "[mupot] lease self-heal attempt failed: %s", type(exc).__name__
+                    )
+                    continue
+                if not healed:
+                    continue
+                logger.info("[mupot] inbox lease quarantine self-healed; reconnecting")
+            try:
+                connected = await self.connect()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[mupot] lease self-heal reconnect raised: %s", type(exc).__name__
+                )
+                connected = False
+            if connected:
+                return
+            self._set_fatal_error(
+                "mupot_inbox_heal_reconnect_failed",
+                "Mupot inbox healed but reconnect failed; retrying",
+                retryable=True,
+            )
+            logger.error("[mupot] lease self-heal reconnect failed; retrying with backoff")
+
     async def _poll_loop(self) -> None:
+        try:
+            await self._poll_loop_body()
+        finally:
+            # Whatever ended the loop (quarantine, reconciliation stop, cancel),
+            # nothing is left to wake: stop the stream with it.
+            if self._poll_task is None or self._poll_task is asyncio.current_task():
+                self._halt_sse_wake()
+
+    async def _poll_loop_body(self) -> None:
         while self._running:
             # FOURTH named gap (kasra-review re-gate #3, 2026-09-14): checking
             # `_estop_engaged()` only right before `inbox_lease` (as rounds 1-3
@@ -2561,6 +2834,16 @@ class MupotAdapter(BasePlatformAdapter):
                 await asyncio.sleep(self.poll_interval)
                 continue
 
+            found_work = False
+            # Positive allow-list of failure points after which the in-process
+            # self-heal may run (PR #33 round 2, P1-A): only BEFORE any turn
+            # started for this attempt. Anything after the lease is handed to
+            # processing -- or any point not named here -- leaves `heal_point`
+            # None and keeps master's durable quarantine (fail closed; a
+            # human reconciles). Never widen this to a post-turn failure: the
+            # reconcile would read `expired`, clear `pending`, and connect()
+            # would re-lease and run the same turn again.
+            heal_point: Optional[str] = None
             try:
                 attempt_id = self._new_lease_attempt_id()
                 arguments = {
@@ -2568,17 +2851,21 @@ class MupotAdapter(BasePlatformAdapter):
                     "lease_seconds": self.lease_seconds,
                     "attempt_id": attempt_id,
                 }
+                heal_point = "inbox_lease"
                 payload = await self._call_consumer(
                     "inbox_lease",
                     arguments,
                     before_attempt=lambda: self._persist_prelease_fence(attempt_id),
                 )
+                heal_point = "lease_validation"
                 outcome = validate_lease_attempt_result(
                     payload,
                     attempt_id,
                     self._consumer_fence,
                 )
+                heal_point = None
                 if outcome["state"] == "leased":
+                    found_work = True
                     message = outcome["messages"][0]
                     message_id = str(message.get("id") or "")
                     logger.info(
@@ -2644,10 +2931,19 @@ class MupotAdapter(BasePlatformAdapter):
                 self._clear_lease_fence()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                # Class only: the 2026-09-17 10:05Z quarantine left no trace of
+                # its cause. Never the message text (may echo server data).
+                logger.error(
+                    "[mupot] inbox lease cycle failed (%s) at %s; quarantining",
+                    type(exc).__name__,
+                    heal_point or "post-lease",
+                )
                 self._quarantine_inbox_polling()
+                if heal_point in _PRE_TURN_HEAL_POINTS:
+                    self._schedule_lease_self_heal()
                 return
-            await asyncio.sleep(self.poll_interval)
+            await self._idle_wait(found_work)
 
     async def _process_leased_message(
         self,
@@ -3380,6 +3676,7 @@ def register(
                 "lease_reconciliation": adapter.lease_reconciliation_status(),
                 "invalid_reply_receipts": adapter.invalid_reply_receipts(),
                 "reply_reconciliation_required": adapter.reply_reconciliation_required(),
+                "sse_wake": adapter.sse_wake_status(),
             }
         return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
 

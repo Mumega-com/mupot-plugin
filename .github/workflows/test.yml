@@ -21,6 +21,16 @@ jobs:
       - run: chmod +x scripts/test.sh && ./scripts/test.sh
   native-gateway:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 2337570 = the historical pin. 77fb7f0 = the rev live on the kayhermes
+        # gateway since 2026-09-17 23:08Z; it carries Hermes a10bbf95bb
+        # (gateway.multiplex_profiles defaults on), which the old pin never
+        # exercised -- the plugin refused to load on it for eight days.
+        hermes_ref:
+          - 233757037df1f03f9fe1cfddc097acd5ad7f7510
+          - 77fb7f0a709b4df2c17822da3a08f8c93de3b3fb
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,7 +41,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: NousResearch/hermes-agent
-          ref: 233757037df1f03f9fe1cfddc097acd5ad7f7510
+          ref: ${{ matrix.hermes_ref }}
           path: hermes-runtime
       - run: |
           python -m venv hermes-runtime/.venv

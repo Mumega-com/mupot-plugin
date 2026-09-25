@@ -84,7 +84,7 @@ def test_parser_never_raises_on_odd_payloads(payload: str) -> None:
         assert frame.max_seq is None
 
 
-@pytest.mark.parametrize("bad", [True, -1, 1.5, "7a", None])
+@pytest.mark.parametrize("bad", [True, -1, 1.5, "7a", None, "\u00b2", "\u0663", "1\u00b2"])
 def test_parser_rejects_non_integer_seq(bad: Any) -> None:
     frame = parse_event_payload(json.dumps({"type": "message", "message": {"seq": bad}}))
     assert frame == SSEFrame("message", None)
@@ -768,3 +768,198 @@ async def test_lease_self_heal_never_executes_a_still_leased_attempt(
     finally:
         await adapter.disconnect()
     assert adapter._lease_self_heal_task is None
+
+
+# --------------------------------------------------------------------------
+# PR #33 round 2: heal only before a turn (P1-A), never exit deaf (P1-B),
+# production scope branch (P2-1), e-stop gate (P2-2).
+
+
+def heal_adapter(tmp_path: Path, client: FakeMupotClient, **extra: Any) -> MupotAdapter:
+    return sse_adapter(tmp_path, client, FakeStream(), sse_wake_enabled=False,
+                       poll_interval=0.02, lease_self_heal_interval=0.02,
+                       lease_self_heal_cap=0.04, **extra)
+
+
+@pytest.mark.asyncio
+async def test_failure_after_the_turn_ran_stays_quarantined_and_never_heals(
+    tmp_path: Path,
+) -> None:
+    """P1-A: an empty reply leaves the message out of `processed`, so the
+    poll loop raises AFTER the turn ran. Healing that would reconcile to
+    `expired`, clear pending, re-lease, and run the turn again."""
+    client = QuarantineThenHealClient("expired")
+    client.fail_next_lease = False
+    client.push("m-post", 5)
+    turns: list[str] = []
+    adapter = heal_adapter(tmp_path, client)
+
+    async def handler(event):
+        turns.append(event.message_id)
+        return ""
+
+    adapter.set_message_handler(handler)
+    assert await adapter.connect()
+    try:
+        await wait_for(lambda: adapter._lease_quarantined)
+        await asyncio.sleep(0.4)  # ~10 heal intervals, had one been scheduled
+        assert turns == ["m-post"]
+        assert client.lease_calls == 1
+        assert "inbox_lease_reconcile" not in client.tools
+        assert adapter._lease_self_heal_task is None
+        assert adapter._lease_quarantined is True and adapter._running is False
+        assert adapter.fatal_error_code == "mupot_inbox_reconciliation_required"
+        marker = StateStore(tmp_path / "state.json").load().get("lease_reconciliation")
+        assert isinstance(marker, dict) and marker["required"] is True
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_lease_failure_heals_and_processes_exactly_once(
+    tmp_path: Path,
+) -> None:
+    """P1-A allow-list, positive side: the inbox_lease call itself failed,
+    so no turn started; the heal reconnects and the message runs once."""
+    client = QuarantineThenHealClient("expired")
+    client.push("m-pre", 6)
+    turns: list[str] = []
+    adapter = heal_adapter(tmp_path, client)
+
+    async def handler(event):
+        turns.append(event.message_id)
+        return f"{{ack_for:{event.message_id}}} done"
+
+    adapter.set_message_handler(handler)
+    assert await adapter.connect()
+    try:
+        await wait_for(lambda: client.acked_ids == ["m-pre"], timeout=3.0)
+        await asyncio.sleep(0.2)
+        assert turns == ["m-pre"]
+        assert client.acked_ids == ["m-pre"]
+        assert client.tools.count("inbox_lease_reconcile") == 1
+        assert adapter._running is True and adapter._lease_quarantined is False
+        assert adapter.fatal_error_code is None
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.parametrize("failure", ["false", "raise"])
+@pytest.mark.asyncio
+async def test_heal_reconnect_failure_is_visible_then_recovers(
+    tmp_path: Path, failure: str,
+) -> None:
+    """P1-B: a failed reconnect after a successful heal surfaces a fatal
+    code while down and keeps retrying until connect() succeeds."""
+    client = QuarantineThenHealClient("expired")
+    adapter = heal_adapter(tmp_path, client)
+    assert await adapter.connect()
+    real_connect = adapter.connect
+    allow = False
+    attempts: list[bool] = []
+
+    async def flaky_connect(*args: Any, **kwargs: Any) -> bool:
+        attempts.append(allow)
+        if not allow:
+            if failure == "raise":
+                raise RuntimeError("boom")
+            return False
+        return await real_connect(*args, **kwargs)
+
+    adapter.connect = flaky_connect  # type: ignore[method-assign]
+    try:
+        await wait_for(lambda: len(attempts) >= 2, timeout=3.0)
+        assert adapter.fatal_error_code == "mupot_inbox_heal_reconnect_failed"
+        assert adapter.fatal_error_retryable is True
+        assert adapter._running is False and adapter._lease_quarantined is False
+        assert adapter._lease_self_heal_task is not None
+        assert not adapter._lease_self_heal_task.done()
+        allow = True
+        await wait_for(lambda: adapter._running, timeout=3.0)
+        assert adapter.fatal_error_code is None
+        client.push("after-reconnect", 71)
+        await wait_for(lambda: client.acked_ids == ["after-reconnect"], timeout=3.0)
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_heal_reconnect_that_never_succeeds_is_never_silently_dead(
+    tmp_path: Path,
+) -> None:
+    """P1-B: no end state may be not-running with no fatal code."""
+    client = QuarantineThenHealClient("expired")
+    adapter = heal_adapter(tmp_path, client)
+    assert await adapter.connect()
+    attempts: list[int] = []
+
+    async def dead_connect(*args: Any, **kwargs: Any) -> bool:
+        attempts.append(1)
+        return False
+
+    adapter.connect = dead_connect  # type: ignore[method-assign]
+    try:
+        await wait_for(lambda: len(attempts) >= 4, timeout=3.0)
+        assert adapter._running is False
+        assert adapter.fatal_error_code == "mupot_inbox_heal_reconnect_failed"
+        assert adapter._lease_self_heal_task is not None
+        assert not adapter._lease_self_heal_task.done()
+    finally:
+        await adapter.disconnect()
+    assert adapter._lease_self_heal_task is None
+
+
+@pytest.mark.asyncio
+async def test_heal_under_a_secret_owner_reconciles_inside_the_scope_never_executing(
+    tmp_path: Path,
+) -> None:
+    """P2-1: the production branch (secret owner present) must pass
+    execute_leased=False and run inside the activated profile scope."""
+    from plugin.tests.native.test_lease_attempt_reconciliation import ScopeOwner
+
+    owner = ScopeOwner()
+    adapter = MupotAdapter(
+        PlatformConfig(enabled=True, extra={
+            "state_path": str(tmp_path / "state.json"),
+            "lease_self_heal_interval": 0.01,
+        }),
+        client_factory=lambda *_: FakeMupotClient(),
+        secret_owner=owner,  # type: ignore[arg-type]
+    )
+    calls: list[tuple[bool, bool]] = []
+
+    async def spy(*, execute_leased: bool) -> bool:
+        calls.append((execute_leased, owner.active))
+        adapter._lease_quarantined = False
+        return False
+
+    adapter._reconcile_inbox_polling_with_active_scope = spy  # type: ignore[method-assign]
+    adapter._lease_quarantined = True
+    await asyncio.wait_for(adapter._lease_self_heal_loop(), timeout=2.0)
+    assert calls == [(False, True)]
+    assert owner.active is False
+
+
+@pytest.mark.asyncio
+async def test_heal_never_reconciles_while_the_estop_is_engaged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-2: a paused gateway does no network self-heal at all."""
+    adapter = heal_adapter(tmp_path, QuarantineThenHealClient("expired"))
+    calls: list[bool] = []
+
+    async def spy(*, execute_leased: bool) -> bool:
+        calls.append(execute_leased)
+        return False
+
+    adapter._reconcile_inbox_polling_with_active_scope = spy  # type: ignore[method-assign]
+    monkeypatch.setattr(adapter_module, "_estop_engaged", lambda: True)
+    adapter._lease_quarantined = True
+    task = asyncio.create_task(adapter._lease_self_heal_loop())
+    try:
+        await asyncio.sleep(0.3)
+        assert calls == []
+        assert not task.done()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

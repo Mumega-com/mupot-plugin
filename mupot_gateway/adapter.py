@@ -259,6 +259,12 @@ class _DeliveryDeferred(_EstopDeferred):
 _LeaseExpiredDeferred = _DeliveryDeferred
 
 
+# The only lease-cycle failure points proven to precede any turn for the
+# attempt (see `_poll_loop_body`). The in-process self-heal is allowed ONLY
+# for these; every other failure keeps the durable quarantine.
+_PRE_TURN_HEAL_POINTS = frozenset({"inbox_lease", "lease_validation"})
+
+
 def _protocol_error() -> MupotProtocolError:
     return MupotProtocolError(_GENERIC_MCP_PROTOCOL_ERROR)
 
@@ -2656,33 +2662,64 @@ class MupotAdapter(BasePlatformAdapter):
         )
 
     async def _lease_self_heal_loop(self) -> None:
+        """Heal, then reconnect; never exit deaf.
+
+        Phase 1 (quarantined): bounded reconcile with capped backoff. If the
+        quarantine is lifted by someone else (an operator's own
+        `reconcile_inbox_polling()`), return -- that caller owns reconnect.
+        Phase 2 (healed HERE): reconnect until connect() succeeds. A failed
+        reconnect is never a silent exit (PR #33 round 2, P1-B): it surfaces
+        `mupot_inbox_heal_reconnect_failed` in status and retries with the
+        same capped backoff, so the adapter can never end not-running with no
+        fatal code and no task left to recover it.
+        """
         delay = self.lease_self_heal_interval
-        while self._lease_quarantined:
+        healed = False
+        while True:
             await asyncio.sleep(delay)
-            if not self._lease_quarantined:
-                return
             delay = min(self.lease_self_heal_cap, delay * 2)
-            if _estop_engaged():
-                continue
-            try:
-                if self._secret_owner is not None:
-                    with self._secret_owner.activate():
+            if not healed:
+                if not self._lease_quarantined:
+                    return
+                if _estop_engaged():
+                    continue
+                try:
+                    if self._secret_owner is not None:
+                        with self._secret_owner.activate():
+                            healed = await self._reconcile_inbox_polling_with_active_scope(
+                                execute_leased=False
+                            )
+                    else:
                         healed = await self._reconcile_inbox_polling_with_active_scope(
                             execute_leased=False
                         )
-                else:
-                    healed = await self._reconcile_inbox_polling_with_active_scope(
-                        execute_leased=False
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "[mupot] lease self-heal attempt failed: %s", type(exc).__name__
                     )
+                    continue
+                if not healed:
+                    continue
+                logger.info("[mupot] inbox lease quarantine self-healed; reconnecting")
+            try:
+                connected = await self.connect()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("[mupot] lease self-heal attempt failed: %s", type(exc).__name__)
-                continue
-            if healed:
-                logger.info("[mupot] inbox lease quarantine self-healed; reconnecting")
-                await self.connect()
+                logger.warning(
+                    "[mupot] lease self-heal reconnect raised: %s", type(exc).__name__
+                )
+                connected = False
+            if connected:
                 return
+            self._set_fatal_error(
+                "mupot_inbox_heal_reconnect_failed",
+                "Mupot inbox healed but reconnect failed; retrying",
+                retryable=True,
+            )
+            logger.error("[mupot] lease self-heal reconnect failed; retrying with backoff")
 
     async def _poll_loop(self) -> None:
         try:
@@ -2798,6 +2835,15 @@ class MupotAdapter(BasePlatformAdapter):
                 continue
 
             found_work = False
+            # Positive allow-list of failure points after which the in-process
+            # self-heal may run (PR #33 round 2, P1-A): only BEFORE any turn
+            # started for this attempt. Anything after the lease is handed to
+            # processing -- or any point not named here -- leaves `heal_point`
+            # None and keeps master's durable quarantine (fail closed; a
+            # human reconciles). Never widen this to a post-turn failure: the
+            # reconcile would read `expired`, clear `pending`, and connect()
+            # would re-lease and run the same turn again.
+            heal_point: Optional[str] = None
             try:
                 attempt_id = self._new_lease_attempt_id()
                 arguments = {
@@ -2805,16 +2851,19 @@ class MupotAdapter(BasePlatformAdapter):
                     "lease_seconds": self.lease_seconds,
                     "attempt_id": attempt_id,
                 }
+                heal_point = "inbox_lease"
                 payload = await self._call_consumer(
                     "inbox_lease",
                     arguments,
                     before_attempt=lambda: self._persist_prelease_fence(attempt_id),
                 )
+                heal_point = "lease_validation"
                 outcome = validate_lease_attempt_result(
                     payload,
                     attempt_id,
                     self._consumer_fence,
                 )
+                heal_point = None
                 if outcome["state"] == "leased":
                     found_work = True
                     message = outcome["messages"][0]
@@ -2886,11 +2935,13 @@ class MupotAdapter(BasePlatformAdapter):
                 # Class only: the 2026-09-17 10:05Z quarantine left no trace of
                 # its cause. Never the message text (may echo server data).
                 logger.error(
-                    "[mupot] inbox lease cycle failed (%s); quarantining",
+                    "[mupot] inbox lease cycle failed (%s) at %s; quarantining",
                     type(exc).__name__,
+                    heal_point or "post-lease",
                 )
                 self._quarantine_inbox_polling()
-                self._schedule_lease_self_heal()
+                if heal_point in _PRE_TURN_HEAL_POINTS:
+                    self._schedule_lease_self_heal()
                 return
             await self._idle_wait(found_work)
 

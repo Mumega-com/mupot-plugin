@@ -61,11 +61,18 @@ the stream is down, `poll_interval` applies. The Hermes e-stop still gates every
 `mupot_gateway_status` reports `sse_wake` health. It needs no consumer-mode change
 (`bearer_only` is fine) and no org-admin capability.
 
-A failed `inbox_lease` still quarantines the loop behind its durable attempt marker, but
-the same bounded reconcile `connect()` runs at startup (`execute_leased=False`: a
-still-leased attempt stays fenced and no turn is re-executed) is now retried in-process
-with capped backoff (`lease_self_heal_interval`, default 60s, up to `lease_self_heal_cap`),
-so one lease timeout no longer silences receive until the next restart.
+Any failed lease cycle still quarantines the loop behind its durable attempt marker. Only
+when the failure happened BEFORE any turn started for that attempt -- the `inbox_lease`
+call itself failed, or its result failed validation, so the lease was never handed to
+processing -- is the same bounded reconcile `connect()` runs at startup
+(`execute_leased=False`: a still-leased attempt stays fenced and no turn is re-executed)
+retried in-process with capped backoff (`lease_self_heal_interval`, default 60s, up to
+`lease_self_heal_cap`), so one lease timeout no longer silences receive until the next
+restart. A failure after processing began (for example a turn that produced no reply)
+keeps the durable quarantine with `mupot_inbox_reconciliation_required` and no in-process
+heal: re-leasing it would run the same turn again, so a human reconciles. If the heal
+succeeds but the reconnect fails, status shows the retryable
+`mupot_inbox_heal_reconnect_failed` and the reconnect keeps retrying with the same backoff.
 
 Enable `mupot.routine_events_enabled: true` for the dedicated authenticated
 `routine.human-wait/v1` receive path. This opt-in does not add `mupot-routines` to

@@ -104,8 +104,12 @@ def _seq(value: object) -> Optional[int]:
         return None
     if isinstance(value, int):
         return value if value >= 0 else None
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
+    if isinstance(value, str):
+        # ASCII digits only: str.isdigit() accepts e.g. "\u00b2", which int()
+        # then rejects -- and this parser must never raise.
+        text = value.strip()
+        if text and text.isascii() and text.isdigit():
+            return int(text)
     return None
 
 

@@ -45,6 +45,18 @@ mupot:
   notification_recipients:
     telegram: '<IMMUTABLE_TELEGRAM_USER_ID>'
   notification_activate: true
+  # Event-based wake (optional). Holds GET /api/inbox/stream open with the same
+  # agent bearer (URL derived from mcp_servers.<mcp_server>.url) and wakes the
+  # lease loop on each new message. The stream never consumes or acks; all
+  # custody stays on inbox_lease/inbox_lease_ack. Works in bearer_only mode.
+  sse_wake_enabled: true
+  poll_interval: 2                 # used while the stream is down / draining
+  sse_safety_poll_interval: 60     # timed poll while the stream is healthy
+  # sse_idle_timeout: 45           # no frame or ': ping' for this long -> reconnect
+  # sse_backoff_cap: 60            # reconnect backoff ceiling (seconds, jittered)
+  # sse_poll_ms: 1000              # server-side stream cadence hint
+  # lease_self_heal_interval: 60   # first in-process retry after a lease quarantine
+  # lease_self_heal_cap: 900
 
 # Configure exactly one Telegram bot in this profile. This one Mupot plugin owns
 # the one native receiver and the deterministic Telegram handlers; do not install

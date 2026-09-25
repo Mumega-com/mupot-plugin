@@ -45,6 +45,28 @@ verifies the operator's expected agent/tenant, preserves
 message correlation, and consumes a source only after successful handling. Terminal ACKs
 are preserved without generating another peer reply. It does not start an SOS connection.
 
+### Event-based wake (`mupot.sse_wake_enabled`)
+
+Off by default. When `true`, the adapter also holds Mupot's peek-only
+`GET /api/inbox/stream` open with the same agent bearer (URL derived from the configured
+MCP URL, token read from the owning profile scope on every connect) and treats each new
+`message`/`initial` frame purely as a wake: the poll loop runs its unchanged
+`inbox_lease -> process -> reply -> inbox_lease_ack` cycle immediately. The stream never
+leases, acks, or reads the inbox, so every guarantee above holds and a spurious wake costs
+one empty lease. Reconnects use capped exponential backoff with jitter and resume with
+`since=<last seen seq>`; `: ping` comments count as liveness and `sse_idle_timeout`
+(default 45s) of silence forces a reconnect. While the stream is healthy the timed poll
+drops to `sse_safety_poll_interval` (default 60s); after a lease that found work, or while
+the stream is down, `poll_interval` applies. The Hermes e-stop still gates every lease.
+`mupot_gateway_status` reports `sse_wake` health. It needs no consumer-mode change
+(`bearer_only` is fine) and no org-admin capability.
+
+A failed `inbox_lease` still quarantines the loop behind its durable attempt marker, but
+the same bounded reconcile `connect()` runs at startup (`execute_leased=False`: a
+still-leased attempt stays fenced and no turn is re-executed) is now retried in-process
+with capped backoff (`lease_self_heal_interval`, default 60s, up to `lease_self_heal_cap`),
+so one lease timeout no longer silences receive until the next restart.
+
 Enable `mupot.routine_events_enabled: true` for the dedicated authenticated
 `routine.human-wait/v1` receive path. This opt-in does not add `mupot-routines` to
 `allowed_agents`: Routine events never start a peer model turn or send to their synthetic

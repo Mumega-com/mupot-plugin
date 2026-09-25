@@ -369,6 +369,9 @@ class RecordingClient(FakeMupotClient):
         self.queue: list[dict] = []
         self.acked_ids: list[str] = []
         self.leased: dict[str, dict] = {}
+        # Ids the fake server redelivers once after their first ack
+        # (at-least-once delivery): the plugin must re-ack, never re-run.
+        self.redeliver_once: set[str] = set()
 
     def push(self, message_id: str, seq: int, sender: str = "hadi-codex") -> None:
         self.queue.append({
@@ -390,6 +393,9 @@ class RecordingClient(FakeMupotClient):
             message = self.leased.pop(arguments["attempt_id"])
             self.queue.remove(message)
             self.acked_ids.append(message["id"])
+            if message["id"] in self.redeliver_once:
+                self.redeliver_once.discard(message["id"])
+                self.queue.append(dict(message))
             return {**FAKE_SCOPE, "attempt_id": arguments["attempt_id"], "state": "acked",
                     "consumed": True}
         if tool in {"inbox", "inbox_ack"}:
@@ -464,13 +470,15 @@ async def test_wake_storm_never_double_processes(tmp_path: Path) -> None:
         await stream.opened.wait()
         client.push("a", 11)
         client.push("b", 12)
+        client.redeliver_once.add("a")
         for seq in (11, 12, 12, 11, 13, 14):  # duplicates, reorder, phantom seqs
             for line in message_frame(seq):
                 conn.put_nowait(line)
-        await wait_for(lambda: client.acked_ids == ["a", "b"], timeout=5.0)
+        await wait_for(lambda: client.acked_ids == ["a", "b", "a"], timeout=5.0)
         await asyncio.sleep(0.1)
-        assert client.acked_ids == ["a", "b"]
-        assert len(client.sent) == 2
+        # The server redelivered "a" after its ack: re-acked, not re-run.
+        assert client.acked_ids == ["a", "b", "a"]
+        assert [reply["in_reply_to"] for reply in client.sent] == ["a", "b"]
     finally:
         await adapter.disconnect()
 

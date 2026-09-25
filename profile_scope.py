@@ -41,6 +41,63 @@ def require_supported_profile_runtime(config: Any) -> None:
         raise RuntimeError(_UNSUPPORTED_RUNTIME)
 
 
+def _explicit_multiplex_verdict(merged_config: Any) -> bool:
+    """True when this process may end up multiplexing profiles.
+
+    Load-time half of the runtime fence. ``hermes_cli.config.load_config()``
+    returns DEFAULT_CONFIG merged with config.yaml, and Hermes a10bbf95bb
+    (2026-09-16) flipped ``gateway.multiplex_profiles`` to ``True`` in
+    DEFAULT_CONFIG. That default is a *request* the gateway settles at boot
+    (``hermes_cli.gateway_multiplex_mode.resolve_multiplex_mode``): a named
+    profile's own gateway always stays standalone. Reading the merged value
+    therefore refused every named-profile install with "unsupported profile
+    runtime" even though the process never multiplexes -- the kayhermes
+    native gateway failed to load on every start from 2026-09-17 23:11Z.
+
+    Decision, mirroring Hermes's own settlement and failing closed:
+    - explicit ``true`` (env ``GATEWAY_MULTIPLEX_PROFILES`` or config.yaml) ->
+      multiplex;
+    - explicit ``false`` -> standalone;
+    - unset -> standalone when Hermes's first two ``implicit_multiplex_blocker``
+      rules already guarantee it (a non-default profile's own gateway, or a
+      single-profile install -- both pure reads). A default profile with other
+      profiles on the host may still be folded onto a multiplexer at boot, so
+      it is refused until the operator pins ``gateway.multiplex_profiles``.
+    Older Hermes without ``gateway_multiplex_mode`` has no implicit default,
+    so the merged config value is still authoritative there. Any other
+    failure to decide is treated as multiplex.
+    """
+    try:
+        from hermes_cli.gateway_multiplex_mode import explicit_multiplex_flag
+    except ImportError:
+        return _configured_multiplex(merged_config)
+    try:
+        from hermes_cli.profiles import get_active_profile_name, profiles_to_serve
+        from hermes_constants import get_hermes_home
+
+        explicit = explicit_multiplex_flag(get_hermes_home())
+        if explicit is not None:
+            return bool(explicit)
+        if (get_active_profile_name() or "default") != "default":
+            return False
+        return len(profiles_to_serve(multiplex=True)) >= 2
+    except Exception:
+        return True
+
+
+def require_supported_profile_runtime_at_load(merged_config: Any) -> None:
+    """Plugin-load variant of :func:`require_supported_profile_runtime`.
+
+    Checks the live runtime latch exactly as before, then the operator's
+    explicit multiplex choice instead of the merged-default value (see
+    :func:`_explicit_multiplex_verdict`). Every later secret read still
+    re-checks the runtime latch through ``require_supported_profile_runtime``.
+    """
+    require_supported_profile_runtime({})
+    if _explicit_multiplex_verdict(merged_config):
+        raise RuntimeError(_UNSUPPORTED_RUNTIME)
+
+
 def _active_home() -> Path:
     try:
         from hermes_constants import get_process_hermes_home

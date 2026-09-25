@@ -29,7 +29,11 @@ from .telegram_inline_approval import (
     TelegramInlineApprovalSettings,
     register_telegram_inline_approval,
 )
-from .profile_scope import ProfileSecretOwner, require_supported_profile_runtime
+from .profile_scope import (
+    ProfileSecretOwner,
+    require_supported_profile_runtime,
+    require_supported_profile_runtime_at_load,
+)
 from .tools import mupot_brain_enable, mupot_provision, mupot_status
 
 logger = logging.getLogger(__name__)
@@ -67,7 +71,7 @@ def _load_plugin_settings() -> dict[str, Any]:
         from hermes_cli.config import cfg_get, load_config
 
         config = load_config()
-        require_supported_profile_runtime(config)
+        require_supported_profile_runtime_at_load(config)
         value = cfg_get(config, "plugins", "entries", "mupot", "settings", default={})
         if not isinstance(value, Mapping):
             raise ValueError("plugins.entries.mupot.settings must be a mapping")

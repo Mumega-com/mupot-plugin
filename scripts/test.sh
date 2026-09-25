@@ -22,7 +22,7 @@ cd "$tmp"
   plugin/mupot_operator.py \
   plugin/schemas.py \
   plugin/tools.py
-"$python" -m py_compile plugin/mupot_gateway/adapter.py plugin/mupot_gateway/notifications.py
+"$python" -m py_compile plugin/mupot_gateway/adapter.py plugin/mupot_gateway/notifications.py plugin/mupot_gateway/sse_wake.py
 
 # Regression: starting Python from the plugin directory must not shadow the
 # standard-library `operator` module.

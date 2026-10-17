@@ -941,6 +941,17 @@ def build_mupot_event(
     )
 
 
+def _utf8_safe(value: Any) -> Any:
+    """Recursively replace characters UTF-8 cannot encode (lone surrogates)."""
+    if isinstance(value, str):
+        return value.encode("utf-8", "replace").decode("utf-8")
+    if isinstance(value, dict):
+        return {_utf8_safe(k): _utf8_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_utf8_safe(v) for v in value]
+    return value
+
+
 class StateStore:
     def __init__(self, path: Path):
         self.path = Path(path).expanduser()
@@ -3027,6 +3038,9 @@ class MupotAdapter(BasePlatformAdapter):
         self._commit(message_id)
 
     def _dlq_once(self, message: dict[str, Any], reason: str) -> None:
+        # Encode-safe: a raw lone surrogate must not make StateStore.save raise.
+        message = _utf8_safe(message)
+        reason = _utf8_safe(reason)
         message_id = str(message.get("id") or "")
         dlq = self._state["dlq"]
         if not any(

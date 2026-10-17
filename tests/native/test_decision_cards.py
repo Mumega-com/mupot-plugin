@@ -76,7 +76,7 @@ def adapter_at(
         "state_path": str(tmp_path / "state.json"),
     }
     if recipients:
-        extra["notification_recipients"] = {"telegram": "owner"}
+        extra["notification_recipients"] = {"telegram": "123456789"}
     return MupotAdapter(
         PlatformConfig(enabled=True, extra=extra),
         client_factory=lambda *_: client,
@@ -221,7 +221,7 @@ async def test_card_is_delivered_as_plain_card_text_not_fenced_and_mirrored_fenc
                 "id": "human",
                 "session_key": "agent:main:telegram:dm:123",
                 "source": "telegram",
-                "user_id": "owner",
+                "user_id": "123456789",
                 "chat_id": "123",
                 "chat_type": "dm",
                 "last_active": 1,
@@ -260,7 +260,7 @@ def _sessions(monkeypatch, notifications, rows) -> None:
 
 DM = {
     "id": "human", "session_key": "agent:main:telegram:dm:123", "source": "telegram",
-    "user_id": "owner", "chat_id": "123", "chat_type": "dm", "last_active": 1,
+    "user_id": "123456789", "chat_id": "123", "chat_type": "dm", "last_active": 1,
 }
 
 
@@ -313,7 +313,7 @@ async def test_no_active_dm_session_falls_back_to_direct_send_to_configured_chat
     with caplog.at_level("WARNING"):
         await adapter._flush_notifications()
     assert len(sent) == 1
-    assert sent[0][0]["chat_id"] == "owner" and sent[0][0]["platform"] == "telegram"
+    assert sent[0][0]["chat_id"] == "123456789" and sent[0][0]["platform"] == "telegram"
     assert sent[0][1].startswith("Decision needed:")
     assert mirrored == []  # no session to mirror into
     assert any("no active conversation" in r.message for r in caplog.records)
@@ -370,3 +370,72 @@ async def test_lone_surrogate_card_is_dead_lettered_and_acked_not_raised(
     assert [e["reason"] for e in saved["dlq"]] == ["invalid_decision_card"]
     assert saved.get("notification_outbox", {}) == {}
     assert client.calls == [("inbox_ack", {"ids": ["msg-card-1"]})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recipient", ["-1001234567890", "@somechannel", "0", "owner", "12ab", "\u0661\u0662"])
+async def test_direct_fallback_refuses_a_non_user_id_recipient(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recipient: str
+) -> None:
+    from plugin.mupot_gateway import notifications
+
+    sent: list[str] = []
+
+    async def deliver_text(target, text):
+        sent.append(text)
+        return {"message_id": "x", "platform": "telegram", "chat_id": "1"}
+
+    monkeypatch.setattr(notifications, "deliver_text", deliver_text)
+    _sessions(monkeypatch, notifications, [])
+    adapter = adapter_at(tmp_path, Client(), recipients=False, notification_recipients={"telegram": recipient})
+    await adapter._process_leased_message(message())
+    await adapter._flush_notifications()
+    assert sent == []
+    assert state(tmp_path)["notification_outbox"]["msg-card-1"]["status"] != "delivered"
+
+
+@pytest.mark.asyncio
+async def test_raw_lone_surrogate_envelope_is_dead_lettered_and_acked_not_raised(
+    tmp_path: Path,
+) -> None:
+    client = Client()
+    adapter = adapter_at(tmp_path, client)
+    body = card_body().replace('"title"', '"ti\ud83dtle"', 1)  # raw, unescaped surrogate
+    await adapter._process_leased_message(message(body=body, **{"from_agent": "mupot-decision-card"}))
+    saved = state(tmp_path)
+    assert [e["reason"] for e in saved["dlq"]] == ["invalid_decision_card"]
+    assert client.calls == [("inbox_ack", {"ids": ["msg-card-1"]})]
+
+
+@pytest.mark.asyncio
+async def test_int_recipient_from_yaml_is_normalised_and_delivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from plugin.mupot_gateway import notifications
+
+    sent: list[str] = []
+
+    async def deliver_text(target, text):
+        sent.append(text)
+        return {"message_id": "x", "platform": "telegram", "chat_id": target["chat_id"]}
+
+    monkeypatch.setattr(notifications, "deliver_text", deliver_text)
+    _sessions(monkeypatch, notifications, [])
+    adapter = adapter_at(tmp_path, Client(), recipients=False, notification_recipients={"telegram": 123456789})
+    await adapter._process_leased_message(message())
+    await adapter._flush_notifications()
+    assert len(sent) == 1
+    assert state(tmp_path)["notification_outbox"]["msg-card-1"]["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_refused_recipient_warning_is_throttled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from plugin.mupot_gateway import notifications
+
+    monkeypatch.setattr(notifications, "_REFUSED_WARNED", set())
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            assert notifications.direct_target({"telegram": "@chan"}) is None
+    assert len([r for r in caplog.records if "refusing direct send" in r.message]) == 1

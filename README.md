@@ -201,7 +201,8 @@ https-only dashboard URL, markup and embedded commands stripped), durably enqueu
 human notice to `notification_recipients`, and ACKs once. It never starts a model turn and
 `mupot-decision-card` is never added to `allowed_agents`. A malformed or forged card is
 quarantined to the DLQ (`invalid_decision_card`) and ACKed. `mupot-review-gate` rows are
-unchanged. Delivery needs an active Telegram DM session for the configured recipient.
+unchanged. Delivery prefers the active Telegram DM session for the configured recipient;
+without one it falls back to a direct send (see below).
 
 **Install order: mupot PR #2014 (decision-card delivery and the `/mu*` aliases) must be deployed
 BEFORE this plugin is installed or `decision_cards_enabled` is turned on.** Otherwise

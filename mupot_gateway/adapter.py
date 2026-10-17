@@ -941,6 +941,17 @@ def build_mupot_event(
     )
 
 
+def _utf8_safe(value: Any) -> Any:
+    """Recursively replace characters UTF-8 cannot encode (lone surrogates)."""
+    if isinstance(value, str):
+        return value.encode("utf-8", "replace").decode("utf-8")
+    if isinstance(value, dict):
+        return {_utf8_safe(k): _utf8_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_utf8_safe(v) for v in value]
+    return value
+
+
 class StateStore:
     def __init__(self, path: Path):
         self.path = Path(path).expanduser()
@@ -1252,7 +1263,10 @@ class MupotAdapter(BasePlatformAdapter):
         state_path = extra.get("state_path") or str(get_hermes_home() / "platforms" / "mupot" / "state.json")
         self.store = StateStore(Path(str(state_path)))
         loaded, state_valid = self.store.load_checked()
-        self.notification_recipients = dict(extra.get("notification_recipients") or {})
+        self.notification_recipients = {
+            str(k): str(v)
+            for k, v in dict(extra.get("notification_recipients") or {}).items()
+        }  # unquoted YAML ints must equal the str user ids compared downstream
         self.notification_activate = extra.get("notification_activate") is True
         routine_events_enabled = extra.get("routine_events_enabled", False)
         if not isinstance(routine_events_enabled, bool):
@@ -3027,6 +3041,9 @@ class MupotAdapter(BasePlatformAdapter):
         self._commit(message_id)
 
     def _dlq_once(self, message: dict[str, Any], reason: str) -> None:
+        # Encode-safe: a raw lone surrogate must not make StateStore.save raise.
+        message = _utf8_safe(message)
+        reason = _utf8_safe(reason)
         message_id = str(message.get("id") or "")
         dlq = self._state["dlq"]
         if not any(

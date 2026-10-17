@@ -35,10 +35,17 @@ _TASK_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 _URL_RE = re.compile(r"^https://[A-Za-z0-9.-]{1,253}(?::\d{1,5})?(?:/[A-Za-z0-9.~%/-]{0,200})?$")
 # EVERY slash-word is inert (/yolo, /approvals, /stop, /sethome, ...): only the
 # plugin-rendered Reply/hint lines and dashboard_url may carry a live command/link.
-_SLASH_RE = re.compile(r"/(?=[A-Za-z])")
+_SLASH_RE = re.compile(r"/(?=[A-Za-z0-9])")  # digit-first (/123) autolinks too
 _SCHEME_RE = re.compile(r"://")
-_DOMAIN_RE = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+# Any dot-like char with non-space on both sides (matches tdlib, which treats marks and
+# symbols as URL chars): IDN TLDs, combining/spacing marks, ideographic/fullwidth dots, IPv4.
+_DOT_RE = re.compile(r"(?<=\S)[.\u3002\uff0e\uff61](?=\S)")
+# +digits with spaces/dashes/parens, >= 7 digits: Telegram autolinks it as a phone.
+_PHONE_RE = re.compile(r"\+\(?\d[\d\s().-]{5,}\d")
 _MARKUP_CHARS = "`*_[]~<>\\|"
+# & and $ become fullwidth (AT&T, $100 keep meaning): no HTML entities (&sol;), no
+# cashtags, no $$ rich-markdown routing.
+_FULLWIDTH = str.maketrans({"&": "\uff06", "$": "\uff04"})
 
 # (field, hard cap in UTF-16 units before the card is rejected, required)
 _FIELD_CAPS = {
@@ -89,8 +96,13 @@ def _clean(value: str, limit: int | None = None) -> str:
         else:
             kept.append(ch)
     text = " ".join("".join(kept).split())
+    text = text.translate(_FULLWIDTH)
     text = _SCHEME_RE.sub("\uff1a\uff0f\uff0f", text)
-    text = _DOMAIN_RE.sub(lambda m: m.group(0).replace(".", "\u2024"), text)
+    text = _DOT_RE.sub("\u2024", text)  # ONE DOT LEADER: visible, never autolinked
+    text = _PHONE_RE.sub(
+        lambda m: m.group(0).replace("+", "\uff0b") if sum(c.isdigit() for c in m.group(0)) >= 7 else m.group(0),
+        text,
+    )
     text = _SLASH_RE.sub("\uff0f", text)  # fullwidth solidus: visible, not a command
     text = text.replace("@", "\uff20").replace("#", "\uff03")  # no mentions/hashtags
     if limit is not None and len(text) > limit:

@@ -79,10 +79,21 @@ def select_target(sessions, recipients):
             "session_id": row["id"], "session_key": row.get("session_key")}
 
 
+_REFUSED_WARNED: set[str] = set()  # warn once per bad recipient per process
+
+
 def direct_target(recipients):
     """Session-less target for a configured recipient (Telegram DM only)."""
     user_id = str(recipients.get("telegram") or "")
-    if not user_id:
+    # Only a positive all-digit Telegram user id is a private DM chat id: a
+    # negative group id or an @channel username would send the card to a group.
+    if not (user_id.isascii() and user_id.isdigit() and int(user_id) > 0):
+        if user_id and user_id not in _REFUSED_WARNED:
+            _REFUSED_WARNED.add(user_id)
+            logger.warning(
+                "[mupot] configured telegram recipient is not a positive numeric "
+                "user id; refusing direct send"
+            )
         return None
     return {"platform": "telegram", "user_id": user_id, "chat_id": user_id,
             "thread_id": None, "session_id": None, "session_key": None,

@@ -191,6 +191,32 @@ the whole gateway process restarts, with nothing in this plugin able to detect o
 (there is no hook back into that rebuild path). `register_telegram_control` logs a WARNING
 naming this limitation whenever `telegram_control_enabled: true` is configured.
 
+## Decision cards (0.16.0)
+
+When a mupot gate is held by a human member, mupot sends one inbox message per agent that
+member owns, from the system sender `mupot-decision-card` (body JSON `type: decision_card`).
+With `decision_cards_enabled: true` the plugin validates the card strictly (8-hex `short_id`,
+`approve`/`reject` strings exactly `/muapprove <id>` and `/mureject <id>`, capped lengths,
+https-only dashboard URL, markup and embedded commands stripped), durably enqueues a plain
+human notice to `notification_recipients`, and ACKs once. It never starts a model turn and
+`mupot-decision-card` is never added to `allowed_agents`. A malformed or forged card is
+quarantined to the DLQ (`invalid_decision_card`) and ACKed. `mupot-review-gate` rows are
+unchanged. Delivery prefers the active Telegram DM session for the configured recipient;
+without one it falls back to a direct send (see below).
+
+**Install order: mupot PR #2014 (decision-card delivery and the `/mu*` aliases) must be deployed
+BEFORE this plugin is installed or `decision_cards_enabled` is turned on.** Otherwise
+`/muapprove` reaches a server without the aliases, and a habitual `/approve` lands on Hermes's
+own exec approval. With no active DM session the card is sent directly to the configured
+`notification_recipients` Telegram chat (logged as a warning); it is never a model turn, even
+with `notification_activate: true`.
+
+The human answers `/muapprove <id>` or `/mureject <id>` (also `/muneeds`, `/muanswer`);
+`telegram_control` relays them verbatim to mupot's `/im/webhook`. Bare `/needs /answer
+/approve /reject` are no longer handled by default (they shadowed Hermes's own `/approve`);
+set `telegram_control_legacy_bare_commands: true` (operator settings) to restore them.
+The relay also now sends a fixed `User-Agent` (Cloudflare's WAF 403s the default urllib one).
+
 ## Human-origin attestation for `task_verdict`
 
 The primary decision channel for an owned member is not a deterministic command at all: they

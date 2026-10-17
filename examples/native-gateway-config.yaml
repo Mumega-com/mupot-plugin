@@ -14,6 +14,7 @@ plugins:
           # Hosted production Mupot. Keep this credential-free HTTPS origin exact.
           base_url: https://mupot.mumega.com
           telegram_control_enabled: true
+          # telegram_control_legacy_bare_commands: false  # true re-enables bare /approve etc.
           telegram_control_webhook_secret_env: IM_WEBHOOK_SECRET
           expected_tenant: <TENANT_SLUG>
           squad_id: <SQUAD_ID>
@@ -33,6 +34,8 @@ mupot:
   mcp_server: mupot
   # Dedicated synthetic Routine human-wait receiver; this does not widen allowed_agents.
   routine_events_enabled: true
+  # Human decision cards from mupot-decision-card (notice only, no model turn); needs notification_recipients.
+  decision_cards_enabled: true
   # During migration, use the exact existing path; do not start a new empty ledger.
   # Fresh installations may omit this and use the profile-aware default.
   state_path: <ABSOLUTE_PATH_TO_EXISTING_MUPOT_STATE_JSON>

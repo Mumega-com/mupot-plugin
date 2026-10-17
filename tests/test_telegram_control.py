@@ -52,7 +52,7 @@ class Chat:
 
 
 class Message:
-    def __init__(self, text: str = "/needs", **forwarding: object) -> None:
+    def __init__(self, text: str = "/muneeds", **forwarding: object) -> None:
         self.text = text
         self.message_id = 999
         self.caption = "must-not-be-forwarded"
@@ -205,12 +205,105 @@ def test_factory_registers_only_the_five_exact_commands(
 
     assert [handler.command for handler in handlers] == [
         "start",
-        "needs",
-        "answer",
-        "approve",
-        "reject",
+        "muneeds",
+        "muanswer",
+        "muapprove",
+        "mureject",
     ]
     assert all(handler.callback is handlers[0].callback for handler in handlers)
+
+
+def _register_commands(
+    monkeypatch: pytest.MonkeyPatch, settings: TelegramControlSettings
+) -> list[str]:
+    factories: list[object] = []
+    handlers: list[object] = []
+
+    class CommandHandler:
+        def __init__(self, command: str, callback: object) -> None:
+            self.command = command
+
+    telegram = types.ModuleType("telegram")
+    telegram_ext = types.ModuleType("telegram.ext")
+    telegram_ext.CommandHandler = CommandHandler
+    monkeypatch.setitem(sys.modules, "telegram", telegram)
+    monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
+    register_telegram_control(
+        types.SimpleNamespace(register_telegram_handler=factories.append), settings
+    )
+    factories[0](types.SimpleNamespace(add_handler=handlers.append), object())
+    return [handler.command for handler in handlers]
+
+
+def test_bare_commands_are_not_registered_by_default_so_hermes_approve_is_unshadowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands = _register_commands(monkeypatch, valid_settings())
+    assert not {"needs", "answer", "approve", "reject"} & set(commands)
+
+
+def test_legacy_flag_restores_the_bare_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands = _register_commands(
+        monkeypatch, valid_settings(legacy_bare_commands=True)
+    )
+    assert commands == [
+        "start", "muneeds", "muanswer", "muapprove", "mureject",
+        "needs", "answer", "approve", "reject",
+    ]
+
+
+def test_legacy_flag_must_be_boolean() -> None:
+    with pytest.raises(ValueError, match="legacy_bare_commands"):
+        TelegramControlSettings.from_mapping(
+            {
+                "telegram_control_enabled": True,
+                "base_url": "https://pot.example.invalid",
+                "telegram_control_legacy_bare_commands": "yes",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["/muapprove abcdef12", "/muapprove@kayhermes_mubot abcdef12", "/mureject abcdef12 no", "/muneeds", "/muanswer r1 yes"],
+)
+def test_mu_commands_relay_unchanged_including_botname(
+    monkeypatch: pytest.MonkeyPatch, text: str
+) -> None:
+    reply, opener = relay_with(monkeypatch, Update(message=Message(text)))
+    assert reply == "Needs: approve decision d-1."
+    sent = json.loads(opener.calls[0][0].data)
+    assert sent["message"]["text"] == text
+
+
+@pytest.mark.parametrize("text", ["/approve abcdef12", "/reject abcdef12", "/needs", "/answer r1 x"])
+def test_bare_commands_refused_before_network_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch, text: str
+) -> None:
+    opener = Opener(AssertionError("network must not run"))
+    monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
+    with pytest.raises(ValueError, match="not supported"):
+        relay_telegram_update(valid_settings(), Update(message=Message(text)))
+    assert opener.calls == []
+
+
+def test_bare_command_relays_when_legacy_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "plugin.telegram_control.read_profile_secret", lambda _n: "s"
+    )
+    opener = Opener(Response(b'{"ok":true,"reply":"ok"}'))
+    monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
+    assert (
+        relay_telegram_update(
+            valid_settings(legacy_bare_commands=True),
+            Update(message=Message("/approve abcdef12")),
+        )
+        == "ok"
+    )
 
 
 @pytest.mark.parametrize(
@@ -239,7 +332,7 @@ def test_relay_refuses_every_forwarding_marker_before_network(
 ) -> None:
     opener = Opener(AssertionError("network must not run"))
     monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
-    update = Update(message=Message("/approve d-1", **{marker: object()}))
+    update = Update(message=Message("/muapprove d-1", **{marker: object()}))
     with pytest.raises(ValueError, match="forwarded"):
         relay_telegram_update(valid_settings(), update)
     assert opener.calls == []
@@ -248,7 +341,7 @@ def test_relay_refuses_every_forwarding_marker_before_network(
 def test_relay_posts_only_the_sanitized_envelope_and_runtime_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    update = Update(message=Message("/answer d-1 accept"))
+    update = Update(message=Message("/muanswer d-1 accept"))
     reply, opener = relay_with(monkeypatch, update)
     assert reply == "Needs: approve decision d-1."
     assert len(opener.calls) == 1
@@ -258,6 +351,7 @@ def test_relay_posts_only_the_sanitized_envelope_and_runtime_secret(
     headers = {key.lower(): value for key, value in request.header_items()}
     assert headers == {
         "content-type": "application/json",
+        "user-agent": "mupot-hermes-plugin/telegram-control",
         "x-telegram-bot-api-secret-token": "runtime-webhook-secret",
     }
     assert json.loads(request.data) == {
@@ -265,7 +359,7 @@ def test_relay_posts_only_the_sanitized_envelope_and_runtime_secret(
         "message": {
             "from": {"id": 123, "first_name": "Ada Example"},
             "chat": {"id": 123, "type": "private"},
-            "text": "/answer d-1 accept",
+            "text": "/muanswer d-1 accept",
         },
     }
     assert "runtime-webhook-secret" not in request.data.decode()
@@ -378,7 +472,7 @@ def test_relay_refuses_malformed_or_unbounded_reply(
 
 def test_relay_failure_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
     secret = "sensitive-secret-value"
-    approval = "/approve invite-code-123"
+    approval = "/muapprove invite-code-123"
     monkeypatch.setattr(
         "plugin.telegram_control.read_profile_secret", lambda _name: secret
     )

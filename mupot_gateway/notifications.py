@@ -79,6 +79,27 @@ def select_target(sessions, recipients):
             "session_id": row["id"], "session_key": row.get("session_key")}
 
 
+_REFUSED_WARNED: set[str] = set()  # warn once per bad recipient per process
+
+
+def direct_target(recipients):
+    """Session-less target for a configured recipient (Telegram DM only)."""
+    user_id = str(recipients.get("telegram") or "")
+    # Only a positive all-digit Telegram user id is a private DM chat id: a
+    # negative group id or an @channel username would send the card to a group.
+    if not (user_id.isascii() and user_id.isdigit() and int(user_id) > 0):
+        if user_id and user_id not in _REFUSED_WARNED:
+            _REFUSED_WARNED.add(user_id)
+            logger.warning(
+                "[mupot] configured telegram recipient is not a positive numeric "
+                "user id; refusing direct send"
+            )
+        return None
+    return {"platform": "telegram", "user_id": user_id, "chat_id": user_id,
+            "thread_id": None, "session_id": None, "session_key": None,
+            "direct": True}
+
+
 async def deliver_text(target, text):
     from gateway.config import Platform
     from tools.send_message_senders import _live_adapter
@@ -289,12 +310,17 @@ def enqueue(
     *,
     activation_required=False,
     activation_after_processed=False,
+    plain_card=False,
 ):
     source_id = str(source.get("id") or "")
     if not source_id or not text.strip():
         raise NotificationCustodyError("Notification custody input is invalid")
 
-    notice_text = _notice_text(source, text)
+    # plain_card: a pre-validated, pre-sanitised human decision card (see
+    # decision_cards.py). It is sent as the card text itself -- not wrapped in
+    # the "Mupot update ... Reply here to guide the next step" peer frame, and
+    # not fenced for the Telegram send (the conversation mirror stays fenced).
+    notice_text = text if plain_card else _notice_text(source, text)
     fingerprint = _source_fingerprint(source, notice_text)
     durable, valid = store.load_checked()
     if not valid:
@@ -321,7 +347,7 @@ def enqueue(
             activation_required
         ) or bool(existing.get("activation_after_processed")) != bool(
             activation_after_processed
-        ):
+        ) or bool(existing.get("plain_card")) != bool(plain_card):
             raise NotificationConflict("Notification source conflict")
         candidate = copy.deepcopy(durable)
         expected = candidate["notification_outbox"][source_id]
@@ -381,6 +407,8 @@ def enqueue(
         expected["activation_required"] = True
     if activation_after_processed:
         expected["activation_after_processed"] = True
+    if plain_card:
+        expected["plain_card"] = True
     outbox[source_id] = expected
     _persist_notice(state, store, candidate, source_id, expected)
 
@@ -426,7 +454,25 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
             target = notice.get("target")
             if target is None:
                 target = select_target(await asyncio.to_thread(active_sessions), recipients)
+                if target is None and notice.get("plain_card") is True:
+                    # A decision card is the human's own notice: with no active DM
+                    # session, send straight to the configured recipient's private
+                    # chat (a Telegram DM chat id equals the user id) rather than
+                    # retrying silently forever. No session, so no mirror.
+                    target = direct_target(recipients)
+                    if target is not None:
+                        logger.warning(
+                            "[mupot] no active conversation for decision card "
+                            "source=%s; sending directly to the configured %s recipient",
+                            source_id,
+                            target["platform"],
+                        )
                 if target is None:
+                    logger.warning(
+                        "[mupot] no active conversation and no direct recipient for "
+                        "notification source=%s; will retry",
+                        source_id,
+                    )
                     raise RuntimeError("No active conversation for the configured human")
                 notice["target"] = target
                 store.save(state)
@@ -443,8 +489,11 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
             # now consume this SAME fenced string, so fixing (or auditing) the
             # escaping only ever has to happen in one place.
             fenced_text = _fenced_untrusted_block(notice["text"]) + _UNTRUSTED_CAVEAT
-            should_activate = notice.get("activation_required") is True or (
-                activation_default and activate is not None
+            # A plain decision card is a human notice, never a model turn,
+            # whatever notification_activate / routine_events_enabled say.
+            should_activate = notice.get("plain_card") is not True and (
+                notice.get("activation_required") is True
+                or (activation_default and activate is not None)
             )
             if should_activate:
                 # CHOKE POINT for the message injector (kasra-review re-gate,
@@ -615,7 +664,12 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
                 # the "quoted, not a command" framing for the human reading it.
                 notice.update(status="sending", delivery_status="sending")
                 store.save(state)
-                notice["delivery_receipt"] = await deliver_text(target, fenced_text)
+                # A validated decision card is the human's own notice: ship the
+                # sanitised card text. Everything else keeps the fenced frame.
+                notice["delivery_receipt"] = await deliver_text(
+                    target,
+                    notice["text"] if notice.get("plain_card") is True else fenced_text,
+                )
                 notice.update(status="pending", delivery_status="receipt_recorded")
                 store.save(state)
             # CHOKE POINT for the conversation mirror (kasra-review re-gate #3,
@@ -638,7 +692,8 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
             # mirror_text's own docstring note) -- never the raw body at the
             # default role="assistant", which would replay as a genuine,
             # unfenced agent turn in the transcript.
-            await asyncio.to_thread(mirror_text, target, fenced_text)
+            if not target.get("direct"):
+                await asyncio.to_thread(mirror_text, target, fenced_text)
             notice.update(status="delivered", delivery_status="delivered",
                           completed_at=time.time())
             notice.pop("last_error", None)

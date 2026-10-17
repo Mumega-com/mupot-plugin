@@ -395,7 +395,7 @@ def telegram_update(replies: list[str], update_id: int = 1) -> Any:
     async def reply_text(value: str) -> None:
         replies.append(value)
 
-    message = SimpleNamespace(text="/needs", reply_text=reply_text)
+    message = SimpleNamespace(text="/muneeds", reply_text=reply_text)
     return SimpleNamespace(
         update_id=update_id,
         effective_user=SimpleNamespace(id=123, full_name="Ada"),

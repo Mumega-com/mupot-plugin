@@ -214,6 +214,7 @@ def test_lone_surrogate_is_a_validation_error_not_a_unicode_error(field: str) ->
     [
         "mupot.рф", "пример.рф", "evil。com", "evil．com", "evil｡com", "1.2.3.4",
         "a.b.c", "mupot.com", "https://x.рф/p",
+        "i\u2764.ws", "\u0939\u093f\u0902\u0926\u0940.com", "mupoe\u0301.com", "evil\u2122.com",
     ],
 )
 def test_every_dot_like_char_between_word_chars_is_broken(text: str) -> None:
@@ -239,6 +240,7 @@ def test_cashtags_html_entities_and_rich_markdown_dollars_are_neutralised() -> N
     for text in ("buy $TSLA now", "$$ x $$", "&sol;yolo", "&commat;admin", "&#47;stop"):
         out = _free_text(text)
         assert "$" not in out and "&" not in out, (text, out)
+        assert "\uff04" in out or "\uff06" in out
     for field in ("title", "asked_by", "project", "result_excerpt"):
         _, out = validate_decision_card(card_message(body=card_body(**{field: "&sol;yolo $$"})))
         assert [ln for ln in out.splitlines() if "/" in ln] == [
@@ -251,3 +253,8 @@ def test_cashtags_html_entities_and_rich_markdown_dollars_are_neutralised() -> N
 def test_digit_first_slash_commands_are_inert(word: str) -> None:
     out = _free_text(f"x /{word} y")
     assert "/" not in out
+
+
+def test_ampersand_and_dollar_keep_their_meaning() -> None:
+    out = _free_text("AT&T R&D costs $100")
+    assert out == "AT\uff06T R\uff06D costs \uff04100"

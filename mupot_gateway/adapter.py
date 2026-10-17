@@ -1263,7 +1263,10 @@ class MupotAdapter(BasePlatformAdapter):
         state_path = extra.get("state_path") or str(get_hermes_home() / "platforms" / "mupot" / "state.json")
         self.store = StateStore(Path(str(state_path)))
         loaded, state_valid = self.store.load_checked()
-        self.notification_recipients = dict(extra.get("notification_recipients") or {})
+        self.notification_recipients = {
+            str(k): str(v)
+            for k, v in dict(extra.get("notification_recipients") or {}).items()
+        }  # unquoted YAML ints must equal the str user ids compared downstream
         self.notification_activate = extra.get("notification_activate") is True
         routine_events_enabled = extra.get("routine_events_enabled", False)
         if not isinstance(routine_events_enabled, bool):

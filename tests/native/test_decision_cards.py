@@ -405,3 +405,37 @@ async def test_raw_lone_surrogate_envelope_is_dead_lettered_and_acked_not_raised
     saved = state(tmp_path)
     assert [e["reason"] for e in saved["dlq"]] == ["invalid_decision_card"]
     assert client.calls == [("inbox_ack", {"ids": ["msg-card-1"]})]
+
+
+@pytest.mark.asyncio
+async def test_int_recipient_from_yaml_is_normalised_and_delivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from plugin.mupot_gateway import notifications
+
+    sent: list[str] = []
+
+    async def deliver_text(target, text):
+        sent.append(text)
+        return {"message_id": "x", "platform": "telegram", "chat_id": target["chat_id"]}
+
+    monkeypatch.setattr(notifications, "deliver_text", deliver_text)
+    _sessions(monkeypatch, notifications, [])
+    adapter = adapter_at(tmp_path, Client(), recipients=False, notification_recipients={"telegram": 123456789})
+    await adapter._process_leased_message(message())
+    await adapter._flush_notifications()
+    assert len(sent) == 1
+    assert state(tmp_path)["notification_outbox"]["msg-card-1"]["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_refused_recipient_warning_is_throttled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from plugin.mupot_gateway import notifications
+
+    monkeypatch.setattr(notifications, "_REFUSED_WARNED", set())
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            assert notifications.direct_target({"telegram": "@chan"}) is None
+    assert len([r for r in caplog.records if "refusing direct send" in r.message]) == 1

@@ -377,7 +377,7 @@ def wire_telegram_handler(manager: Any, loaded: Any, monkeypatch: Any):
     factory, owner = factories[0]
     assert owner == "mupot"
     application = SimpleNamespace(
-        add_handler=handlers.append,
+        add_handler=lambda handler, group=0: handlers.append(handler),
         remove_handler=lambda handler, group=0: handlers.remove(handler),
     )
     factory(application, object())
@@ -389,6 +389,14 @@ def wire_telegram_handler(manager: Any, loaded: Any, monkeypatch: Any):
     opener = TelegramOpener()
     monkeypatch.setattr(control_module, "build_opener", lambda *_: opener)
     return handlers[0], opener
+
+
+async def _invoke(handler: Any, update: Any) -> None:
+    """A matched command ends propagation via ApplicationHandlerStop by design."""
+    from telegram.ext import ApplicationHandlerStop
+
+    with pytest.raises(ApplicationHandlerStop):
+        await handler.callback(update, object())
 
 
 def telegram_update(replies: list[str], update_id: int = 1) -> Any:
@@ -413,9 +421,9 @@ async def test_primary_telegram_handler_uses_fresh_owning_profile_scope(
     handler, opener = wire_telegram_handler(manager, loaded, monkeypatch)
     replies: list[str] = []
     try:
-        await handler.callback(telegram_update(replies), object())
+        await _invoke(handler, telegram_update(replies))
         write_secrets(home, webhook_secret="rotated-owning-profile-webhook-secret")
-        await handler.callback(telegram_update(replies, 2), object())
+        await _invoke(handler, telegram_update(replies, 2))
     finally:
         manager.unload("mupot")
 
@@ -460,7 +468,7 @@ async def test_primary_telegram_handler_fails_closed_before_network_when_owner_i
         set_multiplex_active(True)
     replies: list[str] = []
     try:
-        await handler.callback(telegram_update(replies), object())
+        await _invoke(handler, telegram_update(replies))
         assert replies == ["Mupot project control is temporarily unavailable."]
         assert opener.calls == []
         assert GLOBAL_WEBHOOK_SECRET not in caplog.text

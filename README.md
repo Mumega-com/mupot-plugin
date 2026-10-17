@@ -183,13 +183,21 @@ participants who are not bound to an owned Hermes agent seat. For an owned membe
 natural language through their own agent is the primary, always-live decision channel — see
 "Human-origin attestation" below. The relay also has a known gap: Hermes's own Telegram
 polling-connection rebuild (a transient reconnect after a network hiccup) re-registers only
-Hermes's core message/command handlers, never a plugin's own `CommandHandler`s
+Hermes's core message/command handlers, never a plugin's own factory-registered handlers
 (`plugins/platforms/telegram/adapter.py`'s `_register_handlers`, called from
 `_initialize_app_with_retries` on every rebuilt polling `Application`) — so after such a
 rebuild, `/start` `/needs` `/answer` `/approve` `/reject` can silently stop responding until
 the whole gateway process restarts, with nothing in this plugin able to detect or repair it
-(there is no hook back into that rebuild path). `register_telegram_control` logs a WARNING
-naming this limitation whenever `telegram_control_enabled: true` is configured.
+(there is no hook back into that rebuild path).
+
+**0.16.1 — entity-less commands.** Telegram sends no `bot_command` entity for pasted text or
+text with leading whitespace, so PTB's `CommandHandler`/`filters.COMMAND` missed e.g.
+`/muapprove a2d32cf0` and Hermes core answered "Unrecognized slash command". The relay is now
+one `MessageHandler` (group -1, before core; stops propagation only on a match) matching
+`^\s*/(<enabled commands>)(@bot)?(\s|$)` case-insensitively; an `@botname` suffix must equal
+the bot's own username or the message is ignored. The first-person intake handler no longer
+consumes any text starting with `/`. Each successful relay logs `telegram_control relayed /<command>`
+at INFO (command name only). The startup WARNING was removed.
 
 ## Decision cards (0.16.0)
 

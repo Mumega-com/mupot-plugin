@@ -1544,6 +1544,10 @@ class _FakeFilters:
     COMMAND = _FakeFilterExpr("COMMAND")
     UpdateType = _FakeUpdateTypeNS()
 
+    @staticmethod
+    def Regex(pattern: Any) -> _FakeFilterExpr:
+        return _FakeFilterExpr(f"Regex({pattern})")
+
 
 class _FakeApplicationHandlerStop(Exception):
     pass
@@ -1600,6 +1604,8 @@ def test_register_first_person_wires_a_message_handler_scoped_to_real_messages(
     assert "UpdateType.MESSAGE" in handler.filter_expr.label
     assert "TEXT" in handler.filter_expr.label
     assert "~COMMAND" in handler.filter_expr.label
+    # An entity-less slash command must never be consumed as intake text.
+    assert "~Regex(^\\s*/)" in handler.filter_expr.label
 
 
 @pytest.mark.asyncio

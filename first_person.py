@@ -3667,7 +3667,14 @@ def register_first_person(
         # UpdateType.MESSAGE excludes edited-message updates at the PTB
         # dispatch layer itself (round-2 fix: an edit must never re-enter as
         # the next answer).
-        message_filter = filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND
+        # An entity-less slash command ("/muapprove x" pasted, or with leading
+        # whitespace) is not filters.COMMAND but must never become intake text.
+        message_filter = (
+            filters.UpdateType.MESSAGE
+            & filters.TEXT
+            & ~filters.COMMAND
+            & ~filters.Regex(r"^\s*/")
+        )
         handler = MessageHandler(message_filter, handle)
         application.add_handler(handler, group=_FIRST_PERSON_HANDLER_GROUP)
         wired_applications.append((application, handler))

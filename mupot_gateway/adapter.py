@@ -1258,6 +1258,10 @@ class MupotAdapter(BasePlatformAdapter):
         if not isinstance(routine_events_enabled, bool):
             raise ValueError("routine_events_enabled must be a boolean")
         self.routine_events_enabled = routine_events_enabled
+        decision_cards_enabled = extra.get("decision_cards_enabled", False)
+        if not isinstance(decision_cards_enabled, bool):
+            raise ValueError("decision_cards_enabled must be a boolean")
+        self.decision_cards_enabled = decision_cards_enabled
         # Event-based wake (off by default). See mupot_gateway/sse_wake.py: the
         # stream only ever wakes the lease loop below; it never consumes.
         sse_wake_enabled = extra.get("sse_wake_enabled", False)
@@ -2977,6 +2981,12 @@ class MupotAdapter(BasePlatformAdapter):
                 "emergency stop is engaged",
             )
             raise _EstopDeferred(message_id)
+        if self.decision_cards_enabled:
+            from .decision_cards import is_decision_card_candidate
+
+            if is_decision_card_candidate(message):
+                await self._handle_decision_card(message, attempt_id=attempt_id)
+                return
         if is_routine_event_candidate(message):
             if self.routine_events_enabled:
                 await self._handle_routine_event(message, attempt_id=attempt_id)
@@ -3013,6 +3023,55 @@ class MupotAdapter(BasePlatformAdapter):
             dlq.append({"message": message, "reason": "sender_policy"})
         self._state["dlq"] = dlq[-100:]
         self.store.save(self._state)
+        await self._ack_expected(message_id, attempt_id=attempt_id)
+        self._commit(message_id)
+
+    def _dlq_once(self, message: dict[str, Any], reason: str) -> None:
+        message_id = str(message.get("id") or "")
+        dlq = self._state["dlq"]
+        if not any(
+            str((entry.get("message") or {}).get("id") or "") == message_id
+            for entry in dlq
+        ):
+            dlq.append({"message": message, "reason": reason})
+        self._state["dlq"] = dlq[-100:]
+        self.store.save(self._state)
+
+    async def _handle_decision_card(
+        self,
+        message: dict[str, Any],
+        attempt_id: Optional[str] = None,
+    ) -> None:
+        """Human notice only: durable enqueue, then ACK once. No model turn.
+
+        The estop gate in `_process_leased_message` (the only caller) already
+        ran. `mupot-decision-card` is deliberately NOT in `allowed_agents`.
+        """
+        from .decision_cards import DecisionCardValidationError, validate_decision_card
+        from .notifications import enqueue
+
+        message_id = str(message.get("id") or "")
+        if message_id in self._state["processed"]:
+            await self._ack_expected(message_id, attempt_id=attempt_id)
+            return
+        try:
+            _, text = validate_decision_card(message)
+        except DecisionCardValidationError:
+            self._dlq_once(message, "invalid_decision_card")
+            await self._ack_expected(message_id, attempt_id=attempt_id)
+            self._commit(message_id)
+            return
+        if not self.notification_recipients:
+            logger.warning(
+                "[mupot] decision card message=%s has no notification_recipients; "
+                "quarantined",
+                message_id,
+            )
+            self._dlq_once(message, "decision_card_no_recipients")
+            await self._ack_expected(message_id, attempt_id=attempt_id)
+            self._commit(message_id)
+            return
+        enqueue(self._state, self.store, message, text, plain_card=True)
         await self._ack_expected(message_id, attempt_id=attempt_id)
         self._commit(message_id)
 

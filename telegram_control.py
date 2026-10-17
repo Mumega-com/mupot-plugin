@@ -22,7 +22,19 @@ from .telegram_fence import is_forwarded_telegram_message
 logger = logging.getLogger(__name__)
 
 
-_COMMANDS = ("start", "needs", "answer", "approve", "reject")
+# /start (pairing) and the namespaced /mu* decision commands are always relayed.
+# Bare /needs /answer /approve /reject shadow Hermes's own /approve (and the
+# first-person/agent flows), so they relay only when the operator opts back in
+# with telegram_control_legacy_bare_commands: true.
+_CORE_COMMANDS = ("start", "muneeds", "muanswer", "muapprove", "mureject")
+_LEGACY_BARE_COMMANDS = ("needs", "answer", "approve", "reject")
+_COMMANDS = _CORE_COMMANDS + _LEGACY_BARE_COMMANDS  # every command this module can ever relay
+
+
+def _enabled_commands(settings: "TelegramControlSettings") -> tuple[str, ...]:
+    if settings.legacy_bare_commands:
+        return _CORE_COMMANDS + _LEGACY_BARE_COMMANDS
+    return _CORE_COMMANDS
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,127}\Z")
 _MAX_REQUEST_BYTES = 32 * 1024
 _MAX_RESPONSE_BYTES = 64 * 1024
@@ -55,6 +67,7 @@ class TelegramControlSettings:
     base_url: str
     webhook_secret_env: str = "IM_WEBHOOK_SECRET"
     timeout: float = 20.0
+    legacy_bare_commands: bool = False
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "TelegramControlSettings":
@@ -72,6 +85,10 @@ class TelegramControlSettings:
                 "telegram control webhook secret environment-variable name is invalid"
             )
 
+        legacy_bare = value.get("telegram_control_legacy_bare_commands", False)
+        if not isinstance(legacy_bare, bool):
+            raise ValueError("telegram_control_legacy_bare_commands must be a boolean")
+
         timeout_value = value.get(
             "telegram_control_timeout", value.get("timeout", 20.0)
         )
@@ -85,6 +102,7 @@ class TelegramControlSettings:
             base_url=base_url.strip(),
             webhook_secret_env=env_name.strip(),
             timeout=timeout,
+            legacy_bare_commands=legacy_bare,
         )
         settings.validate()
         return settings
@@ -92,6 +110,9 @@ class TelegramControlSettings:
     def validate(self) -> None:
         if not isinstance(self.enabled, bool):
             raise ValueError("telegram control enabled must be a boolean")
+
+        if not isinstance(self.legacy_bare_commands, bool):
+            raise ValueError("telegram control legacy_bare_commands must be a boolean")
 
         if not isinstance(self.base_url, str) or self.base_url != self.base_url.strip():
             raise ValueError("telegram control base_url must be a valid HTTPS URL")
@@ -131,7 +152,9 @@ def _required_telegram_id(value: Any, label: str) -> int | str:
     raise ValueError(f"telegram {label} is invalid")
 
 
-def _sanitized_envelope(update: Any) -> dict[str, Any]:
+def _sanitized_envelope(
+    update: Any, commands: tuple[str, ...] = _CORE_COMMANDS
+) -> dict[str, Any]:
     user = getattr(update, "effective_user", None)
     chat = getattr(update, "effective_chat", None)
     message = getattr(update, "effective_message", None)
@@ -157,7 +180,7 @@ def _sanitized_envelope(update: Any) -> dict[str, Any]:
     if len(text) > _MAX_TEXT_CHARS:
         raise RuntimeError("telegram control request exceeds the size limit")
     command = text.split(maxsplit=1)[0].split("@", 1)[0]
-    if command not in {f"/{name}" for name in _COMMANDS}:
+    if command not in {f"/{name}" for name in commands}:
         raise ValueError("telegram command is not supported")
 
     display_name = getattr(user, "full_name", "")
@@ -180,7 +203,7 @@ def relay_telegram_update(settings: TelegramControlSettings, update: Any) -> str
     if not settings.enabled:
         raise RuntimeError("telegram control is disabled")
 
-    envelope = _sanitized_envelope(update)
+    envelope = _sanitized_envelope(update, _enabled_commands(settings))
     body = json.dumps(envelope, separators=(",", ":"), ensure_ascii=False).encode(
         "utf-8"
     )
@@ -196,6 +219,9 @@ def relay_telegram_update(settings: TelegramControlSettings, update: Any) -> str
         data=body,
         headers={
             "Content-Type": "application/json",
+            # Cloudflare's WAF on the mupot host answers 403 to the default
+            # "Python-urllib/x.y" agent before the worker sees the request.
+            "User-Agent": "mupot-hermes-plugin/telegram-control",
             "X-Telegram-Bot-Api-Secret-Token": secret,
         },
         method="POST",
@@ -254,7 +280,7 @@ def register_telegram_control(
         "restarts) -- see README.md's 'Telegram project control' section. For an owned "
         "member, plain natural language through their own agent is the primary, always-live "
         "path.",
-        " /".join(_COMMANDS),
+        " /".join(_enabled_commands(settings)),
     )
 
     wired_applications: list[tuple[Any, list[Any]]] = []
@@ -278,14 +304,21 @@ def register_telegram_control(
                 reply = await asyncio.to_thread(relay)
             except ValueError:
                 reply = _REFUSAL_REPLY
-            except Exception:
+            except Exception as exc:
+                # Class + constant message only: every error raised on this
+                # path is a fixed string that never carries secrets or text.
+                logger.warning(
+                    "mupot plugin: telegram_control relay failed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
                 reply = _UNAVAILABLE_REPLY
             message = getattr(update, "effective_message", None)
             if message is not None:
                 await message.reply_text(reply)
 
         handlers: list[Any] = []
-        for command in _COMMANDS:
+        for command in _enabled_commands(settings):
             handler = CommandHandler(command, handle)
             application.add_handler(handler)
             handlers.append(handler)

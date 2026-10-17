@@ -289,12 +289,17 @@ def enqueue(
     *,
     activation_required=False,
     activation_after_processed=False,
+    plain_card=False,
 ):
     source_id = str(source.get("id") or "")
     if not source_id or not text.strip():
         raise NotificationCustodyError("Notification custody input is invalid")
 
-    notice_text = _notice_text(source, text)
+    # plain_card: a pre-validated, pre-sanitised human decision card (see
+    # decision_cards.py). It is sent as the card text itself -- not wrapped in
+    # the "Mupot update ... Reply here to guide the next step" peer frame, and
+    # not fenced for the Telegram send (the conversation mirror stays fenced).
+    notice_text = text if plain_card else _notice_text(source, text)
     fingerprint = _source_fingerprint(source, notice_text)
     durable, valid = store.load_checked()
     if not valid:
@@ -321,7 +326,7 @@ def enqueue(
             activation_required
         ) or bool(existing.get("activation_after_processed")) != bool(
             activation_after_processed
-        ):
+        ) or bool(existing.get("plain_card")) != bool(plain_card):
             raise NotificationConflict("Notification source conflict")
         candidate = copy.deepcopy(durable)
         expected = candidate["notification_outbox"][source_id]
@@ -381,6 +386,8 @@ def enqueue(
         expected["activation_required"] = True
     if activation_after_processed:
         expected["activation_after_processed"] = True
+    if plain_card:
+        expected["plain_card"] = True
     outbox[source_id] = expected
     _persist_notice(state, store, candidate, source_id, expected)
 
@@ -615,7 +622,12 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
                 # the "quoted, not a command" framing for the human reading it.
                 notice.update(status="sending", delivery_status="sending")
                 store.save(state)
-                notice["delivery_receipt"] = await deliver_text(target, fenced_text)
+                # A validated decision card is the human's own notice: ship the
+                # sanitised card text. Everything else keeps the fenced frame.
+                notice["delivery_receipt"] = await deliver_text(
+                    target,
+                    notice["text"] if notice.get("plain_card") is True else fenced_text,
+                )
                 notice.update(status="pending", delivery_status="receipt_recorded")
                 store.save(state)
             # CHOKE POINT for the conversation mirror (kasra-review re-gate #3,

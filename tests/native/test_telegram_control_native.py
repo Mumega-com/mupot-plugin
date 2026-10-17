@@ -150,22 +150,22 @@ async def test_discovered_handlers_isolate_commands_and_are_owned_on_unload(
     assert len(plugin_handlers) == 5
     assert [next(iter(handler.commands)) for handler in plugin_handlers] == [
         "start",
-        "needs",
-        "answer",
-        "approve",
-        "reject",
+        "muneeds",
+        "muanswer",
+        "muapprove",
+        "mureject",
     ]
     assert group_zero[5:]  # Hermes core handlers remain registered after the plugin.
 
     application._initialized = True
     await application.process_update(_telegram_update(application, "/start invite-1", 1))
     await application.process_update(
-        _telegram_update(application, "/answer decision-1 accept", 2)
+        _telegram_update(application, "/muanswer decision-1 accept", 2)
     )
     await application.process_update(_telegram_update(application, "ordinary work", 3))
 
-    assert relayed == ["/start invite-1", "/answer decision-1 accept"]
-    assert replies == ["Mupot handled /start", "Mupot handled /answer"]
+    assert relayed == ["/start invite-1", "/muanswer decision-1 accept"]
+    assert replies == ["Mupot handled /start", "Mupot handled /muanswer"]
     assert core_turns == ["ordinary work"]
 
     assert manager.unload("mupot") is True

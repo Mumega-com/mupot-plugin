@@ -42,7 +42,7 @@ class Opener:
 
 
 def update(update_id: int = 1) -> Any:
-    message = SimpleNamespace(text="/needs")
+    message = SimpleNamespace(text="/muneeds")
     return SimpleNamespace(
         update_id=update_id,
         effective_user=SimpleNamespace(id=123, full_name="Ada"),

@@ -107,7 +107,7 @@ async def test_discovered_handlers_isolate_commands_and_are_owned_on_unload(
     from hermes_cli import plugins
     from plugins.platforms.telegram.adapter import TelegramAdapter
     from telegram import Message, User
-    from telegram.ext import Application, CommandHandler
+    from telegram.ext import Application, MessageHandler
 
     control_module = sys.modules[f"{loaded.module.__name__}.telegram_control"]
     relayed: list[str] = []
@@ -143,19 +143,13 @@ async def test_discovered_handlers_isolate_commands_and_are_owned_on_unload(
     adapter._wire_plugin_handlers(application)
     adapter._register_handlers(application)
 
-    group_zero = application.handlers[0]
     plugin_handlers = [
-        handler for handler in group_zero if isinstance(handler, CommandHandler)
+        handler
+        for handler in application.handlers[-1]
+        if isinstance(handler, MessageHandler)
     ]
-    assert len(plugin_handlers) == 5
-    assert [next(iter(handler.commands)) for handler in plugin_handlers] == [
-        "start",
-        "muneeds",
-        "muanswer",
-        "muapprove",
-        "mureject",
-    ]
-    assert group_zero[5:]  # Hermes core handlers remain registered after the plugin.
+    assert len(plugin_handlers) == 1  # one handler, wired once despite double wiring
+    assert application.handlers[0]  # Hermes core handlers remain registered.
 
     application._initialized = True
     await application.process_update(_telegram_update(application, "/start invite-1", 1))
@@ -170,7 +164,7 @@ async def test_discovered_handlers_isolate_commands_and_are_owned_on_unload(
 
     assert manager.unload("mupot") is True
     assert manager.get_telegram_handler_factories() == []
-    assert all(handler not in application.handlers[0] for handler in plugin_handlers)
+    assert not application.handlers.get(-1)
 
 
 def test_targeted_unload_preserves_another_owner_of_the_same_factory(
@@ -197,3 +191,153 @@ def test_targeted_unload_preserves_another_owner_of_the_same_factory(
         ]
     finally:
         manager.unload()
+
+
+async def _wired_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, lstrip_entity: bool = True):
+    """Real PTB Application: plugin wired first, then a core-like catch-all."""
+    manager, loaded = _discover_plugin(tmp_path, monkeypatch)
+    from hermes_cli import plugins
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    from gateway.config import PlatformConfig
+    from telegram import Message, User
+    from telegram.ext import Application, MessageHandler, filters
+
+    control_module = sys.modules[f"{loaded.module.__name__}.telegram_control"]
+    relayed: list[str] = []
+
+    def relay(_settings, update) -> str:
+        relayed.append(update.effective_message.text)
+        return "ok"
+
+    monkeypatch.setattr(control_module, "relay_telegram_update", relay)
+    replies: list[str] = []
+
+    async def reply_text(_message, text: str, **_kwargs) -> None:
+        replies.append(text)
+
+    monkeypatch.setattr(Message, "reply_text", reply_text)
+    application = Application.builder().token("123:test-token").build()
+    application.bot._bot_user = User(
+        id=999, is_bot=True, first_name="Mupot Test", username="mupot_test_bot"
+    )
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="123:test-token", extra={})
+    )
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    adapter._wire_plugin_handlers(application)
+    core: list[str] = []
+
+    async def catch_all(update, _context) -> None:
+        core.append(update.effective_message.text)
+
+    # Core-like text path, added AFTER the plugin, in group 0.
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catch_all))
+    application._initialized = True
+    return application, relayed, replies, core, control_module
+
+
+def _entityless(application, text: str, update_id: int, *, entities=None, edited=False):
+    from telegram import Update
+
+    key = "edited_message" if edited else "message"
+    return Update.de_json(
+        {
+            "update_id": update_id,
+            key: {
+                "message_id": update_id,
+                "date": 0,
+                "chat": {"id": 123, "type": "private", "first_name": "Ada"},
+                "from": {"id": 123, "is_bot": False, "first_name": "Ada"},
+                "text": text,
+                **({"entities": entities} if entities else {}),
+            },
+        },
+        application.bot,
+    )
+
+
+@pytest.mark.asyncio
+async def test_entityless_and_whitespace_commands_reach_plugin_not_core(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    application, relayed, replies, core, _ = await _wired_app(tmp_path, monkeypatch)
+    await application.process_update(_entityless(application, "/muapprove abcdef12", 1))
+    await application.process_update(_entityless(application, "  /muapprove abcdef12", 2))
+    await application.process_update(_entityless(application, "/MUAPPROVE abcdef12", 3))
+    await application.process_update(
+        _entityless(
+            application,
+            "/muapprove abcdef12",
+            4,
+            entities=[{"type": "bot_command", "offset": 0, "length": 10}],
+        )
+    )
+    await application.process_update(
+        _entityless(application, "/muapprove@MUPOT_test_bot abcdef12", 5)
+    )
+    assert len(relayed) == 5
+    assert replies == ["ok"] * 5
+    assert core == []  # core never sees a plugin command
+
+
+@pytest.mark.asyncio
+async def test_other_bot_suffix_edited_and_plain_text_are_not_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    application, relayed, replies, core, _ = await _wired_app(tmp_path, monkeypatch)
+    await application.process_update(
+        _entityless(application, "/muapprove@otherbot abcdef12", 1)
+    )
+    await application.process_update(
+        _entityless(application, "/muapprove abcdef12", 2, edited=True)
+    )
+    await application.process_update(_entityless(application, "/muapproveX abc", 3))
+    await application.process_update(_entityless(application, "hello /muapprove", 4))
+    assert relayed == [] and replies == []
+    # Everything the plugin does not own still reaches the core-like catch-all
+    # (not swallowed). The plugin itself ignores the edited update.
+    assert core == [
+        "/muapprove@otherbot abcdef12",
+        "/muapprove abcdef12",  # the edited message, answered by no plugin
+        "/muapproveX abc",
+        "hello /muapprove",
+    ]
+
+
+def test_first_person_intake_filter_ignores_entityless_slash_text() -> None:
+    """Real PTB filters: pasted/whitespace-led slash text is never intake text."""
+    from unittest.mock import MagicMock
+
+    from telegram.ext import Application
+
+    plugin_module = sys.modules["plugin"]
+    from plugin.first_person import FirstPersonSettings, register_first_person
+
+    factories: list = []
+    ctx = MagicMock()
+    ctx.register_telegram_handler = factories.append
+    ctx._manager = None
+    register_first_person(
+        ctx,
+        FirstPersonSettings(
+            enabled=True,
+            base_url="https://pot.example.invalid/base",
+            webhook_secret_env="TEST_IM_WEBHOOK_SECRET",
+            timeout=7.0,
+        ),
+        client=MagicMock(),
+    )
+    application = Application.builder().token("123:test-token").build()
+    factories[0](application, None)
+    (handler,) = application.handlers[-5]
+    assert plugin_module is not None
+
+    def matches(text: str) -> bool:
+        return bool(
+            handler.check_update(_entityless(application, text, 1))
+        )
+
+    assert matches("hello there")
+    assert not matches("/muapprove abcdef12")
+    assert not matches("  /muapprove abcdef12")
+    assert not matches("\n/start x")

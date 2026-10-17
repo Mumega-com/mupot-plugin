@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 # first-person/agent flows), so they relay only when the operator opts back in
 # with telegram_control_legacy_bare_commands: true.
 _CORE_COMMANDS = ("start", "muneeds", "muanswer", "muapprove", "mureject")
+# Runs after first_person's intake (-5) and before Hermes core (0).
+_CONTROL_HANDLER_GROUP = -1
 _LEGACY_BARE_COMMANDS = ("needs", "answer", "approve", "reject")
 _COMMANDS = _CORE_COMMANDS + _LEGACY_BARE_COMMANDS  # every command this module can ever relay
 
@@ -179,7 +181,13 @@ def _sanitized_envelope(
         raise ValueError("telegram command text is required")
     if len(text) > _MAX_TEXT_CHARS:
         raise RuntimeError("telegram control request exceeds the size limit")
-    command = text.split(maxsplit=1)[0].split("@", 1)[0]
+    # Telegram may deliver a command without a bot_command entity (pasted text,
+    # leading whitespace); Hermes core treats text.lstrip().startswith("/") as a
+    # command, so match on the stripped text here too and relay the stripped form.
+    text = text.lstrip()
+    if not text:
+        raise ValueError("telegram command text is required")
+    command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
     if command not in {f"/{name}" for name in commands}:
         raise ValueError("telegram command is not supported")
 
@@ -258,42 +266,25 @@ def register_telegram_control(
     if not settings.enabled:
         return
 
-    # Known limitation (evidence: kayhermes gateway journal 2026-09-15, plugin
-    # PR #11): Hermes's own transient-init reconnect path (plugins/platforms/
-    # telegram/adapter.py's _register_handlers, invoked from
-    # _initialize_app_with_retries on a rebuilt polling Application) re-adds
-    # ONLY Hermes's core handlers, never a plugin's own factory-registered
-    # CommandHandlers -- so after any such rebuild (a network hiccup mid-poll
-    # is enough), /start /needs /answer /approve /reject silently stop
-    # responding until the whole gateway process restarts, with nothing in
-    # this plugin able to detect or repair it (there is no hook back into
-    # that rebuild path). This relay stays available for members who are not
-    # bound to an owned Hermes agent; for an owned member the primary,
-    # always-live path is plain natural language through their own agent --
-    # see mupot_gateway/human_origin.py, whose task_verdict
-    # calls now carry a harness-stamped human_origin instead of needing a
-    # deterministic command at all.
-    logger.warning(
-        "mupot plugin: telegram_control's deterministic /%s commands are enabled as a "
-        "fallback for non-owned members. They do NOT survive Hermes's own Telegram "
-        "polling-connection rebuild (silently stop responding until the gateway process "
-        "restarts) -- see README.md's 'Telegram project control' section. For an owned "
-        "member, plain natural language through their own agent is the primary, always-live "
-        "path.",
-        " /".join(_enabled_commands(settings)),
-    )
-
     wired_applications: list[tuple[Any, list[Any]]] = []
 
     def factory(application: Any, adapter: Any) -> None:
         # Hermes loads backend plugins without platform SDK dependencies. Keep
         # the optional PTB import inside the native factory invoked at connect.
-        from telegram.ext import CommandHandler
+        from telegram.ext import ApplicationHandlerStop, MessageHandler, filters
 
         if any(existing is application for existing, _ in wired_applications):
             return
 
         async def handle(update: Any, context: Any) -> None:
+            message_text = getattr(getattr(update, "effective_message", None), "text", "")
+            head = message_text.split(maxsplit=1)[0] if message_text.strip() else ""
+            command_name, _, suffix = head.lstrip("/").partition("@")
+            command_name = command_name.lower()
+            if suffix:
+                bot_username = getattr(getattr(context, "bot", None), "username", None)
+                if not isinstance(bot_username, str) or suffix.lower() != bot_username.lower():
+                    return  # addressed to another bot: not ours, let it propagate
             try:
                 def relay() -> str:
                     if secret_owner is None:
@@ -313,21 +304,37 @@ def register_telegram_control(
                     exc,
                 )
                 reply = _UNAVAILABLE_REPLY
+            else:
+                logger.info("telegram_control relayed /%s", command_name)
             message = getattr(update, "effective_message", None)
             if message is not None:
                 await message.reply_text(reply)
+            # Only reached for a matched command: stop lower groups (Hermes
+            # core) from also answering it.
+            raise ApplicationHandlerStop
 
-        handlers: list[Any] = []
-        for command in _enabled_commands(settings):
-            handler = CommandHandler(command, handle)
-            application.add_handler(handler)
-            handlers.append(handler)
-        wired_applications.append((application, handlers))
+        # A MessageHandler (not CommandHandler/filters.COMMAND) because those
+        # require a bot_command entity at offset 0, which Telegram omits for
+        # pasted text or leading whitespace. Group -1 runs before core's group 0
+        # and a match stops propagation, so registration order never matters.
+        command_regex = (
+            r"^\s*/("
+            + "|".join(re.escape(name) for name in _enabled_commands(settings))
+            + r")(@[A-Za-z0-9_]{5,32})?(\s|$)"
+        )
+        message_filter = (
+            filters.UpdateType.MESSAGE
+            & filters.TEXT
+            & filters.Regex(re.compile(command_regex, re.IGNORECASE))
+        )
+        handler = MessageHandler(message_filter, handle)
+        application.add_handler(handler, group=_CONTROL_HANDLER_GROUP)
+        wired_applications.append((application, [handler]))
 
     def unload() -> None:
         for application, handlers in wired_applications:
             for handler in handlers:
-                application.remove_handler(handler, group=0)
+                application.remove_handler(handler, group=_CONTROL_HANDLER_GROUP)
         wired_applications.clear()
 
         manager = getattr(ctx, "_manager", None)

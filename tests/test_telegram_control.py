@@ -173,6 +173,62 @@ def test_settings_bound_timeout(bad_timeout: float) -> None:
         valid_settings(timeout=bad_timeout).validate()
 
 
+class _FakeStop(Exception):
+    pass
+
+
+class _FakeFilter:
+    def __init__(self, label: str, regex: object = None) -> None:
+        self.label = label
+        self.regex = regex
+
+    def __and__(self, other: "_FakeFilter") -> "_FakeFilter":
+        return _FakeFilter(
+            f"({self.label} & {other.label})", self.regex or other.regex
+        )
+
+
+class _FakeMessageHandler:
+    def __init__(self, message_filter: _FakeFilter, callback: object) -> None:
+        self.filter = message_filter
+        self.callback = callback
+        self.group: int | None = None
+
+
+class _FakeApplication:
+    def __init__(self) -> None:
+        self.handlers: list[_FakeMessageHandler] = []
+
+    def add_handler(self, handler: _FakeMessageHandler, group: int = 0) -> None:
+        handler.group = group
+        self.handlers.append(handler)
+
+
+def _install_fake_ptb(monkeypatch: pytest.MonkeyPatch) -> None:
+    telegram = types.ModuleType("telegram")
+    telegram_ext = types.ModuleType("telegram.ext")
+    telegram_ext.ApplicationHandlerStop = _FakeStop
+    telegram_ext.MessageHandler = _FakeMessageHandler
+    telegram_ext.filters = types.SimpleNamespace(
+        TEXT=_FakeFilter("TEXT"),
+        UpdateType=types.SimpleNamespace(MESSAGE=_FakeFilter("MESSAGE")),
+        Regex=lambda pattern: _FakeFilter("Regex", pattern),
+    )
+    monkeypatch.setitem(sys.modules, "telegram", telegram)
+    monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
+
+
+def _wire(monkeypatch: pytest.MonkeyPatch, settings: TelegramControlSettings) -> _FakeApplication:
+    _install_fake_ptb(monkeypatch)
+    factories: list[object] = []
+    register_telegram_control(
+        types.SimpleNamespace(register_telegram_handler=factories.append), settings
+    )
+    application = _FakeApplication()
+    factories[0](application, object())
+    return application
+
+
 def test_disabled_control_registers_no_native_handler() -> None:
     calls: list[object] = []
     ctx = types.SimpleNamespace(register_telegram_handler=calls.append)
@@ -180,78 +236,40 @@ def test_disabled_control_registers_no_native_handler() -> None:
     assert calls == []
 
 
-def test_factory_registers_only_the_five_exact_commands(
+def _matches(application: _FakeApplication, text: str) -> bool:
+    return bool(application.handlers[0].filter.regex.search(text))
+
+
+def test_factory_registers_one_group_minus_one_handler_matching_only_the_five_commands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    factories: list[object] = []
-    ctx = types.SimpleNamespace(register_telegram_handler=factories.append)
-    register_telegram_control(ctx, valid_settings())
-    assert len(factories) == 1
-
-    handlers: list[object] = []
-
-    class CommandHandler:
-        def __init__(self, command: str, callback: object) -> None:
-            self.command = command
-            self.callback = callback
-
-    telegram = types.ModuleType("telegram")
-    telegram_ext = types.ModuleType("telegram.ext")
-    telegram_ext.CommandHandler = CommandHandler
-    monkeypatch.setitem(sys.modules, "telegram", telegram)
-    monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
-    application = types.SimpleNamespace(add_handler=handlers.append)
-    factories[0](application, object())
-
-    assert [handler.command for handler in handlers] == [
-        "start",
-        "muneeds",
-        "muanswer",
-        "muapprove",
-        "mureject",
-    ]
-    assert all(handler.callback is handlers[0].callback for handler in handlers)
-
-
-def _register_commands(
-    monkeypatch: pytest.MonkeyPatch, settings: TelegramControlSettings
-) -> list[str]:
-    factories: list[object] = []
-    handlers: list[object] = []
-
-    class CommandHandler:
-        def __init__(self, command: str, callback: object) -> None:
-            self.command = command
-
-    telegram = types.ModuleType("telegram")
-    telegram_ext = types.ModuleType("telegram.ext")
-    telegram_ext.CommandHandler = CommandHandler
-    monkeypatch.setitem(sys.modules, "telegram", telegram)
-    monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
-    register_telegram_control(
-        types.SimpleNamespace(register_telegram_handler=factories.append), settings
-    )
-    factories[0](types.SimpleNamespace(add_handler=handlers.append), object())
-    return [handler.command for handler in handlers]
+    application = _wire(monkeypatch, valid_settings())
+    assert len(application.handlers) == 1
+    assert application.handlers[0].group == -1
+    for command in ("start", "muneeds", "muanswer", "muapprove", "mureject"):
+        assert _matches(application, f"/{command}")
+        assert _matches(application, f"  /{command} abc")
+        assert _matches(application, f"/{command}@some_bot abc")
+        assert _matches(application, f"/{command.upper()} abc")
+    for text in ("/muapproveX", "/mu", "approve abc", "x /muapprove", "/approve abc", "/needs"):
+        assert not _matches(application, text)
 
 
 def test_bare_commands_are_not_registered_by_default_so_hermes_approve_is_unshadowed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    commands = _register_commands(monkeypatch, valid_settings())
-    assert not {"needs", "answer", "approve", "reject"} & set(commands)
+    application = _wire(monkeypatch, valid_settings())
+    for text in ("/needs", "/answer x", "/approve x", "/reject x"):
+        assert not _matches(application, text)
 
 
 def test_legacy_flag_restores_the_bare_commands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    commands = _register_commands(
-        monkeypatch, valid_settings(legacy_bare_commands=True)
-    )
-    assert commands == [
-        "start", "muneeds", "muanswer", "muapprove", "mureject",
-        "needs", "answer", "approve", "reject",
-    ]
+    application = _wire(monkeypatch, valid_settings(legacy_bare_commands=True))
+    for text in ("/needs", "/answer x", "/approve x", "/reject x", "/muapprove x"):
+        assert _matches(application, text)
+    assert not _matches(application, "/approvex")
 
 
 def test_legacy_flag_must_be_boolean() -> None:
@@ -490,28 +508,11 @@ def test_relay_failure_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_native_callback_returns_safe_failure_without_starting_an_llm_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    factories: list[object] = []
-    handlers: list[object] = []
-
-    class CommandHandler:
-        def __init__(self, command: str, callback: object) -> None:
-            self.command = command
-            self.callback = callback
-
-    telegram = types.ModuleType("telegram")
-    telegram_ext = types.ModuleType("telegram.ext")
-    telegram_ext.CommandHandler = CommandHandler
-    monkeypatch.setitem(sys.modules, "telegram", telegram)
-    monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
     monkeypatch.setattr(
         "plugin.telegram_control.relay_telegram_update",
         lambda *_: (_ for _ in ()).throw(RuntimeError("sensitive approval body")),
     )
-    register_telegram_control(
-        types.SimpleNamespace(register_telegram_handler=factories.append),
-        valid_settings(),
-    )
-    factories[0](types.SimpleNamespace(add_handler=handlers.append), object())
+    handlers = _wire(monkeypatch, valid_settings()).handlers
     replies: list[str] = []
 
     async def reply_text(text: str) -> None:
@@ -519,7 +520,8 @@ async def test_native_callback_returns_safe_failure_without_starting_an_llm_turn
 
     update = Update()
     update.effective_message.reply_text = reply_text
-    await handlers[0].callback(update, object())
+    with pytest.raises(_FakeStop):
+        await handlers[0].callback(update, object())
     assert replies == ["Mupot project control is temporarily unavailable."]
     assert "sensitive approval body" not in replies[0]
 
@@ -536,24 +538,7 @@ async def test_runtime_multiplex_activation_after_registration_refuses_relay(
         scope={"TEST_IM_WEBHOOK_SECRET": "profile-secret"},
     )
     secret_scope.is_multiplex_active = lambda: runtime["multiplex"]
-    factories: list[object] = []
-    handlers: list[object] = []
-
-    class CommandHandler:
-        def __init__(self, command: str, callback: object) -> None:
-            self.command = command
-            self.callback = callback
-
-    telegram = types.ModuleType("telegram")
-    telegram_ext = types.ModuleType("telegram.ext")
-    telegram_ext.CommandHandler = CommandHandler
-    monkeypatch.setitem(sys.modules, "telegram", telegram)
-    monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
-    register_telegram_control(
-        types.SimpleNamespace(register_telegram_handler=factories.append),
-        valid_settings(),
-    )
-    factories[0](types.SimpleNamespace(add_handler=handlers.append), object())
+    handlers = _wire(monkeypatch, valid_settings()).handlers
     opener = Opener(AssertionError("network must not run"))
     monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
     replies: list[str] = []
@@ -565,7 +550,8 @@ async def test_runtime_multiplex_activation_after_registration_refuses_relay(
     update.effective_message.reply_text = reply_text
     runtime["multiplex"] = True
 
-    await handlers[0].callback(update, object())
+    with pytest.raises(_FakeStop):
+        await handlers[0].callback(update, object())
 
     assert replies == ["Mupot project control is temporarily unavailable."]
     assert opener.calls == []
@@ -688,26 +674,9 @@ async def test_native_callback_replies_with_refusal_for_an_unsupported_command(
 ) -> None:
     """The same refusal (M12) proven through the actual registered PTB callback, not
     just through relay_telegram_update directly."""
-    factories: list[object] = []
-    handlers: list[object] = []
-
-    class CommandHandler:
-        def __init__(self, command: str, callback: object) -> None:
-            self.command = command
-            self.callback = callback
-
-    telegram = types.ModuleType("telegram")
-    telegram_ext = types.ModuleType("telegram.ext")
-    telegram_ext.CommandHandler = CommandHandler
-    monkeypatch.setitem(sys.modules, "telegram", telegram)
-    monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
     opener = Opener(AssertionError("network must not run"))
     monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
-    register_telegram_control(
-        types.SimpleNamespace(register_telegram_handler=factories.append),
-        valid_settings(),
-    )
-    factories[0](types.SimpleNamespace(add_handler=handlers.append), object())
+    handlers = _wire(monkeypatch, valid_settings()).handlers
     replies: list[str] = []
 
     async def reply_text(text: str) -> None:
@@ -715,7 +684,8 @@ async def test_native_callback_replies_with_refusal_for_an_unsupported_command(
 
     update = Update(message=Message("/shutdown"))
     update.effective_message.reply_text = reply_text
-    await handlers[0].callback(update, object())
+    with pytest.raises(_FakeStop):
+        await handlers[0].callback(update, object())
     assert replies == [
         "This command is available only in your private, unforwarded Telegram chat."
     ]
@@ -784,3 +754,64 @@ def test_no_redirect_refuses_a_real_302_and_never_forwards_the_secret_header() -
         redirector_thread.join(timeout=5)
 
     assert captured == {}
+
+
+def test_envelope_accepts_leading_whitespace_and_relays_stripped_text() -> None:
+    from plugin.telegram_control import _sanitized_envelope
+
+    envelope = _sanitized_envelope(Update(message=Message(" \n /muapprove abcdef12")))
+    assert envelope["message"]["text"] == "/muapprove abcdef12"
+    upper = _sanitized_envelope(Update(message=Message("/MUApprove@Bot abcdef12")))
+    assert upper["message"]["text"] == "/MUApprove@Bot abcdef12"
+    for bad in ("   ", " /shutdown x", " /needs x"):
+        with pytest.raises(ValueError):
+            _sanitized_envelope(Update(message=Message(bad)))
+
+
+class _Ctx:
+    def __init__(self, username: object) -> None:
+        self.bot = types.SimpleNamespace(username=username)
+
+
+@pytest.mark.asyncio
+async def test_bot_suffix_must_equal_own_username_else_ignored_without_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handlers = _wire(monkeypatch, valid_settings()).handlers
+    relayed: list[object] = []
+    monkeypatch.setattr(
+        "plugin.telegram_control.relay_telegram_update",
+        lambda *_: relayed.append(1) or "ok",
+    )
+    replies: list[str] = []
+
+    async def reply_text(text: str) -> None:
+        replies.append(text)
+
+    for suffix, expect_handled in (("@otherbot", False), ("@MUPOT_test_bot", True)):
+        update = Update(message=Message(f"/muapprove{suffix} abcdef12"))
+        update.effective_message.reply_text = reply_text
+        if expect_handled:
+            with pytest.raises(_FakeStop):
+                await handlers[0].callback(update, _Ctx("mupot_test_bot"))
+        else:
+            await handlers[0].callback(update, _Ctx("mupot_test_bot"))  # no Stop
+    assert len(relayed) == 1 and replies == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_successful_relay_logs_command_name_only(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    handlers = _wire(monkeypatch, valid_settings()).handlers
+    monkeypatch.setattr("plugin.telegram_control.relay_telegram_update", lambda *_: "ok")
+
+    async def reply_text(text: str) -> None:
+        return None
+
+    update = Update(message=Message("/muapprove abcdef12"))
+    update.effective_message.reply_text = reply_text
+    with caplog.at_level("INFO", logger="plugin.telegram_control"):
+        with pytest.raises(_FakeStop):
+            await handlers[0].callback(update, _Ctx("b_bot_"))
+    assert [r.getMessage() for r in caplog.records] == ["telegram_control relayed /muapprove"]

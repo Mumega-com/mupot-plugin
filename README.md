@@ -203,6 +203,13 @@ human notice to `notification_recipients`, and ACKs once. It never starts a mode
 quarantined to the DLQ (`invalid_decision_card`) and ACKed. `mupot-review-gate` rows are
 unchanged. Delivery needs an active Telegram DM session for the configured recipient.
 
+**Install order: mupot PR #2014 (decision-card delivery and the `/mu*` aliases) must be deployed
+BEFORE this plugin is installed or `decision_cards_enabled` is turned on.** Otherwise
+`/muapprove` reaches a server without the aliases, and a habitual `/approve` lands on Hermes's
+own exec approval. With no active DM session the card is sent directly to the configured
+`notification_recipients` Telegram chat (logged as a warning); it is never a model turn, even
+with `notification_activate: true`.
+
 The human answers `/muapprove <id>` or `/mureject <id>` (also `/muneeds`, `/muanswer`);
 `telegram_control` relays them verbatim to mupot's `/im/webhook`. Bare `/needs /answer
 /approve /reject` are no longer handled by default (they shadowed Hermes's own `/approve`);

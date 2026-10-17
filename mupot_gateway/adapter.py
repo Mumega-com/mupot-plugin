@@ -3048,7 +3048,7 @@ class MupotAdapter(BasePlatformAdapter):
         ran. `mupot-decision-card` is deliberately NOT in `allowed_agents`.
         """
         from .decision_cards import DecisionCardValidationError, validate_decision_card
-        from .notifications import enqueue
+        from .notifications import NotificationConflict, enqueue
 
         message_id = str(message.get("id") or "")
         if message_id in self._state["processed"]:
@@ -3071,7 +3071,15 @@ class MupotAdapter(BasePlatformAdapter):
             await self._ack_expected(message_id, attempt_id=attempt_id)
             self._commit(message_id)
             return
-        enqueue(self._state, self.store, message, text, plain_card=True)
+        try:
+            enqueue(self._state, self.store, message, text, plain_card=True)
+        except NotificationConflict:
+            # Same id replayed with different facts: dead-letter this one row
+            # instead of letting it quarantine the whole inbox poll.
+            self._dlq_once(message, "decision_card_conflict")
+            await self._ack_expected(message_id, attempt_id=attempt_id)
+            self._commit(message_id)
+            return
         await self._ack_expected(message_id, attempt_id=attempt_id)
         self._commit(message_id)
 

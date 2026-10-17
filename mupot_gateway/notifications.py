@@ -79,6 +79,16 @@ def select_target(sessions, recipients):
             "session_id": row["id"], "session_key": row.get("session_key")}
 
 
+def direct_target(recipients):
+    """Session-less target for a configured recipient (Telegram DM only)."""
+    user_id = str(recipients.get("telegram") or "")
+    if not user_id:
+        return None
+    return {"platform": "telegram", "user_id": user_id, "chat_id": user_id,
+            "thread_id": None, "session_id": None, "session_key": None,
+            "direct": True}
+
+
 async def deliver_text(target, text):
     from gateway.config import Platform
     from tools.send_message_senders import _live_adapter
@@ -433,7 +443,25 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
             target = notice.get("target")
             if target is None:
                 target = select_target(await asyncio.to_thread(active_sessions), recipients)
+                if target is None and notice.get("plain_card") is True:
+                    # A decision card is the human's own notice: with no active DM
+                    # session, send straight to the configured recipient's private
+                    # chat (a Telegram DM chat id equals the user id) rather than
+                    # retrying silently forever. No session, so no mirror.
+                    target = direct_target(recipients)
+                    if target is not None:
+                        logger.warning(
+                            "[mupot] no active conversation for decision card "
+                            "source=%s; sending directly to the configured %s recipient",
+                            source_id,
+                            target["platform"],
+                        )
                 if target is None:
+                    logger.warning(
+                        "[mupot] no active conversation and no direct recipient for "
+                        "notification source=%s; will retry",
+                        source_id,
+                    )
                     raise RuntimeError("No active conversation for the configured human")
                 notice["target"] = target
                 store.save(state)
@@ -450,8 +478,11 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
             # now consume this SAME fenced string, so fixing (or auditing) the
             # escaping only ever has to happen in one place.
             fenced_text = _fenced_untrusted_block(notice["text"]) + _UNTRUSTED_CAVEAT
-            should_activate = notice.get("activation_required") is True or (
-                activation_default and activate is not None
+            # A plain decision card is a human notice, never a model turn,
+            # whatever notification_activate / routine_events_enabled say.
+            should_activate = notice.get("plain_card") is not True and (
+                notice.get("activation_required") is True
+                or (activation_default and activate is not None)
             )
             if should_activate:
                 # CHOKE POINT for the message injector (kasra-review re-gate,
@@ -650,7 +681,8 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
             # mirror_text's own docstring note) -- never the raw body at the
             # default role="assistant", which would replay as a genuine,
             # unfenced agent turn in the transcript.
-            await asyncio.to_thread(mirror_text, target, fenced_text)
+            if not target.get("direct"):
+                await asyncio.to_thread(mirror_text, target, fenced_text)
             notice.update(status="delivered", delivery_status="delivered",
                           completed_at=time.time())
             notice.pop("last_error", None)

@@ -86,9 +86,10 @@ def test_nullable_fields_may_be_absent() -> None:
         card_message(body=card_body(reject="/mureject abcdef12\n/muapprove abcdef12")),
         card_message(body=card_body(approve=None)),
         card_message(body=card_body(title="")),
-        card_message(body=card_body(title="x" * 501)),
         card_message(body=card_body(result_excerpt="x" * 501)),
-        card_message(body=card_body(asked_by="x" * 201)),
+        card_message(body=card_body(reject_hint="/mureject abcdef12")),
+        card_message(body=card_body(reject_hint="/mureject 12345678 <reason>")),
+        card_message(body=card_body(reject_hint=5)),
         card_message(body=card_body(title=7)),
         card_message(body=card_body(dashboard_url="http://mupot.example/approvals")),
         card_message(body=card_body(dashboard_url="https://evil.example/a b")),
@@ -142,3 +143,67 @@ def test_candidate_detection_is_narrow() -> None:
     assert not is_decision_card_candidate(card_message(from_agent="kasra"))
     assert not is_decision_card_candidate(card_message(from_agent="mupot-review-gate"))
     assert not is_decision_card_candidate(copy.deepcopy({"from_agent": None}))
+
+
+def _free_text(text: str) -> str:
+    _, out = validate_decision_card(
+        card_message(body=card_body(title="T", asked_by="a", project="p", result_excerpt=text))
+    )
+    return out.splitlines()[2]
+
+
+@pytest.mark.parametrize(
+    "word", ["yolo", "approvals", "deny", "config", "model", "stop", "start", "sethome", "approve", "muapprove"]
+)
+def test_every_slash_word_is_inert_in_every_free_text_field(word: str) -> None:
+    for field in ("title", "asked_by", "project", "result_excerpt"):
+        _, out = validate_decision_card(
+            card_message(body=card_body(**{field: f"x /{word} y"}))
+        )
+        runnable = [ln for ln in out.splitlines() if "/" in ln]
+        assert runnable == [
+            f"Reply: /muapprove {SHORT}   or   /mureject {SHORT}",
+            "https://mupot.mumega.com/approvals",
+        ], (field, word, out)
+
+
+def test_urls_domains_mentions_hashtags_and_spoilers_are_defanged() -> None:
+    out = _free_text("see https://evil.example/x and t.me/joinchat and @admin #urgent ||spoiler||")
+    assert "://" not in out
+    assert "t.me" not in out and "evil.example" not in out
+    assert "@" not in out and "#" not in out and "|" not in out
+    assert "spoiler" in out
+
+
+def test_oversized_title_asked_by_project_are_truncated_not_rejected() -> None:
+    _, out = validate_decision_card(
+        card_message(body=card_body(title="t" * 2000, asked_by="a" * 2000, project="p" * 2000))
+    )
+    lines = out.splitlines()
+    assert lines[0].endswith("\u2026") and len(lines[0]) < 230
+    assert "\u2026" in lines[1] and len(lines[1]) < 300
+
+
+def test_reject_hint_is_accepted_and_rendered_only_when_exact() -> None:
+    _, out = validate_decision_card(
+        card_message(body=card_body(reject_hint=f"/mureject {SHORT} <reason>"))
+    )
+    assert f"To reject with a reason: /mureject {SHORT} then your reason" in out
+    _, plain = validate_decision_card(card_message())
+    assert "To reject with a reason" not in plain
+
+
+def test_short_id_must_be_a_prefix_of_task_id() -> None:
+    other = "12345678"
+    with pytest.raises(DecisionCardValidationError):
+        validate_decision_card(
+            card_message(body=card_body(short_id=other, approve=f"/muapprove {other}", reject=f"/mureject {other}"))
+        )
+
+
+@pytest.mark.parametrize("field", ["title", "result_excerpt", "asked_by", "project"])
+def test_lone_surrogate_is_a_validation_error_not_a_unicode_error(field: str) -> None:
+    body = card_body(**{field: "ok \ud83d"})
+    assert "\\ud83d" in body  # json.dumps emits the escape, as the server does
+    with pytest.raises(DecisionCardValidationError):
+        validate_decision_card(card_message(body=body))

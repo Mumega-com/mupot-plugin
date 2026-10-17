@@ -33,15 +33,20 @@ _TASK_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 # https only, no userinfo/query/fragment; path limited to characters that are
 # inert in Telegram markdown (no underscore).
 _URL_RE = re.compile(r"^https://[A-Za-z0-9.-]{1,253}(?::\d{1,5})?(?:/[A-Za-z0-9.~%/-]{0,200})?$")
-_COMMAND_RE = re.compile(r"/(?=(?:mu)?(?:approve|reject|answer|needs)\b)", re.IGNORECASE)
-_MARKUP_CHARS = "`*_[]~<>\\"
+# EVERY slash-word is inert (/yolo, /approvals, /stop, /sethome, ...): only the
+# plugin-rendered Reply/hint lines and dashboard_url may carry a live command/link.
+_SLASH_RE = re.compile(r"/(?=[A-Za-z])")
+_SCHEME_RE = re.compile(r"://")
+_DOMAIN_RE = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+_MARKUP_CHARS = "`*_[]~<>\\|"
 
 # (field, hard cap in UTF-16 units before the card is rejected, required)
 _FIELD_CAPS = {
-    "title": (500, True),
+    # None cap = any length (the 8000-char body cap bounds it); display-truncated.
+    "title": (None, True),
     "priority": (32, False),
-    "project": (300, False),
-    "asked_by": (200, False),
+    "project": (None, False),
+    "asked_by": (None, False),
     "result_excerpt": (500, False),
 }
 _TITLE_DISPLAY = 200
@@ -84,14 +89,29 @@ def _clean(value: str, limit: int | None = None) -> str:
         else:
             kept.append(ch)
     text = " ".join("".join(kept).split())
-    text = _COMMAND_RE.sub("／", text)  # fullwidth solidus: visible, not a command
+    text = _SCHEME_RE.sub("\uff1a\uff0f\uff0f", text)
+    text = _DOMAIN_RE.sub(lambda m: m.group(0).replace(".", "\u2024"), text)
+    text = _SLASH_RE.sub("\uff0f", text)  # fullwidth solidus: visible, not a command
+    text = text.replace("@", "\uff20").replace("#", "\uff03")  # no mentions/hashtags
     if limit is not None and len(text) > limit:
         text = text[: limit - 1].rstrip() + "…"
     return text
 
 
 def validate_decision_card(message: Mapping[str, Any]) -> tuple[dict[str, str], str]:
-    """Return (normalised card fields, human notice text) or raise."""
+    """Return (normalised card fields, human notice text) or raise
+    DecisionCardValidationError -- and nothing else: a lone UTF-16 surrogate
+    (a server-side truncation can split an emoji) or any other unexpected
+    failure must dead-letter the card, not escape into the poll loop."""
+    try:
+        return _validate_decision_card(message)
+    except DecisionCardValidationError:
+        raise
+    except Exception:
+        raise DecisionCardValidationError("card could not be processed") from None
+
+
+def _validate_decision_card(message: Mapping[str, Any]) -> tuple[dict[str, str], str]:
     if not isinstance(message, Mapping):
         raise DecisionCardValidationError("envelope is invalid")
     body = message.get("body")
@@ -116,6 +136,13 @@ def validate_decision_card(message: Mapping[str, Any]) -> tuple[dict[str, str], 
     if not isinstance(parsed, dict) or parsed.get("type") != CARD_TYPE:
         raise DecisionCardValidationError("body type is invalid")
 
+    for value in parsed.values():
+        if isinstance(value, str):
+            try:
+                value.encode("utf-8")  # a lone surrogate cannot be stored or sent
+            except UnicodeError:
+                raise DecisionCardValidationError("card text is not valid Unicode") from None
+
     short_id = parsed.get("short_id")
     task_id = parsed.get("task_id")
     if (
@@ -139,11 +166,15 @@ def validate_decision_card(message: Mapping[str, Any]) -> tuple[dict[str, str], 
         if value is None and not required:
             fields[name] = ""
             continue
-        if not isinstance(value, str) or _utf16_length(value) > cap:
+        if not isinstance(value, str) or (cap is not None and _utf16_length(value) > cap):
             raise DecisionCardValidationError(f"{name} is invalid")
         fields[name] = value
     if not _clean(fields["title"]):
         raise DecisionCardValidationError("title is invalid")
+
+    hint = parsed.get("reject_hint")
+    if hint is not None and hint != f"/mureject {short_id} <reason>":
+        raise DecisionCardValidationError("reject_hint does not match the card")
 
     url = parsed.get("dashboard_url")
     if url is None:
@@ -165,6 +196,8 @@ def validate_decision_card(message: Mapping[str, Any]) -> tuple[dict[str, str], 
         lines.append(excerpt)
     lines.append("")
     lines.append(f"Reply: /muapprove {short_id}   or   /mureject {short_id}")
+    if hint is not None:
+        lines.append(f"To reject with a reason: /mureject {short_id} then your reason")
     if url:
         lines.append(url)
     return {"short_id": short_id, "task_id": task_id}, "\n".join(lines)

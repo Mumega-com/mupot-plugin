@@ -68,8 +68,9 @@ def adapter_at(
     enabled: bool = True,
     recipients: bool = True,
     injector=None,
+    **more: object,
 ) -> MupotAdapter:
-    extra: dict[str, object] = {
+    extra: dict[str, object] = {**more,
         "allowed_agents": "kasra",
         "decision_cards_enabled": enabled,
         "state_path": str(tmp_path / "state.json"),
@@ -251,3 +252,121 @@ def test_decision_cards_enabled_must_be_boolean(tmp_path: Path) -> None:
             ),
             client_factory=lambda *_: Client(),
         )
+
+
+def _sessions(monkeypatch, notifications, rows) -> None:
+    monkeypatch.setattr(notifications, "active_sessions", lambda: rows)
+
+
+DM = {
+    "id": "human", "session_key": "agent:main:telegram:dm:123", "source": "telegram",
+    "user_id": "owner", "chat_id": "123", "chat_type": "dm", "last_active": 1,
+}
+
+
+@pytest.mark.asyncio
+async def test_card_is_sent_never_activated_even_with_notification_activate_and_routine_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from plugin.mupot_gateway import notifications
+
+    sent: list[str] = []
+    activations: list[str] = []
+
+    async def deliver_text(target, text):
+        sent.append(text)
+        return {"message_id": "tg-1", "platform": "telegram", "chat_id": "123"}
+
+    monkeypatch.setattr(notifications, "deliver_text", deliver_text)
+    monkeypatch.setattr(notifications, "mirror_text", lambda t, x: None)
+    _sessions(monkeypatch, notifications, [DM])
+    adapter = adapter_at(
+        tmp_path, Client(),
+        injector=lambda content, **kw: activations.append(content) or True,
+        notification_activate=True, routine_events_enabled=True,
+    )
+    await adapter._process_leased_message(message())
+    await adapter._flush_notifications()
+    assert len(sent) == 1 and sent[0].startswith("Decision needed:")
+    assert activations == []
+    assert state(tmp_path)["notification_outbox"]["msg-card-1"]["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_no_active_dm_session_falls_back_to_direct_send_to_configured_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from plugin.mupot_gateway import notifications
+
+    sent: list[tuple[dict, str]] = []
+    mirrored: list[str] = []
+
+    async def deliver_text(target, text):
+        sent.append((target, text))
+        return {"message_id": "tg-1", "platform": "telegram", "chat_id": target["chat_id"]}
+
+    monkeypatch.setattr(notifications, "deliver_text", deliver_text)
+    monkeypatch.setattr(notifications, "mirror_text", lambda t, x: mirrored.append(x))
+    _sessions(monkeypatch, notifications, [])
+    adapter = adapter_at(tmp_path, Client())
+    await adapter._process_leased_message(message())
+    with caplog.at_level("WARNING"):
+        await adapter._flush_notifications()
+    assert len(sent) == 1
+    assert sent[0][0]["chat_id"] == "owner" and sent[0][0]["platform"] == "telegram"
+    assert sent[0][1].startswith("Decision needed:")
+    assert mirrored == []  # no session to mirror into
+    assert any("no active conversation" in r.message for r in caplog.records)
+    assert state(tmp_path)["notification_outbox"]["msg-card-1"]["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_non_card_notice_still_requires_an_active_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from plugin.mupot_gateway import notifications
+
+    sent: list[str] = []
+
+    async def deliver_text(target, text):
+        sent.append(text)
+        return {"message_id": "x", "platform": "telegram", "chat_id": "1"}
+
+    monkeypatch.setattr(notifications, "deliver_text", deliver_text)
+    _sessions(monkeypatch, notifications, [])
+    adapter = adapter_at(tmp_path, Client())
+    notifications.enqueue(adapter._state, adapter.store, {"id": "peer-1", "from_agent": "kasra"}, "hi")
+    await adapter._flush_notifications()
+    assert sent == []
+    assert state(tmp_path)["notification_outbox"]["peer-1"]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_conflicting_redelivery_is_dead_lettered_and_acked_not_raised(
+    tmp_path: Path,
+) -> None:
+    client = Client()
+    adapter = adapter_at(tmp_path, client)
+    await adapter._process_leased_message(message())
+    # Same source id, different facts, and not yet marked processed.
+    adapter._state["processed"] = []
+    adapter.store.save(adapter._state)
+    await adapter._process_leased_message(
+        message(body=card_body(title="A different title"))
+    )
+    assert [e["reason"] for e in state(tmp_path)["dlq"]] == ["decision_card_conflict"]
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["title", "result_excerpt"])
+async def test_lone_surrogate_card_is_dead_lettered_and_acked_not_raised(
+    tmp_path: Path, field: str
+) -> None:
+    client = Client()
+    adapter = adapter_at(tmp_path, client)
+    await adapter._process_leased_message(message(body=card_body(**{field: "x \ud83d"})))
+    saved = state(tmp_path)
+    assert [e["reason"] for e in saved["dlq"]] == ["invalid_decision_card"]
+    assert saved.get("notification_outbox", {}) == {}
+    assert client.calls == [("inbox_ack", {"ids": ["msg-card-1"]})]

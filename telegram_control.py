@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # Bare /needs /answer /approve /reject shadow Hermes's own /approve (and the
 # first-person/agent flows), so they relay only when the operator opts back in
 # with telegram_control_legacy_bare_commands: true.
-_CORE_COMMANDS = ("start", "muneeds", "muanswer", "muapprove", "mureject")
+_CORE_COMMANDS = ("start", "muneeds", "muanswer", "muapprove", "mureject", "mulogin")
 # Runs after first_person's intake (-5) and before Hermes core (0).
 _CONTROL_HANDLER_GROUP = -1
 _LEGACY_BARE_COMMANDS = ("needs", "answer", "approve", "reject")

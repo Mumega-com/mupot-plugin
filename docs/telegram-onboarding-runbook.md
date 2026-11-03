@@ -213,10 +213,25 @@ or a completed turn. If saving the queued state fails after acceptance, the earl
 uncertain state remains the replay fence. Routine activation eligibility is read from the
 exact durable processed Routine receipt, not the bounded recent `processed` ID window.
 
+`activation_deferred` is the opposite case: the receiver proved, before calling Hermes, that
+the gateway was not live yet (reason `no_live_gateway`, typical right after a restart while
+Telegram is still connecting), so nothing was scheduled. It is retried automatically once
+the gateway is ready, with 10s-doubling backoff capped at 300s, and gives up after 12
+deferrals as `activation_failed`. `activation_failed` is terminal, appears in
+`stranded_notifications`, and is never retried automatically; nothing was delivered, so
+once you confirm the need is still live, step 3 of the runbook below (a fresh ordinary
+notification) is safe. Only `activation_unknown` (the injector was called and the outcome
+is unknown) stays a no-replay fence.
+
+Rows already at `activation_unknown` before this change are NOT migrated or retried: an
+earlier startup race left them there, but the plugin cannot prove from the row alone that
+the injection did not happen. Reconcile them manually with the runbook below.
+
 ### Operating on a stranded notification
 
 Call the `mupot_gateway_status` MCP tool to see any notification the receiver could not
 resolve: `stranded_notifications` lists every source ID currently at status
+`activation_failed` (never became ready within the retry cap; nothing was sent),
 `activation_unknown` (Hermes accepted or refused scheduling, but the receiver crashed or
 lost the response before it could persist which) or `transport_unknown` (the same
 ambiguity for a direct channel send). Both are deliberately durable, deliberately

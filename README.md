@@ -104,6 +104,15 @@ scheduling but persisting `activation_queued` fails, the receiver retains the ea
 uncertain state and requires operator reconciliation. Routine activation is authorized by
 the exact durable processed Routine receipt, not by the bounded recent `processed` list.
 
+A DEFINITE pre-delivery refusal is different. Before activating, the receiver probes whether
+the Hermes gateway message injector is registered (a live gateway). If it is not (for example
+on startup, before Telegram has connected), nothing is injected and no `activating` fence is
+written: the notice becomes `activation_deferred` (reason in `activation_deferred_reason`)
+and is retried with 10s-doubling backoff capped at 300s. After 12 deferrals it becomes the
+terminal, operator-visible `activation_failed` (listed in `stranded_notifications`). Any
+outcome after the injector was actually called (exception, timeout, a bare `False`, a crash)
+remains `activation_unknown` and is never retried automatically.
+
 For the broader project-onboarding and human-control scope, see
 [`docs/human-project-control.md`](docs/human-project-control.md).
 

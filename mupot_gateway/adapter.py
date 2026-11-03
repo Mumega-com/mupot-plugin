@@ -69,7 +69,9 @@ _LEASE_ATTEMPT_MARKER_VERSION = 3
 # _LEASE_ATTEMPT_ID_RE itself is imported above from .lease_ownership (single shared
 # pattern -- see the comment there) rather than redefined here.
 _PROFILE_OWNER_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
-_STRANDED_NOTIFICATION_STATUSES = frozenset({"activation_unknown", "transport_unknown"})
+_STRANDED_NOTIFICATION_STATUSES = frozenset(
+    {"activation_unknown", "transport_unknown", "activation_failed"}
+)
 _LEASE_ATTEMPT_STATES = frozenset(
     {"leased", "empty", "cancelled", "expired", "acked"}
 )
@@ -1156,6 +1158,7 @@ class MupotAdapter(BasePlatformAdapter):
         config: PlatformConfig,
         client_factory: Callable[[str], Any] = HermesMCPClient,
         message_injector: Optional[Callable[..., bool]] = None,
+        activation_ready: Optional[Callable[[], Any]] = None,
         secret_owner: ProfileSecretOwner | None = None,
     ) -> None:
         super().__init__(config, _platform_for_mupot())
@@ -1305,6 +1308,10 @@ class MupotAdapter(BasePlatformAdapter):
             float(extra.get("lease_self_heal_cap") or 900.0),
         )
         self.message_injector = message_injector
+        # Returns None/True when the gateway can accept an injection, else a
+        # short reason (or False). Probed by notifications.flush BEFORE any
+        # activation state is written; see MAX_ACTIVATION_DEFERRALS there.
+        self.activation_ready = activation_ready
         # self._secret_owner was already set above, before the lease_seconds
         # resolution -- see the P1-5 comment there.
         self._profile_owner_fingerprint = _profile_owner_fingerprint(secret_owner)
@@ -3485,6 +3492,7 @@ class MupotAdapter(BasePlatformAdapter):
                 else None
             ),
             activation_default=self.notification_activate,
+            activation_ready=self.activation_ready,
         )
 
     async def send(
@@ -3662,6 +3670,27 @@ def _apply_yaml_config(_yaml: dict, platform: dict) -> dict:
     }
 
 
+def _gateway_injector_readiness(ctx: Any) -> Callable[[], Optional[str]]:
+    """Readiness probe: is a live gateway message injector registered yet?
+
+    Hermes's ``inject_message`` returns a bare ``False`` for "no live gateway"
+    and for several other reasons, so the return value alone cannot prove a
+    refusal was pre-delivery. Reading the injector registration BEFORE calling
+    is the definite signal: absent => nothing could be scheduled. A Hermes that
+    does not expose the registration reports ready (prior behaviour), so any
+    refusal there stays the ambiguous ``activation_unknown`` fence.
+    """
+
+    def probe() -> Optional[str]:
+        manager = getattr(ctx, "_manager", None)
+        registered = getattr(manager, "has_gateway_message_injector", None)
+        if registered is None:
+            return None
+        return None if registered else "no_live_gateway"
+
+    return probe
+
+
 def register(
     ctx,
     *,
@@ -3701,6 +3730,7 @@ def register(
             replace(config, extra=extra),
             client_factory=client_factory,
             message_injector=ctx.inject_message,
+            activation_ready=_gateway_injector_readiness(ctx),
             secret_owner=secret_owner,
         )
         _live_adapter[:] = [instance]

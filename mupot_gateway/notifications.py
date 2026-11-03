@@ -172,6 +172,15 @@ _UNTRUSTED_CAVEAT = (
 # without pretending the fence below is optional.
 _ACTIVATION_ROLE = "mupot-notice"
 
+# A DEFINITE pre-delivery refusal (the gateway/platform is provably not live, so
+# the injector was never called and nothing was scheduled) is retryable after
+# readiness. It is deliberately a different state from ``activation_unknown``,
+# which stays the fail-closed no-replay fence for genuinely ambiguous outcomes.
+# Backoff is 10s doubling, capped at 300s; after this many deferrals the notice
+# moves to the terminal, operator-visible ``activation_failed``.
+MAX_ACTIVATION_DEFERRALS = 12
+_NOT_READY_REASON_DEFAULT = "gateway_not_ready"
+
 
 def _fenced_untrusted_block(text):
     """Delimit *text* as quoted DATA, immune to the body forging its own fence close.
@@ -360,6 +369,8 @@ def enqueue(
                 "activating": "attempting",
                 "activation_queued": "queued",
                 "activation_unknown": "unknown",
+                "activation_deferred": "deferred",
+                "activation_failed": "failed",
             }.get(legacy_status, "not_started"),
         )
         expected.setdefault(
@@ -413,11 +424,32 @@ def enqueue(
     _persist_notice(state, store, candidate, source_id, expected)
 
 
-async def flush(state, store, recipients, *, activate=None, activation_default=False):
+def _probe_activation_ready(activation_ready):
+    """Return None when ready, else a short machine-readable not-ready reason.
+
+    Runs BEFORE any activation state is written or the injector is called, so a
+    not-ready answer (or a probe that itself raises) proves nothing was
+    scheduled. No probe configured means "assume ready" (prior behaviour).
+    """
+    if activation_ready is None:
+        return None
+    try:
+        reason = activation_ready()
+    except Exception as exc:
+        return "readiness_probe_" + type(exc).__name__
+    if reason is None or reason is True:
+        return None
+    if reason is False:
+        return _NOT_READY_REASON_DEFAULT
+    return str(reason)[:80] or _NOT_READY_REASON_DEFAULT
+
+
+async def flush(state, store, recipients, *, activate=None, activation_default=False,
+                activation_ready=None):
     if not recipients:
         return
     for source_id, notice in list(state["notification_outbox"].items()):
-        if notice.get("status") in {"delivered", "transport_unknown", "activation_queued", "activation_unknown"} or notice.get("retry_at", 0) > time.time():
+        if notice.get("status") in {"delivered", "transport_unknown", "activation_queued", "activation_unknown", "activation_failed"} or notice.get("retry_at", 0) > time.time():
             continue
         routine_activation = notice.get("activation_after_processed") is True
         if routine_activation and not _routine_activation_is_processed(
@@ -524,6 +556,57 @@ async def flush(state, store, recipients, *, activate=None, activation_default=F
                     raise RetryLater()
                 if activate is None:
                     raise RuntimeError("Human activation is unavailable")
+                not_ready = _probe_activation_ready(activation_ready)
+                if not_ready is not None:
+                    # DEFINITE pre-delivery refusal: the injector is not called
+                    # and no "activating"/"activation_unknown" fence is written,
+                    # so there is no ambiguity. Park as activation_deferred with
+                    # bounded backoff; flush retries it once the platform is
+                    # ready. Past the cap it is a visible terminal
+                    # activation_failed. Not a Hermes pause (that is RetryLater).
+                    deferrals = int(notice.get("activation_deferrals", 0)) + 1
+                    try:
+                        if deferrals >= MAX_ACTIVATION_DEFERRALS:
+                            _transition_notice(
+                                state, store, source_id,
+                                {
+                                    "status": "activation_failed",
+                                    "activation_status": "failed",
+                                    "activation_deferrals": deferrals,
+                                    "activation_deferred_reason": not_ready,
+                                    "last_error": "ActivationNeverReady",
+                                },
+                            )
+                            logger.warning(
+                                "[mupot] human activation gave up after %d deferrals "
+                                "source=%s reason=%s",
+                                deferrals, source_id, not_ready,
+                            )
+                        else:
+                            delay = min(300, 10 * (2 ** min(deferrals - 1, 5)))
+                            _transition_notice(
+                                state, store, source_id,
+                                {
+                                    "status": "activation_deferred",
+                                    "activation_status": "deferred",
+                                    "activation_deferrals": deferrals,
+                                    "activation_deferred_reason": not_ready,
+                                    "retry_at": time.time() + delay,
+                                    "last_error": "ActivationDeferred",
+                                },
+                            )
+                            logger.warning(
+                                "[mupot] human activation deferred source=%s reason=%s "
+                                "attempt=%d retry_in=%ds",
+                                source_id, not_ready, deferrals, delay,
+                            )
+                    except Exception as exc:
+                        _restore_durable_state(state, store)
+                        logger.warning(
+                            "[mupot] activation deferral state unavailable source=%s error=%s",
+                            source_id, type(exc).__name__,
+                        )
+                    break
                 if not target.get("session_key"):
                     raise RuntimeError("Human activation requires an existing gateway session key")
                 if routine_activation:

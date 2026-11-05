@@ -156,10 +156,11 @@ async def test_discovered_handlers_isolate_commands_and_are_owned_on_unload(
     await application.process_update(
         _telegram_update(application, "/muanswer decision-1 accept", 2)
     )
-    await application.process_update(_telegram_update(application, "ordinary work", 3))
+    await application.process_update(_telegram_update(application, "/mulogin", 3))
+    await application.process_update(_telegram_update(application, "ordinary work", 4))
 
-    assert relayed == ["/start invite-1", "/muanswer decision-1 accept"]
-    assert replies == ["Mupot handled /start", "Mupot handled /muanswer"]
+    assert relayed == ["/start invite-1", "/muanswer decision-1 accept", "/mulogin"]
+    assert replies == ["Mupot handled /start", "Mupot handled /muanswer", "Mupot handled /mulogin"]
     assert core_turns == ["ordinary work"]
 
     assert manager.unload("mupot") is True

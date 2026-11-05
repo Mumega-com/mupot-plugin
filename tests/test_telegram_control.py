@@ -240,18 +240,18 @@ def _matches(application: _FakeApplication, text: str) -> bool:
     return bool(application.handlers[0].filter.regex.search(text))
 
 
-def test_factory_registers_one_group_minus_one_handler_matching_only_the_five_commands(
+def test_factory_registers_one_group_minus_one_handler_matching_project_commands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     application = _wire(monkeypatch, valid_settings())
     assert len(application.handlers) == 1
     assert application.handlers[0].group == -1
-    for command in ("start", "muneeds", "muanswer", "muapprove", "mureject"):
+    for command in ("start", "muneeds", "muanswer", "muapprove", "mureject", "mulogin"):
         assert _matches(application, f"/{command}")
         assert _matches(application, f"  /{command} abc")
         assert _matches(application, f"/{command}@some_bot abc")
         assert _matches(application, f"/{command.upper()} abc")
-    for text in ("/muapproveX", "/mu", "approve abc", "x /muapprove", "/approve abc", "/needs"):
+    for text in ("/muapproveX", "/muloginX", "/muhelp", "/mu", "approve abc", "x /muapprove", "/approve abc", "/needs", "/help"):
         assert not _matches(application, text)
 
 
@@ -285,7 +285,7 @@ def test_legacy_flag_must_be_boolean() -> None:
 
 @pytest.mark.parametrize(
     "text",
-    ["/muapprove abcdef12", "/muapprove@kayhermes_mubot abcdef12", "/mureject abcdef12 no", "/muneeds", "/muanswer r1 yes"],
+    ["/muapprove abcdef12", "/muapprove@kayhermes_mubot abcdef12", "/mureject abcdef12 no", "/muneeds", "/muanswer r1 yes", "/mulogin", "/mulogin@kayhermes_mubot"],
 )
 def test_mu_commands_relay_unchanged_including_botname(
     monkeypatch: pytest.MonkeyPatch, text: str
@@ -331,9 +331,11 @@ def test_bare_command_relays_when_legacy_flag_on(
         Update(user=User(user_id=124)),
     ],
 )
+@pytest.mark.parametrize("text", ["/muneeds", "/mulogin"])
 def test_relay_refuses_non_private_or_mismatched_identity_before_network(
-    monkeypatch: pytest.MonkeyPatch, update: Update
+    monkeypatch: pytest.MonkeyPatch, update: Update, text: str
 ) -> None:
+    update.effective_message.text = text
     opener = Opener(AssertionError("network must not run"))
     monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
     with pytest.raises(ValueError, match="private"):
@@ -345,12 +347,13 @@ def test_relay_refuses_non_private_or_mismatched_identity_before_network(
     "marker",
     ["forward_origin", "forward_from", "forward_from_chat", "forward_date"],
 )
+@pytest.mark.parametrize("text", ["/muapprove d-1", "/mulogin"])
 def test_relay_refuses_every_forwarding_marker_before_network(
-    monkeypatch: pytest.MonkeyPatch, marker: str
+    monkeypatch: pytest.MonkeyPatch, marker: str, text: str
 ) -> None:
     opener = Opener(AssertionError("network must not run"))
     monkeypatch.setattr("plugin.telegram_control.build_opener", lambda *_: opener)
-    update = Update(message=Message("/muapprove d-1", **{marker: object()}))
+    update = Update(message=Message(text, **{marker: object()}))
     with pytest.raises(ValueError, match="forwarded"):
         relay_telegram_update(valid_settings(), update)
     assert opener.calls == []
